@@ -1,9 +1,16 @@
+"""
+Binance Monitor Bot — مراقبة صفقات Binance Futures + أوامر Telegram تفاعلية.
+يعمل على Web Service (يفتح منفذ PORT) + WebSocket للإشعارات الفورية.
+"""
 import os
-import re
 import sys
 import time
+import re
+import json
 import asyncio
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
 from binance import AsyncClient, BinanceSocketManager
@@ -11,62 +18,87 @@ from binance.exceptions import BinanceAPIException
 from telegram import Update
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import NetworkError, TimedOut
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ============================================================
-# التحقق من متغيرات البيئة
+# الإعدادات
 # ============================================================
-REQUIRED_ENV = ["BINANCE_API_KEY", "BINANCE_API_SECRET",
-                "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
-missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID_RAW = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+REQUIRED = {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "TELEGRAM_CHAT_ID": CHAT_ID_RAW,
+    "BINANCE_API_KEY": API_KEY,
+    "BINANCE_API_SECRET": API_SECRET,
+}
+missing = [k for k, v in REQUIRED.items() if not v]
 if missing:
     print(f"❌ متغيرات ناقصة: {', '.join(missing)}", file=sys.stderr)
     sys.exit(1)
 
-API_KEY = os.environ["BINANCE_API_KEY"]
-API_SECRET = os.environ["BINANCE_API_SECRET"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+CHAT_ID = int(CHAT_ID_RAW)
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(message)s")
+HOURLY_MIN = 60           # دورة التقرير كل ساعة
+WS_RECONNECT_DELAY = 10   # ثوانٍ قبل إعادة الاتصال بـ WebSocket
+
+# ============================================================
+# Logging
+# ============================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.getLogger("binance").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)  # تقليل ضجيج Telegram
 
 # ============================================================
 # حالة عامة
 # ============================================================
 binance_client: AsyncClient | None = None
-app: Application | None = None
 notifications_enabled = True
 
 # كاش HTTP + كشف الحظر
-_http_cache: dict = {}          # key -> (timestamp, value)
+_http_cache: dict = {}
 _banned_until_ms: int = 0
 
-HELP_TEXT = (
-    "🤖 <b>بوت مراقبة Binance</b>\n\n"
-    "<b>الأوامر:</b>\n"
-    "/positions — الصفقات المفتوحة\n"
-    "/balance — الرصيد والهامش\n"
-    "/pnl — الربح/الخسارة\n"
-    "/orders — الأوامر المعلقة\n"
-    "/status — حالة البوت\n"
-    "/mute — إيقاف الإشعارات\n"
-    "/unmute — تشغيل الإشعارات\n"
-    "/help — المساعدة"
-)
+
+# ============================================================
+# Health Server (ليعمل على Web Service)
+# ============================================================
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - Binance Monitor Bot")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def _run_health():
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info(f"🩺 Health server على المنفذ {port}")
+    server.serve_forever()
 
 
 # ============================================================
 # أدوات مساعدة
 # ============================================================
-def authorized(update: Update) -> bool:
-    return update.effective_chat and update.effective_chat.id == CHAT_ID
-
-
 def is_banned() -> bool:
     return _banned_until_ms > int(time.time() * 1000)
 
@@ -78,39 +110,28 @@ def ban_remaining_sec() -> int:
 
 
 def _register_ban(exc: Exception):
-    """يسجّل الحظر عند رؤية خطأ -1003 مع timestamp."""
     global _banned_until_ms
-    msg = str(exc)
-    m = re.search(r"banned until (\d+)", msg)
+    m = re.search(r"banned until (\d+)", str(exc))
     if m:
         _banned_until_ms = int(m.group(1))
-        log.warning(f"⛔ Binance IP banned until "
-                    f"{datetime.fromtimestamp(_banned_until_ms/1000, timezone.utc)}")
+        log.warning(
+            f"⛔ Binance IP banned until "
+            f"{datetime.fromtimestamp(_banned_until_ms/1000, timezone.utc)}"
+        )
 
 
 async def cached_http(key: str, coro_factory, ttl: int = 20):
-    """
-    تنفيذ طلب HTTP مع:
-      - كاش (TTL)
-      - كشف الحظر (-1003)
-      - رسالة واضحة للمستخدم
-    """
-    # 1) محظور حالياً؟
+    """HTTP مع كاش + كشف الحظر + رسالة واضحة."""
     if is_banned():
-        remaining = ban_remaining_sec()
         raise RuntimeError(
-            f"⛔ Binance حظر IP مؤقتاً.\n"
-            f"المتبقي: ~{remaining//60} دقيقة\n"
-            f"لن أرسل طلبات جديدة حتى ينتهي الحظر."
+            f"⛔ Binance حظر IP مؤقتاً. المتبقي: ~{ban_remaining_sec()//60} دقيقة."
         )
 
-    # 2) هل الكاش صالح؟
     now = time.time()
     hit = _http_cache.get(key)
     if hit and now - hit[0] < ttl:
         return hit[1]
 
-    # 3) استدعاء HTTP
     try:
         val = await coro_factory()
         _http_cache[key] = (now, val)
@@ -124,21 +145,27 @@ async def cached_http(key: str, coro_factory, ttl: int = 20):
         raise
 
 
-async def send(text: str):
-    if not notifications_enabled or app is None:
+async def send(text: str, context: ContextTypes.DEFAULT_TYPE | None = None):
+    """إرسال للقناة الأساسية."""
+    if not notifications_enabled:
         return
     try:
-        await app.bot.send_message(chat_id=CHAT_ID, text=text,
-                                   parse_mode=ParseMode.HTML)
+        if context is not None:
+            await context.bot.send_message(
+                chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML
+            )
+        elif binance_client is not None and _app is not None:
+            await _app.bot.send_message(
+                chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML
+            )
     except Exception as e:
-        log.error(f"Telegram send error: {e}")
+        log.error(f"send error: {e}")
 
 
 # ============================================================
-# جلب البيانات عبر HTTP (مع كاش)
+# جلب البيانات
 # ============================================================
 async def fetch_positions() -> list:
-    """يستخدم /fapi/v2/positionRisk — يعيد markPrice و unRealizedProfit دائماً."""
     data = await cached_http(
         "positions",
         lambda: binance_client.futures_position_information(),
@@ -193,20 +220,39 @@ def fmt_position(p: dict) -> str | None:
     return "\n".join(lines)
 
 
+HELP_TEXT = (
+    "🤖 <b>بوت مراقبة Binance</b>\n"
+    "━━━━━━━━━━━━━━━━━━━\n\n"
+    "<b>الأوامر:</b>\n"
+    "/positions — الصفقات المفتوحة\n"
+    "/balance — الرصيد والهامش\n"
+    "/pnl — الربح/الخسارة\n"
+    "/orders — الأوامر المعلقة\n"
+    "/status — حالة البوت\n"
+    "/mute — إيقاف الإشعارات\n"
+    "/unmute — تشغيل الإشعارات\n"
+    "/help — المساعدة"
+)
+
+
 # ============================================================
 # أوامر Telegram
 # ============================================================
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def authorized(update: Update) -> bool:
+    return update.effective_chat and update.effective_chat.id == CHAT_ID
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, ctx)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
 
 
-async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -230,25 +276,24 @@ async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 
-async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
     try:
         account = await fetch_account()
-        # حقول آمنة مع .get
         wallet = float(account.get("totalWalletBalance", 0) or 0)
         unrealized = float(account.get("totalUnrealizedProfit", 0) or 0)
         margin_bal = float(account.get("totalMarginBalance", 0) or 0)
         available = float(account.get("availableBalance", 0) or 0)
-        used_margin = float(account.get("totalPositionInitialMargin", 0) or 0)
+        used = float(account.get("totalPositionInitialMargin", 0) or 0)
 
         await update.message.reply_text(
             f"💰 <b>الرصيد</b>\n\n"
             f"المحفظة: <b>{wallet:.2f}</b> USDT\n"
             f"PnL عائم: <b>{unrealized:+.4f}</b> USDT\n"
             f"رصيد الهامش: <b>{margin_bal:.2f}</b> USDT\n"
-            f"هامش مستخدم: <b>{used_margin:.2f}</b> USDT\n"
+            f"هامش مستخدم: <b>{used:.2f}</b> USDT\n"
             f"متاح للتداول: <b>{available:.2f}</b> USDT",
             parse_mode=ParseMode.HTML,
         )
@@ -257,17 +302,14 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 
-async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
     try:
         positions = await fetch_positions()
-
-        # PnL عائم
         unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
 
-        # PnL محقق آخر 24 ساعة — طلب مستقل خفيف
         realized_24h = 0.0
         try:
             start_ms = int((time.time() - 86400) * 1000)
@@ -280,9 +322,8 @@ async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             realized_24h = sum(float(i["income"]) for i in income)
         except Exception as e:
-            log.warning(f"income_history failed: {e}")
+            log.warning(f"income_history: {e}")
 
-        # تفصيل
         lines = []
         for p in positions:
             pnl = float(p.get("unRealizedProfit", 0) or 0)
@@ -294,7 +335,7 @@ async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 <b>PnL</b>\n\n"
             f"عائم الآن: <b>{unrealized:+.4f}</b> USDT\n"
             f"محقق (24س): <b>{realized_24h:+.4f}</b> USDT\n\n"
-            f"<b>تفصيل الصفقات:</b>\n{breakdown}",
+            f"<b>تفصيل:</b>\n{breakdown}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
@@ -302,7 +343,7 @@ async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 
-async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     await update.message.chat.send_action(ChatAction.TYPING)
@@ -327,138 +368,213 @@ async def cmd_orders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     status = "🟢 متصل" if binance_client else "🔴 غير متصل"
     notif = "🔔 مفعلة" if notifications_enabled else "🔕 مكتومة"
-    if is_banned():
-        ban_info = f"\n⛔ محظور — متبقي ~{ban_remaining_sec()//60} دقيقة"
-    else:
-        ban_info = ""
+    ban = (f"\n⛔ محظور — متبقي ~{ban_remaining_sec()//60} دقيقة"
+           if is_banned() else "")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     await update.message.reply_text(
         f"🤖 <b>حالة البوت</b>\n\n"
         f"Binance: {status}\n"
         f"الإشعارات: {notif}\n"
-        f"الوقت: {ts}{ban_info}",
+        f"الوقت: {ts}{ban}",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global notifications_enabled
     if not authorized(update):
         return
     notifications_enabled = False
-    await update.message.reply_text("🔕 تم إيقاف الإشعارات الفورية.")
+    await update.message.reply_text("🔕 تم إيقاف الإشعارات.")
 
 
-async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global notifications_enabled
     if not authorized(update):
         return
     notifications_enabled = True
-    await update.message.reply_text("🔔 تم تشغيل الإشعارات الفورية.")
+    await update.message.reply_text("🔔 تم تشغيل الإشعارات.")
 
 
 # ============================================================
-# المهام الخلفية
+# Jobs (تعمل عبر JobQueue)
 # ============================================================
-async def hourly_report():
-    # انتظر 10 دقائق قبل التقرير الأول (يعطي فرصة للحظر أن يزول / أول WS update)
-    await asyncio.sleep(600)
-    while True:
+async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
+    """تقرير كل ساعة."""
+    try:
+        if is_banned():
+            log.warning("hourly: متخطى (حظر)")
+            return
+
+        positions = await fetch_positions()
         try:
-            if is_banned():
-                log.warning("hourly_report: متخطى بسبب الحظر")
-                await asyncio.sleep(3600)
-                continue
+            account = await fetch_account()
+            balance = float(account.get("totalWalletBalance", 0) or 0)
+        except Exception:
+            balance = 0.0
 
-            positions = await fetch_positions()
-            try:
-                account = await fetch_account()
-                balance = float(account.get("totalWalletBalance", 0) or 0)
-            except Exception:
-                balance = 0.0
+        unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-            unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if not positions:
+            msg = (
+                f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n"
+                f"لا توجد صفقات مفتوحة.\n"
+                f"💰 الرصيد: {balance:.2f} USDT"
+            )
+        else:
+            body = "\n\n".join(filter(None, (fmt_position(p) for p in positions)))
+            msg = (
+                f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n{body}\n\n"
+                f"──────────────\n"
+                f"💰 الرصيد: {balance:.2f} USDT\n"
+                f"📊 PnL: {unrealized:+.4f} USDT\n"
+                f"🔢 العدد: {len(positions)}"
+            )
 
-            if not positions:
-                msg = (f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n"
-                       f"لا توجد صفقات مفتوحة.\n"
-                       f"💰 الرصيد: {balance:.2f} USDT")
-            else:
-                body = "\n\n".join(filter(None, (fmt_position(p) for p in positions)))
-                msg = (f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n{body}\n\n"
-                       f"──────────────\n"
-                       f"💰 الرصيد: {balance:.2f} USDT\n"
-                       f"📊 PnL: {unrealized:+.4f} USDT\n"
-                       f"🔢 العدد: {len(positions)}")
-            await send(msg)
-            log.info("✅ Hourly report sent")
-        except Exception as e:
-            log.exception(f"hourly_report: {e}")
-
-        await asyncio.sleep(3600)
+        await context.bot.send_message(
+            chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML
+        )
+        log.info("✅ Hourly report sent")
+    except Exception as e:
+        log.exception(f"hourly_job: {e}")
 
 
-async def user_stream():
-    """WebSocket: مصدر الإشعارات الفورية — لا يستهلك طلبات HTTP."""
+# ============================================================
+# WebSocket (يعمل في task منفصل)
+# ============================================================
+async def user_stream_task(app: Application):
+    """يستمع لتحديثات Binance ويرسل إشعارات."""
     bsm = BinanceSocketManager(binance_client)
     while True:
         try:
             async with bsm.futures_user_socket() as stream:
                 log.info("🔌 WebSocket متصل")
-                await send("🔌 تم الاتصال بـ Binance WebSocket")
+                try:
+                    await app.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text="🔌 تم الاتصال بـ Binance WebSocket",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
 
                 while True:
                     msg = await stream.recv()
 
-                    # فتح / تعديل صفقات
+                    # فتح/تعديل صفقة
                     if msg.get("e") == "ACCOUNT_UPDATE":
                         for pos in msg["a"]["P"]:
                             amt = float(pos["pa"])
                             if amt != 0 and pos.get("bc", "0") == "0":
                                 side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
-                                await send(
+                                text = (
                                     f"🚀 <b>صفقة مفتوحة</b>\n\n"
                                     f"الاتجاه: {side}\n"
                                     f"الرمز: <b>{pos['s']}</b>\n"
                                     f"الحجم: {abs(amt)}\n"
                                     f"الدخول: {pos['ep']}"
                                 )
+                                if notifications_enabled:
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=CHAT_ID, text=text,
+                                            parse_mode=ParseMode.HTML,
+                                        )
+                                    except Exception as e:
+                                        log.error(f"WS send: {e}")
 
-                    # تنفيذ أوامر
+                    # تنفيذ أمر
                     elif msg.get("e") == "ORDER_TRADE_UPDATE":
                         o = msg["o"]
                         if o["X"] == "FILLED":
                             rp_val = float(o.get("rp", "0") or 0)
-                            pnl_txt = (f"\n💰 PnL محقق: <b>{rp_val:+.4f} USDT</b>"
-                                       if rp_val != 0 else "")
-                            await send(
+                            pnl_txt = (
+                                f"\n💰 PnL محقق: <b>{rp_val:+.4f} USDT</b>"
+                                if rp_val != 0 else ""
+                            )
+                            text = (
                                 f"⚡ <b>تنفيذ أمر</b>\n"
                                 f"الرمز: <b>{o['s']}</b>\n"
                                 f"الاتجاه: {o['S']}\n"
                                 f"الكمية: {o['q']}\n"
                                 f"متوسط السعر: {o.get('ap') or '0'}{pnl_txt}"
                             )
+                            if notifications_enabled:
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=CHAT_ID, text=text,
+                                        parse_mode=ParseMode.HTML,
+                                    )
+                                except Exception as e:
+                                    log.error(f"WS send: {e}")
         except Exception as e:
-            log.exception(f"user_stream error: {e}")
-            await asyncio.sleep(10)
+            log.exception(f"user_stream: {e}")
+            await asyncio.sleep(WS_RECONNECT_DELAY)
 
 
-# ============================================================
-# نقطة البداية
-# ============================================================
-async def main():
-    global binance_client, app
+async def post_init(app: Application):
+    """يشغّل مهام Binance بعد جاهزية التطبيق."""
+    global binance_client, _app
+    _app = app
 
     binance_client = await AsyncClient.create(API_KEY, API_SECRET)
     log.info("Binance client جاهز")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # WebSocket في task خلفي
+    app.create_task(user_stream_task(app))
+
+    # رسالة بدء
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text="🤖 <b>بدأ بوت مراقبة Binance</b>\nأرسل /help للأوامر.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.error(f"startup send: {e}")
+
+
+async def post_shutdown(app: Application):
+    if binance_client:
+        await binance_client.close_connection()
+        log.info("Binance client مُغلق")
+
+
+async def error_handler(update, context):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning(f"⚠️ network: {err}")
+        return
+    log.error(f"❌ error: {err}", exc_info=err)
+
+
+# ============================================================
+# Main
+# ============================================================
+_app: Application | None = None
+
+
+def main():
+    # 1) Health server (ليعمل على Web Service)
+    threading.Thread(target=_run_health, daemon=True).start()
+
+    print("🚀 Binance Monitor Bot يبدأ...")
+
+    # 2) تطبيق Telegram
+    app = Application.builder() \
+        .token(TELEGRAM_TOKEN) \
+        .post_init(post_init) \
+        .post_shutdown(post_shutdown) \
+        .build()
+
+    # 3) Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("positions", cmd_positions))
@@ -468,26 +584,31 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_error_handler(error_handler)
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    log.info("Telegram polling بدأ")
+    # 4) Jobs
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            hourly_job,
+            interval=HOURLY_MIN * 60,
+            first=300,     # أول تقرير بعد 5 دقائق
+            name="hourly",
+        )
+        print(f"⏰ تقرير كل {HOURLY_MIN} دقيقة")
 
-    await send("🤖 <b>بدأ البوت</b>\nأرسل /help للأوامر.")
+    print("✅ Bot جاهز")
 
-    try:
-        await asyncio.gather(user_stream(), hourly_report())
-    finally:
-        log.info("Shutting down...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await binance_client.close_connection()
+    # 5) التشغيل (نفس طريقة bot.py)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        bootstrap_retries=5,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()
