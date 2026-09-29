@@ -1,0 +1,4 @@
+python-binance==1.0.19
+python-telegram-bot==20.7
+python-dotenv==1.0.1
+aiohttp==3.9.1
