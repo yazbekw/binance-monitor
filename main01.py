@@ -1,6 +1,6 @@
 """
-Binance Monitor Bot — تقاطع EMA + حماية تلقائية
-الإصدار النهائي: يجلب Algo Orders + 5 طرق لوضع TP/SL
+Binance Monitor Bot — تقاطع EMA + مراقبة TP/SL ذاتية
+الحل: إذا فشل وضع TP/SL على Binance → يراقب السعر ويغلق بنفسه
 """
 import os
 import sys
@@ -45,6 +45,7 @@ if missing:
 CHAT_ID = int(CHAT_ID_RAW)
 HOURLY_MIN = 60
 WS_RECONNECT_DELAY = 10
+MARK_WS_RECONNECT_DELAY = 5
 
 # ============================================================
 # الاستراتيجية
@@ -77,14 +78,18 @@ STRATEGY_JOB_INTERVAL = int(os.getenv("STRATEGY_JOB_INTERVAL", "30"))
 SL_CAP_RATIO          = float(os.getenv("SL_CAP_RATIO", "0.8"))
 
 # ============================================================
-# الحماية التلقائية
+# الحماية ومراقبة TP/SL
 # ============================================================
+# monitor: مراقبة ذاتية فقط (آمن، لا -4120)
+# orders:  محاولة وضع أوامر على Binance
+# both:    جرّب الأوامر + راقب كحماية إضافية
+CLOSE_MODE = os.getenv("CLOSE_MODE", "monitor").lower()
+if CLOSE_MODE not in ("monitor", "orders", "both"):
+    CLOSE_MODE = "monitor"
+
 AUTO_PROTECT_ENABLED = os.getenv("AUTO_PROTECT_ENABLED", "true").lower() == "true"
 AUTO_PROTECT_INTERVAL = int(os.getenv("AUTO_PROTECT_INTERVAL", "60"))
 AUTO_PROTECT_MIN_NOTIONAL = float(os.getenv("AUTO_PROTECT_MIN_NOTIONAL", "20"))
-
-# منع الإزعاج: كم مرة نحاول قبل التخلي
-AUTO_PROTECT_MAX_ATTEMPTS = int(os.getenv("AUTO_PROTECT_MAX_ATTEMPTS", "2"))
 
 _notional_ref = MARGIN_USDT * LEVERAGE
 _effective_sl_ref = min(SL_USDT, MARGIN_USDT * SL_CAP_RATIO)
@@ -93,6 +98,9 @@ _default_sl_pct = round(_effective_sl_ref / _notional_ref * 100, 3)
 
 AUTO_PROTECT_TP_PCT = float(os.getenv("AUTO_PROTECT_TP_PCT", str(_default_tp_pct)))
 AUTO_PROTECT_SL_PCT = float(os.getenv("AUTO_PROTECT_SL_PCT", str(_default_sl_pct)))
+
+# حماية من الانزلاق: لا تقبل سعراً أسوأ من X% عن مستوى TP/SL
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))
 
 # ============================================================
 # Logging
@@ -112,6 +120,7 @@ binance_client: AsyncClient | None = None
 notifications_enabled = True
 _app: Application | None = None
 _user_stream_task: asyncio.Task | None = None
+_mark_watcher_task: asyncio.Task | None = None
 
 _http_cache: dict = {}
 _banned_until_ms: int = 0
@@ -122,16 +131,14 @@ _symbol_filters_cache: dict = {}
 _trend_cache: dict = {}
 
 _last_strategy_candle: int = 0
-_protected_positions: dict = {}
 
-# ذاكرة محاولات الحماية الفاشلة
-# {symbol: {"attempts": int, "last_try": float, "notified": bool}}
-_protect_failures: dict = {}
-
-# الرموز التي لا يدعمها algo endpoint
-_algo_unsupported: set = set()
+# الصفقات المراقَبة: {symbol: {...}}
+_watched_positions: dict = {}
 
 _daily_pnl_cache = {"date": None, "pnl": 0.0, "last_fetch": 0.0}
+
+# قفل لمنع الإغلاق المتزامن
+_close_locks: dict = {}
 
 
 # ============================================================
@@ -279,90 +286,6 @@ async def fetch_account(force: bool = False) -> dict:
     )
 
 
-async def fetch_algo_orders(symbol: str) -> list:
-    """
-    يجلب أوامر Algo (TP/SL من التطبيق) لرمز معين.
-    يُجرب عدة endpoints حتى ينجح واحد.
-    """
-    if symbol in _algo_unsupported:
-        return []
-
-    # Endpoint 1: openAlgoOrders
-    try:
-        result = await binance_client._request_futures_api(
-            "get", "openAlgoOrders", signed=True,
-            data={"symbol": symbol},
-        )
-        if isinstance(result, dict) and "orders" in result:
-            return result["orders"]
-        if isinstance(result, list):
-            return result
-        return []
-    except BinanceAPIException as e:
-        if e.code in (-4046, -4120, -1102, -1100):
-            # endpoint غير مدعوم أو params خاطئة
-            pass
-        else:
-            log.debug(f"algo orders {symbol}: {e.code}")
-    except Exception as e:
-        log.debug(f"algo orders {symbol}: {e}")
-
-    # Endpoint 2: futures_get_open_orders مع symbol (أحياناً يعرض TP/SL)
-    try:
-        orders = await binance_client.futures_get_open_orders(symbol=symbol)
-        return orders
-    except Exception as e:
-        log.debug(f"orders {symbol}: {e}")
-        return []
-
-
-async def fetch_open_orders(force: bool = False) -> list:
-    """
-    يجلب كل الأوامر (عادية + Algo) لكل رمز في المراكز + رموز الاستراتيجية.
-    """
-    if force:
-        _http_cache.pop("orders_all", None)
-
-    async def _fetch():
-        try:
-            positions = await fetch_positions()
-        except Exception:
-            positions = []
-
-        symbols = {p["symbol"] for p in positions}
-        symbols.update(STRATEGY_SYMBOLS)
-
-        all_orders = []
-        for symbol in symbols:
-            try:
-                # أوامر عادية
-                regular = await binance_client.futures_get_open_orders(symbol=symbol)
-                for o in regular:
-                    o["_source"] = "regular"
-                    all_orders.append(o)
-            except Exception as e:
-                log.warning(f"regular {symbol}: {e}")
-
-            # أوامر Algo
-            try:
-                algo = await fetch_algo_orders(symbol)
-                for o in algo:
-                    o["_source"] = "algo"
-                    # توحيد الأسماء
-                    o.setdefault("symbol", symbol)
-                    o.setdefault("type", o.get("orderType", o.get("type", "?")))
-                    o.setdefault("origQty", o.get("quantity", o.get("origQty", "?")))
-                    o.setdefault("closePosition", o.get("closePosition", True))
-                    o.setdefault("reduceOnly", o.get("reduceOnly", True))
-                    all_orders.append(o)
-            except Exception as e:
-                log.debug(f"algo {symbol}: {e}")
-
-        return all_orders
-
-    return await cached_http("orders_all", _fetch, ttl=30)
-
-
 async def get_symbol_filters(symbol: str) -> tuple[str, str]:
     if symbol in _symbol_filters_cache:
         return _symbol_filters_cache[symbol]
@@ -441,151 +364,346 @@ async def get_trend_direction(symbol: str) -> str | None:
 
 
 # ============================================================
-# وضع TP/SL — 5 طرق بديلة
+# وضع TP/SL على Binance (لمن يريد orders mode)
 # ============================================================
-async def _try_regular_order(
-    symbol: str, side: str, order_type: str,
-    stop_price: float, qty: float,
-    use_close_position: bool = False,
-) -> tuple[bool, str]:
-    """محاولة وضع أمر عادي."""
-    try:
-        if use_close_position:
-            await binance_client.futures_create_order(
-                symbol=symbol, side=side, type=order_type,
-                stopPrice=stop_price, closePosition=True,
-                workingType="MARK_PRICE",
-            )
-        else:
-            await binance_client.futures_create_order(
-                symbol=symbol, side=side, type=order_type,
-                stopPrice=stop_price, quantity=qty,
-                reduceOnly=True, workingType="MARK_PRICE",
-            )
-        return True, "ok"
-    except BinanceAPIException as e:
-        return False, f"{e.code}:{e.message[:60]}"
-    except Exception as e:
-        return False, str(e)[:60]
-
-
-async def _try_algo_order(
+async def _try_order(
     symbol: str, side: str, order_type: str,
     stop_price: float, qty: float,
 ) -> tuple[bool, str]:
-    """محاولة وضع أمر Algo عبر endpoint متخصص."""
-    endpoints = [
-        ("order", {"algoType": "CONDITIONAL"}),
-        ("algoOrder", {}),
-    ]
-
-    for path, extra in endpoints:
-        try:
-            data = {
-                "symbol": symbol,
-                "side": side,
-                "type": order_type,
-                "stopPrice": str(stop_price),
-                "quantity": str(qty),
-                "reduceOnly": "true",
-                "workingType": "MARK_PRICE",
-            }
-            data.update(extra)
-
-            await binance_client._request_futures_api(
-                "post", path, signed=True, data=data
-            )
-            log.info(f"✅ Algo {path} نجح")
-            return True, f"algo_{path}"
-        except BinanceAPIException as e:
-            if e.code in (-4046, -1102):
-                continue
-            return False, f"algo:{e.code}:{e.message[:50]}"
-        except Exception as e:
-            continue
-
-    return False, "algo_endpoints_failed"
-
-
-async def _try_limit_order(
-    symbol: str, side: str, price: float, qty: float,
-) -> tuple[bool, str]:
-    """محاولة أخيرة: أمر LIMIT عادي — يعمل دائماً."""
+    """محاولة واحدة — لن نُكرر أبداً لتقليل الطلبات."""
     try:
         await binance_client.futures_create_order(
-            symbol=symbol, side=side, type="LIMIT",
-            price=price, quantity=qty,
-            reduceOnly=True, timeInForce="GTC",
+            symbol=symbol, side=side, type=order_type,
+            stopPrice=stop_price, quantity=qty,
+            reduceOnly=True, workingType="MARK_PRICE",
         )
-        return True, "limit"
+        return True, "ok"
     except BinanceAPIException as e:
-        return False, f"limit:{e.code}:{e.message[:60]}"
+        return False, f"{e.code}"
     except Exception as e:
-        return False, f"limit:{str(e)[:60]}"
+        return False, str(e)[:50]
 
 
-async def place_one_conditional_order(
-    symbol: str, side: str, order_kind: str,
-    stop_price: float, qty: float,
-) -> bool:
-    """
-    يحاول وضع أمر TP أو SL بـ 5 طرق حتى ينجح.
-    order_kind: "TP" أو "SL"
-    """
-    primary_type = "TAKE_PROFIT_MARKET" if order_kind == "TP" else "STOP_MARKET"
-
-    # ═══ v1: quantity + reduceOnly ═══
-    ok, err = await _try_regular_order(
-        symbol, side, primary_type, stop_price, qty, use_close_position=False
-    )
-    if ok:
-        log.info(f"✅ {order_kind} v1 {symbol} @ {stop_price}")
-        return True
-    log.debug(f"⚠️ {order_kind} v1: {err}")
-
-    # ═══ v2: closePosition ═══
-    ok, err = await _try_regular_order(
-        symbol, side, primary_type, stop_price, qty, use_close_position=True
-    )
-    if ok:
-        log.info(f"✅ {order_kind} v2 {symbol} @ {stop_price}")
-        return True
-    log.debug(f"⚠️ {order_kind} v2: {err}")
-
-    # ═══ v3: Algo endpoints ═══
-    ok, err = await _try_algo_order(symbol, side, primary_type, stop_price, qty)
-    if ok:
-        log.info(f"✅ {order_kind} v3 {symbol} @ {stop_price}")
-        return True
-    log.debug(f"⚠️ {order_kind} v3: {err}")
-
-    # ═══ v4: LIMIT (يعمل دائماً) ═══
-    ok, err = await _try_limit_order(symbol, side, stop_price, qty)
-    if ok:
-        log.info(f"✅ {order_kind} v4 (LIMIT) {symbol} @ {stop_price}")
-        return True
-    log.error(f"❌ {order_kind} v4: {err}")
-
-    return False
-
-
-async def place_tp_sl_orders(
+async def try_place_tp_sl_on_binance(
     symbol: str, close_side: str, qty: float,
     tp_price: float, sl_price: float,
-    place_tp: bool = True, place_sl: bool = True,
 ) -> tuple[bool, bool]:
-    tp_ok = True
-    sl_ok = True
-
-    if place_tp:
-        tp_ok = await place_one_conditional_order(
-            symbol, close_side, "TP", tp_price, qty
-        )
-    if place_sl:
-        sl_ok = await place_one_conditional_order(
-            symbol, close_side, "SL", sl_price, qty
-        )
+    """
+    محاولة واحدة فقط لكل أمر — لا حلقات.
+    """
+    tp_ok, tp_err = await _try_order(
+        symbol, close_side, "TAKE_PROFIT_MARKET", tp_price, qty
+    )
+    sl_ok, sl_err = await _try_order(
+        symbol, close_side, "STOP_MARKET", sl_price, qty
+    )
+    if not tp_ok:
+        log.info(f"TP على Binance فشل لـ {symbol}: {tp_err}")
+    if not sl_ok:
+        log.info(f"SL على Binance فشل لـ {symbol}: {sl_err}")
     return tp_ok, sl_ok
+
+
+# ============================================================
+# المراقبة الذاتية — قلب الحل الجديد
+# ============================================================
+def _get_lock(symbol: str) -> asyncio.Lock:
+    if symbol not in _close_locks:
+        _close_locks[symbol] = asyncio.Lock()
+    return _close_locks[symbol]
+
+
+async def sync_positions_and_watch():
+    """
+    يزامن قائمة المراقبة مع المراكز الفعلية.
+    يُضيف الجديد، يحذف المُغلق.
+    """
+    if binance_client is None or is_banned():
+        return
+
+    try:
+        positions = await fetch_positions(force=True)
+    except Exception as e:
+        log.debug(f"sync positions: {e}")
+        return
+
+    current_symbols = {p["symbol"] for p in positions}
+
+    # احذف المراكز المُغلقة
+    for sym in list(_watched_positions.keys()):
+        if sym not in current_symbols:
+            log.info(f"👁️ توقف عن مراقبة {sym} (المركز أُغلق)")
+            _watched_positions.pop(sym, None)
+            _close_locks.pop(sym, None)
+
+    # أضف/حدّث المراكز
+    for p in positions:
+        symbol = p["symbol"]
+        try:
+            amt = float(p["positionAmt"])
+        except (KeyError, ValueError):
+            continue
+        if amt == 0:
+            continue
+
+        entry = float(p.get("entryPrice", 0) or 0)
+        if entry <= 0:
+            continue
+
+        abs_amt = abs(amt)
+        notional = abs_amt * entry
+        if notional < AUTO_PROTECT_MIN_NOTIONAL:
+            continue
+
+        is_long = amt > 0
+
+        # احسب المستويات
+        if is_long:
+            tp = entry * (1 + AUTO_PROTECT_TP_PCT / 100)
+            sl = entry * (1 - AUTO_PROTECT_SL_PCT / 100)
+        else:
+            tp = entry * (1 - AUTO_PROTECT_TP_PCT / 100)
+            sl = entry * (1 + AUTO_PROTECT_SL_PCT / 100)
+
+        existing = _watched_positions.get(symbol)
+        if existing:
+            # لا تغيير في الحجم/الدخول
+            same_amt = abs(existing["qty"] - abs_amt) / max(abs_amt, 1e-9) < 1e-4
+            same_entry = abs(existing["entry"] - entry) / max(entry, 1e-9) < 1e-4
+            if same_amt and same_entry:
+                continue
+
+        # مركز جديد أو تغيّر
+        _watched_positions[symbol] = {
+            "side": "LONG" if is_long else "SHORT",
+            "entry": entry,
+            "qty": abs_amt,
+            "tp": tp,
+            "sl": sl,
+            "closed": False,
+            "closing": False,
+            "notified": False,
+            "created": time.time(),
+            "last_ws_update": 0.0,
+        }
+        log.info(f"👁️ جديد: {symbol} {('LONG' if is_long else 'SHORT')} "
+                 f"| TP={tp:.4f} SL={sl:.4f}")
+
+        # إشعار بالمركز الجديد
+        side_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
+        try:
+            await send(
+                f"👁️ <b>مراقبة صفقة جديدة</b>\n\n"
+                f"{side_emoji} | <b>{symbol}</b>\n"
+                f"الدخول: {entry}\n"
+                f"الكمية: {abs_amt}\n"
+                f"Notional: ~{notional:.0f}$\n\n"
+                f"🎯 TP: {tp:.4f} (+{AUTO_PROTECT_TP_PCT:.2f}%)\n"
+                f"🛑 SL: {sl:.4f} (-{AUTO_PROTECT_SL_PCT:.2f}%)\n\n"
+                f"<i>سأراقب السعر وأُغلق تلقائياً عند الوصول.</i>"
+            )
+        except Exception:
+            pass
+
+
+async def check_price_and_close(symbol: str, price: float, source: str = "ws"):
+    """
+    يفحص السعر الحالي مقابل TP/SL ويغلق عند الحاجة.
+    """
+    pos = _watched_positions.get(symbol)
+    if not pos or pos.get("closed") or pos.get("closing"):
+        return
+
+    pos["last_ws_update"] = time.time()
+
+    side = pos["side"]
+    tp = pos["tp"]
+    sl = pos["sl"]
+
+    hit = None
+    if side == "LONG":
+        if price >= tp:
+            hit = "TP"
+        elif price <= sl:
+            hit = "SL"
+    else:
+        if price <= tp:
+            hit = "TP"
+        elif price >= sl:
+            hit = "SL"
+
+    if hit:
+        log.info(f"⚡ {symbol} وصل {hit} @ {price} (source={source})")
+        await close_position_market(symbol, pos, hit, price)
+
+
+async def close_position_market(symbol: str, pos: dict, reason: str, price: float):
+    """
+    يُغلق المركز بأمر MARKET.
+    """
+    lock = _get_lock(symbol)
+    async with lock:
+        # إعادة تحقق
+        if pos.get("closed") or pos.get("closing"):
+            return
+
+        pos["closing"] = True
+
+        try:
+            side = "SELL" if pos["side"] == "LONG" else "BUY"
+
+            # حاول إلغاء أي أوامر معلقة (قد تكون TP/SL يدوي)
+            try:
+                await binance_client.futures_cancel_all_open_orders(symbol=symbol)
+            except Exception as e:
+                log.debug(f"cancel orders {symbol}: {e}")
+
+            # أمر MARKET
+            order = await binance_client.futures_create_order(
+                symbol=symbol,
+                side=side,
+                type="MARKET",
+                quantity=pos["qty"],
+                reduceOnly=True,
+            )
+
+            pos["closed"] = True
+            pos["close_time"] = time.time()
+
+            emoji = "🎯" if reason == "TP" else "🛑"
+            title = "جني أرباح" if reason == "TP" else "وقف خسارة"
+            status = order.get("status", "?")
+            avg = order.get("avgPrice", "0")
+
+            try:
+                await send(
+                    f"{emoji} <b>{title} (مراقبة ذاتية)</b>\n\n"
+                    f"<b>{symbol}</b> | {pos['side']}\n"
+                    f"الكمية: {pos['qty']}\n"
+                    f"سعر التنفيذ: {avg or price}\n"
+                    f"الدخول: {pos['entry']}\n"
+                    f"الحالة: {status}"
+                )
+            except Exception:
+                pass
+
+            log.info(f"✅ {reason} {symbol} — أُغلق @ {avg or price}")
+
+            # انتظر ثم احذف
+            await asyncio.sleep(10)
+            _watched_positions.pop(symbol, None)
+            _close_locks.pop(symbol, None)
+
+        except Exception as e:
+            log.exception(f"close {symbol}: {e}")
+            pos["closing"] = False
+            try:
+                await send(
+                    f"🚨 <b>فشل إغلاق {symbol}</b>\n\n"
+                    f"السبب: {reason}\n"
+                    f"السعر: {price}\n"
+                    f"❌ {e}\n\n"
+                    f"<b>أغلق يدوياً من التطبيق فوراً!</b>"
+                )
+            except Exception:
+                pass
+
+
+# ============================================================
+# Mark Price WebSocket (المراقبة اللحظية)
+# ============================================================
+async def mark_price_watcher(app: Application):
+    """
+    يستمع لأسعار markPrice لكل مركز مُراقب.
+    عند وصول TP/SL → يُغلق.
+    """
+    while True:
+        try:
+            symbols = list(_watched_positions.keys())
+            if not symbols:
+                await asyncio.sleep(5)
+                continue
+
+            # راقب فقط الرموز التي لم تُغلق
+            active = [
+                s for s in symbols
+                if _watched_positions.get(s)
+                and not _watched_positions[s].get("closed")
+                and not _watched_positions[s].get("closing")
+            ]
+            if not active:
+                await asyncio.sleep(5)
+                continue
+
+            streams = [f"{s.lower()}@markPrice@1s" for s in active]
+            bsm = BinanceSocketManager(binance_client)
+
+            log.info(f"📡 mark watcher: {len(active)} رموز")
+            try:
+                async with bsm.futures_multiplex_socket(streams) as stream:
+                    while True:
+                        msg = await stream.recv()
+                        data = msg.get("data", msg)
+                        event = data.get("e")
+                        if event != "markPriceUpdate":
+                            continue
+
+                        symbol = data.get("s")
+                        price_str = data.get("p")
+                        if not symbol or not price_str:
+                            continue
+
+                        try:
+                            price = float(price_str)
+                        except (ValueError, TypeError):
+                            continue
+
+                        await check_price_and_close(symbol, price, "ws")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning(f"mark ws inner: {e}")
+                await asyncio.sleep(MARK_WS_RECONNECT_DELAY)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"mark watcher: {e}")
+            await asyncio.sleep(MARK_WS_RECONNECT_DELAY)
+
+
+# ============================================================
+# Job الدوري: مزامنة + fallback سعري
+# ============================================================
+async def watch_sync_job(context: ContextTypes.DEFAULT_TYPE | None = None):
+    """
+    كل AUTO_PROTECT_INTERVAL ثانية:
+    - يزامن قائمة المراقبة
+    - فحص سعري احتياطي لكل رمز لم يتحدّث مؤخراً
+    """
+    if not AUTO_PROTECT_ENABLED or binance_client is None or is_banned():
+        return
+
+    try:
+        await sync_positions_and_watch()
+    except Exception as e:
+        log.exception(f"sync: {e}")
+        return
+
+    # Fallback: لو WebSocket لم يُحدّث سعراً منذ 90 ثانية → افحص عبر REST
+    now = time.time()
+    for symbol, pos in list(_watched_positions.items()):
+        if pos.get("closed") or pos.get("closing"):
+            continue
+        last = pos.get("last_ws_update", 0)
+        if now - last < 90:
+            continue
+
+        try:
+            ticker = await binance_client.futures_symbol_ticker(symbol=symbol)
+            price = float(ticker["price"])
+            await check_price_and_close(symbol, price, "rest")
+        except Exception as e:
+            log.debug(f"rest price {symbol}: {e}")
 
 
 # ============================================================
@@ -615,21 +733,26 @@ def fmt_position(p: dict) -> str | None:
         lines.append(f"  الحالي: {mark}")
     lines.append(f"  الرافعة: x{lev}")
     lines.append(f"  {icon} PnL: <b>{pnl:+.4f} USDT</b>")
+
+    # أضف TP/SL من قائمة المراقبة
+    watched = _watched_positions.get(p["symbol"])
+    if watched and not watched.get("closed"):
+        lines.append(f"  🎯 TP: {watched['tp']:.4f}")
+        lines.append(f"  🛑 SL: {watched['sl']:.4f}")
     return "\n".join(lines)
 
 
 HELP_TEXT = (
-    "🤖 <b>بوت Binance — تقاطع EMA + حماية</b>\n"
+    "🤖 <b>بوت Binance — تقاطع EMA + مراقبة ذاتية</b>\n"
     "━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>الأوامر:</b>\n"
-    "/positions — الصفقات المفتوحة\n"
+    "/positions — الصفقات + TP/SL\n"
     "/balance — الرصيد\n"
     "/pnl — الربح/الخسارة\n"
-    "/orders — كل الأوامر\n"
+    "/watch — الصفقات المراقَبة\n"
     "/status — حالة البوت\n"
     "/strategy — الاستراتيجية\n"
-    "/protect — حماية الصفقات الآن\n"
-    "/reset_protect — إعادة محاولة الرموز الفاشلة\n"
+    "/rescan — إعادة مزامنة الآن\n"
     "/close SYMBOL — إغلاق صفقة\n"
     "/mute /unmute — الإشعارات"
 )
@@ -670,7 +793,6 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        log.exception("cmd_positions")
         await update.message.reply_text(f"❌ {e}")
 
 
@@ -682,7 +804,6 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account = await fetch_account(force=True)
         wallet = float(account.get("totalWalletBalance", 0) or 0)
         unrealized = float(account.get("totalUnrealizedProfit", 0) or 0)
-        margin_bal = float(account.get("totalMarginBalance", 0) or 0)
         available = float(account.get("availableBalance", 0) or 0)
         used = float(account.get("totalPositionInitialMargin", 0) or 0)
         daily = await get_daily_realized_pnl()
@@ -690,22 +811,19 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"💰 <b>الرصيد</b>\n\n"
             f"المحفظة: <b>{wallet:.2f}</b> USDT\n"
-            f"PnL عائم: <b>{unrealized:+.4f}</b> USDT\n"
-            f"رصيد الهامش: <b>{margin_bal:.2f}</b> USDT\n"
-            f"هامش مستخدم: <b>{used:.2f}</b> USDT\n"
-            f"متاح للتداول: <b>{available:.2f}</b> USDT\n\n"
-            f"📅 PnL اليوم: <b>{daily:+.4f}</b> / -{MAX_DAILY_LOSS_USDT:.0f} USDT",
+            f"PnL عائم: <b>{unrealized:+.4f}</b>\n"
+            f"هامش مستخدم: <b>{used:.2f}</b>\n"
+            f"متاح: <b>{available:.2f}</b>\n\n"
+            f"📅 PnL اليوم: <b>{daily:+.4f}</b>",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        log.exception("cmd_balance")
         await update.message.reply_text(f"❌ {e}")
 
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    await update.message.chat.send_action(ChatAction.TYPING)
     try:
         positions = await fetch_positions(force=True)
         unrealized = sum(float(p.get("unRealizedProfit", 0) or 0) for p in positions)
@@ -714,87 +832,80 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in positions:
             pnl = float(p.get("unRealizedProfit", 0) or 0)
             icon = "📈" if pnl >= 0 else "📉"
-            lines.append(f"{icon} <b>{p.get('symbol', '?')}</b>: {pnl:+.4f} USDT")
-        breakdown = "\n".join(lines) if lines else "—"
-
+            lines.append(f"{icon} <b>{p.get('symbol', '?')}</b>: {pnl:+.4f}")
         await update.message.reply_text(
             f"📊 <b>PnL</b>\n\n"
-            f"عائم: <b>{unrealized:+.4f}</b> USDT\n"
-            f"محقق اليوم: <b>{daily:+.4f}</b> USDT\n\n"
-            f"{breakdown}",
+            f"عائم: <b>{unrealized:+.4f}</b>\n"
+            f"محقق اليوم: <b>{daily:+.4f}</b>\n\n"
+            + "\n".join(lines) if lines else "—",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        log.exception("cmd_pnl")
         await update.message.reply_text(f"❌ {e}")
 
 
-async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    await update.message.chat.send_action(ChatAction.TYPING)
-    try:
-        orders = await fetch_open_orders(force=True)
-        if not orders:
-            await update.message.reply_text(
-                "لا توجد أوامر معلقة.\n"
-                "<i>إذا كنت ترى TP/SL في تطبيق Binance، "
-                "فهي على الأرجح غير مرئية عبر API — لكنها تعمل.</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        by_symbol: dict = {}
-        for o in orders:
-            by_symbol.setdefault(o["symbol"], []).append(o)
-
-        lines = [f"📋 <b>الأوامر ({len(orders)})</b>"]
-        for symbol, ords in by_symbol.items():
-            lines.append(f"\n<b>{symbol}</b> ({len(ords)}):")
-            for o in ords:
-                price = o.get("price") or o.get("stopPrice") or "M"
-                otype = o.get("type", "?")
-                src = o.get("_source", "regular")
-                tag = "🔸" if src == "algo" else "•"
-                otype_ar = {
-                    "TAKE_PROFIT_MARKET": "🎯 جني سوقي",
-                    "STOP_MARKET": "🛑 وقف سوقي",
-                    "TAKE_PROFIT": "🎯 جني",
-                    "STOP": "🛑 وقف",
-                    "LIMIT": "📌 حد",
-                }.get(otype, otype)
-                lines.append(
-                    f"  {tag} {otype_ar} {o.get('side','?')}\n"
-                    f"    {o.get('origQty','?')} @ {price}"
-                )
-
+    if not _watched_positions:
         await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML
+            "👁️ لا توجد صفقات تحت المراقبة.\n\n"
+            "<i>استخدم /rescan لإعادة المزامنة.</i>",
+            parse_mode=ParseMode.HTML,
         )
-    except Exception as e:
-        log.exception("cmd_orders")
-        await update.message.reply_text(f"❌ {e}")
+        return
+
+    lines = [f"👁️ <b>تحت المراقبة ({len(_watched_positions)})</b>\n"]
+    for sym, pos in _watched_positions.items():
+        status = "🟢 نشط"
+        if pos.get("closed"):
+            status = "✅ أُغلق"
+        elif pos.get("closing"):
+            status = "⏳ جارٍ الإغلاق"
+
+        side_emoji = "🟢 LONG" if pos["side"] == "LONG" else "🔴 SHORT"
+        lines.append(
+            f"\n<b>{sym}</b> {side_emoji}\n"
+            f"  الحالة: {status}\n"
+            f"  الدخول: {pos['entry']:.4f}\n"
+            f"  🎯 TP: {pos['tp']:.4f}\n"
+            f"  🛑 SL: {pos['sl']:.4f}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_rescan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    await update.message.reply_text("🔄 جاري المزامنة...")
+    await sync_positions_and_watch()
+    await update.message.reply_text(
+        f"✅ {len(_watched_positions)} صفقة تحت المراقبة.\n"
+        f"أرسل /watch للتفاصيل."
+    )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
-    status = "🟢 متصل" if binance_client else "🔴 غير متصل"
-    notif = "🔔" if notifications_enabled else "🔕"
+    ws_status = "🟢" if _user_stream_task and not _user_stream_task.done() else "🔴"
+    mark_status = "🟢" if _mark_watcher_task and not _mark_watcher_task.done() else "🔴"
     ban = (f"\n⛔ محظور — ~{ban_remaining_sec()//60} دقيقة"
            if is_banned() else "")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    protect = "🟢" if AUTO_PROTECT_ENABLED else "🔴"
-    ws = "🟢" if _user_stream_task and not _user_stream_task.done() else "🔴"
-    failed = len(_protect_failures)
 
     await update.message.reply_text(
         f"🤖 <b>حالة البوت</b>\n\n"
-        f"Binance: {status}\n"
-        f"WebSocket: {ws}\n"
-        f"الإشعارات: {notif}\n"
-        f"الحماية: {protect}\n"
-        f"رموز فشلت حمايتها: {failed}\n"
+        f"Binance: {'🟢' if binance_client else '🔴'}\n"
+        f"WebSocket أوامر: {ws_status}\n"
+        f"WebSocket أسعار: {mark_status}\n"
+        f"الإشعارات: {'🔔' if notifications_enabled else '🔕'}\n"
+        f"الحماية: {'🟢' if AUTO_PROTECT_ENABLED else '🔴'}\n"
+        f"الوضع: <b>{CLOSE_MODE}</b>\n"
+        f"تحت المراقبة: {len(_watched_positions)}\n"
         f"الوقت: {ts}{ban}",
         parse_mode=ParseMode.HTML,
     )
@@ -811,43 +922,21 @@ async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend_str = ("📈" if trend[1] == "UP" else "📉") if trend else "—"
         state_lines.append(f"  {st_str} <b>{s}</b> {trend_str}")
 
-    daily = await get_daily_realized_pnl()
     effective_sl = min(SL_USDT, MARGIN_USDT * SL_CAP_RATIO)
     notional = MARGIN_USDT * LEVERAGE
+    daily = await get_daily_realized_pnl()
 
     await update.message.reply_text(
         f"📈 <b>الاستراتيجية</b>\n\n"
         f"{'🟢 مفعلة' if STRATEGY_ENABLED else '🔴 معطلة'}\n"
-        f"EMA {EMA_FAST}/{EMA_SLOW} @ {STRATEGY_INTERVAL}\n"
-        f"الاتجاه: {'🟢' if TREND_FILTER_ENABLED else '🔴'} "
-        f"(EMA {TREND_EMA_PERIOD} @ {TREND_TIMEFRAME})\n\n"
+        f"EMA {EMA_FAST}/{EMA_SLOW} @ {STRATEGY_INTERVAL}\n\n"
         f"<b>الرموز:</b>\n" + "\n".join(state_lines) + "\n\n"
         f"الهامش: {MARGIN_USDT}$ × x{LEVERAGE} = {notional:.0f}$\n"
         f"🎯 +{TP_USDT}$ | 🛑 -{effective_sl:.2f}$\n"
-        f"PnL اليوم: {daily:+.4f} USDT\n\n"
-        f"🛡️ حماية: TP +{AUTO_PROTECT_TP_PCT}% / SL -{AUTO_PROTECT_SL_PCT}%",
+        f"PnL اليوم: {daily:+.4f}\n\n"
+        f"🛡️ المراقبة: TP +{AUTO_PROTECT_TP_PCT}% / SL -{AUTO_PROTECT_SL_PCT}%\n"
+        f"الوضع: {CLOSE_MODE}",
         parse_mode=ParseMode.HTML,
-    )
-
-
-async def cmd_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-    await update.message.reply_text("🛡️ جاري الفحص...")
-    _protected_positions.clear()
-    _protect_failures.clear()
-    await auto_protect_job(context)
-    await update.message.reply_text("✅ تم.")
-
-
-async def cmd_reset_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-    _protect_failures.clear()
-    _algo_unsupported.clear()
-    await update.message.reply_text(
-        "🔄 تم مسح ذاكرة الفشل.\n"
-        "أرسل /protect لإعادة المحاولة."
     )
 
 
@@ -877,14 +966,12 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
             symbol=symbol, side=side, type="MARKET",
             quantity=abs(amt), reduceOnly=True,
         )
-        _protected_positions.pop(symbol, None)
-        _protect_failures.pop(symbol, None)
+        _watched_positions.pop(symbol, None)
         await update.message.reply_text(
-            f"✅ تم إغلاق {symbol}\n{order.get('status', '')}",
+            f"✅ أُغلق {symbol}\n{order.get('status', '')}",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        log.exception("cmd_close")
         await update.message.reply_text(f"❌ {e}")
 
 
@@ -915,8 +1002,7 @@ async def check_crossover(symbol: str) -> str | None:
             symbol=symbol, interval=STRATEGY_INTERVAL,
             limit=EMA_SLOW + 50,
         )
-    except Exception as e:
-        log.warning(f"{symbol}: klines {e}")
+    except Exception:
         return None
 
     if len(klines) < EMA_SLOW + 5:
@@ -933,14 +1019,13 @@ async def check_crossover(symbol: str) -> str | None:
     if not ema_fast or not ema_slow:
         return None
 
-    current_state = "FAST_ABOVE" if ema_fast[-1] > ema_slow[-1] else "FAST_BELOW"
-    prev_state = _last_ema_states.get(symbol)
-    _last_ema_states[symbol] = current_state
+    current = "FAST_ABOVE" if ema_fast[-1] > ema_slow[-1] else "FAST_BELOW"
+    prev = _last_ema_states.get(symbol)
+    _last_ema_states[symbol] = current
 
-    if prev_state is None or prev_state == current_state:
+    if prev is None or prev == current:
         return None
-
-    return "LONG" if current_state == "FAST_ABOVE" else "SHORT"
+    return "LONG" if current == "FAST_ABOVE" else "SHORT"
 
 
 async def place_trade(symbol: str, side: str) -> bool:
@@ -970,26 +1055,19 @@ async def place_trade(symbol: str, side: str) -> bool:
 
     try:
         step, tick = await get_symbol_filters(symbol)
-    except Exception as e:
-        await send(f"⚠️ دقة {symbol}: {e}")
+    except Exception:
         return False
 
     try:
         ticker = await binance_client.futures_symbol_ticker(symbol=symbol)
         price = float(ticker["price"])
-    except Exception as e:
-        await send(f"⚠️ سعر {symbol}: {e}")
+    except Exception:
         return False
 
     notional = MARGIN_USDT * LEVERAGE
     qty = round_step(notional / price, step)
     if qty <= 0:
         return False
-
-    tp_move_pct = TP_USDT / notional
-    effective_sl = min(SL_USDT, MARGIN_USDT * SL_CAP_RATIO)
-    sl_capped = SL_USDT > effective_sl
-    sl_move_pct = effective_sl / notional
 
     order_side = "BUY" if side == "LONG" else "SELL"
     try:
@@ -1009,51 +1087,16 @@ async def place_trade(symbol: str, side: str) -> bool:
         except Exception:
             fill_price = price
 
-    if side == "LONG":
-        tp_price = round_step(fill_price * (1 + tp_move_pct), tick)
-        sl_price = round_step(fill_price * (1 - sl_move_pct), tick)
-        close_side = "SELL"
-    else:
-        tp_price = round_step(fill_price * (1 - tp_move_pct), tick)
-        sl_price = round_step(fill_price * (1 + sl_move_pct), tick)
-        close_side = "BUY"
-
-    tp_ok, sl_ok = await place_tp_sl_orders(
-        symbol, close_side, qty, tp_price, sl_price
-    )
-
-    if tp_ok and sl_ok:
-        _protected_positions[symbol] = (qty, fill_price)
-
-    side_emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-    warn_lines = []
-    if sl_capped:
-        warn_lines.append(f"⚠️ SL مقصوص إلى -{effective_sl:.2f}$")
-    if not tp_ok or not sl_ok:
-        warn_lines.append(
-            f"⚠️ فشل: {'TP ' if not tp_ok else ''}{'SL ' if not sl_ok else ''}"
-        )
-
-    try:
-        positions = await fetch_positions()
-        open_count = len(positions)
-    except Exception:
-        open_count = "?"
-
-    msg = (
+    await send(
         f"🎯 <b>فتح صفقة</b>\n\n"
-        f"{side_emoji} | <b>{symbol}</b>\n"
+        f"{'🟢 LONG' if side == 'LONG' else '🔴 SHORT'} | <b>{symbol}</b>\n"
         f"الدخول: {fill_price}\n"
         f"الكمية: {qty}\n"
-        f"الهامش: {MARGIN_USDT}$ | x{LEVERAGE}\n\n"
-        f"🎯 TP: {tp_price} ({'+' if tp_ok else '❌ '}{tp_move_pct*100:.2f}%)\n"
-        f"🛑 SL: {sl_price} ({'-' if sl_ok else '❌ '}{sl_move_pct*100:.2f}%)\n\n"
-        f"المفتوحة: {open_count}/{MAX_CONCURRENT_TRADES}"
+        f"الهامش: {MARGIN_USDT}$ | x{LEVERAGE}"
     )
-    if warn_lines:
-        msg += "\n\n" + "\n".join(warn_lines)
 
-    await send(msg)
+    # أضف إلى المراقبة فوراً
+    await sync_positions_and_watch()
     return True
 
 
@@ -1093,169 +1136,10 @@ async def strategy_job(context: ContextTypes.DEFAULT_TYPE):
             log.info(f"📶 {symbol}: {signal}")
             success = await place_trade(symbol, signal)
             if success:
-                try:
-                    positions = await fetch_positions(force=True)
-                    open_symbols = {p["symbol"] for p in positions}
-                except Exception:
-                    open_symbols.add(symbol)
-                    positions = positions + [{"symbol": symbol}]
+                positions = positions + [{"symbol": symbol}]
+                open_symbols.add(symbol)
     except Exception as e:
         log.exception(f"strategy_job: {e}")
-
-
-# ============================================================
-# الحماية التلقائية — مع منع الإزعاج
-# ============================================================
-async def auto_protect_job(context: ContextTypes.DEFAULT_TYPE | None = None):
-    if not AUTO_PROTECT_ENABLED or binance_client is None:
-        return
-    if is_banned():
-        return
-
-    try:
-        positions = await fetch_positions()
-        if not positions:
-            _protected_positions.clear()
-            _protect_failures.clear()
-            return
-
-        all_orders = await fetch_open_orders(force=True)
-        orders_by_symbol: dict = {}
-        for o in all_orders:
-            orders_by_symbol.setdefault(o["symbol"], []).append(o)
-
-        now = time.time()
-
-        for p in positions:
-            symbol = p["symbol"]
-            try:
-                amt = float(p["positionAmt"])
-            except (KeyError, ValueError):
-                continue
-            if amt == 0:
-                continue
-
-            entry = float(p.get("entryPrice", 0) or 0)
-            if entry <= 0:
-                continue
-
-            abs_amt = abs(amt)
-            notional = abs_amt * entry
-            if notional < AUTO_PROTECT_MIN_NOTIONAL:
-                continue
-
-            # فحص الكاش
-            cached = _protected_positions.get(symbol)
-            if cached:
-                ca, ce = cached
-                if (abs(ca - abs_amt) / max(abs_amt, 1e-9) < 1e-4 and
-                        abs(ce - entry) / max(entry, 1e-9) < 1e-4):
-                    continue
-
-            # فحص الأوامر الموجودة
-            symbol_orders = orders_by_symbol.get(symbol, [])
-            has_tp = False
-            has_sl = False
-            for o in symbol_orders:
-                otype = o.get("type", "")
-                cp = o.get("closePosition", False)
-                ro = o.get("reduceOnly", False)
-                if not (cp or ro):
-                    continue
-                if "TAKE_PROFIT" in otype:
-                    has_tp = True
-                elif otype in ("STOP_MARKET", "STOP"):
-                    has_sl = True
-
-            # إذا محمية → تجاهل
-            if has_tp and has_sl:
-                _protected_positions[symbol] = (abs_amt, entry)
-                _protect_failures.pop(symbol, None)
-                continue
-
-            # فحص محاولات الفشل السابقة
-            failure = _protect_failures.get(symbol, {})
-            attempts = failure.get("attempts", 0)
-
-            if attempts >= AUTO_PROTECT_MAX_ATTEMPTS:
-                # توقف عن المحاولة — لا إزعاج
-                continue
-
-            # حد زمني بين المحاولات (60 ثانية)
-            last_try = failure.get("last_try", 0)
-            if now - last_try < 60:
-                continue
-
-            # حاول وضع TP/SL
-            try:
-                step, tick = await get_symbol_filters(symbol)
-            except Exception:
-                continue
-
-            is_long = amt > 0
-            close_side = "SELL" if is_long else "BUY"
-
-            if is_long:
-                tp_price = round_step(entry * (1 + AUTO_PROTECT_TP_PCT / 100), tick)
-                sl_price = round_step(entry * (1 - AUTO_PROTECT_SL_PCT / 100), tick)
-            else:
-                tp_price = round_step(entry * (1 - AUTO_PROTECT_TP_PCT / 100), tick)
-                sl_price = round_step(entry * (1 + AUTO_PROTECT_SL_PCT / 100), tick)
-
-            tp_ok, sl_ok = await place_tp_sl_orders(
-                symbol, close_side, abs_amt, tp_price, sl_price,
-                place_tp=not has_tp, place_sl=not has_sl,
-            )
-
-            if tp_ok and sl_ok:
-                _protected_positions[symbol] = (abs_amt, entry)
-                _protect_failures.pop(symbol, None)
-
-                side_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
-                tp_line = (
-                    f"🎯 TP: {tp_price} (+{AUTO_PROTECT_TP_PCT:.2f}%) ✅"
-                    if not has_tp else "🎯 TP: موجود"
-                )
-                sl_line = (
-                    f"🛑 SL: {sl_price} (-{AUTO_PROTECT_SL_PCT:.2f}%) ✅"
-                    if not has_sl else "🛑 SL: موجود"
-                )
-
-                await send(
-                    f"🛡️ <b>حماية صفقة</b>\n\n"
-                    f"{side_emoji} | <b>{symbol}</b>\n"
-                    f"الكمية: {abs_amt}\n"
-                    f"الدخول: {entry}\n"
-                    f"Notional: ~{notional:.0f}$\n\n"
-                    f"{tp_line}\n{sl_line}"
-                )
-                log.info(f"🛡️ {symbol} محمي")
-            else:
-                # سجّل الفشل
-                failure["attempts"] = attempts + 1
-                failure["last_try"] = now
-                _protect_failures[symbol] = failure
-
-                log.warning(
-                    f"⚠️ فشل حماية {symbol} "
-                    f"(محاولة {failure['attempts']}/{AUTO_PROTECT_MAX_ATTEMPTS})"
-                )
-
-                # إشعار أول مرة فقط
-                if not failure.get("notified"):
-                    failure["notified"] = True
-                    await send(
-                        f"⚠️ <b>لم أستطع حماية {symbol} آلياً</b>\n\n"
-                        f"قد يكون الحساب يستخدم نظام Algo Orders.\n"
-                        f"TP/SL الحالي: "
-                        f"{'✅ موجود' if has_tp or has_sl else '❌ غير موجود'}\n\n"
-                        f"💡 <i>صفقتك آمنة إذا كان TP/SL يظهر في التطبيق.</i>\n"
-                        f"إن لم يظهر، ضعه يدوياً:\n"
-                        f"🎯 TP: {tp_price}\n"
-                        f"🛑 SL: {sl_price}"
-                    )
-    except Exception as e:
-        log.exception(f"auto_protect_job: {e}")
 
 
 # ============================================================
@@ -1280,7 +1164,7 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
         if not positions:
             msg = (
                 f"⏰ <b>تقرير كل ساعة</b> | {ts}\n\n"
-                f"لا صفقات مفتوحة.\n"
+                f"لا صفقات.\n"
                 f"💰 الرصيد: {balance:.2f}$\n"
                 f"📅 PnL اليوم: {daily:+.4f}$"
             )
@@ -1292,7 +1176,7 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
                 f"💰 الرصيد: {balance:.2f}$\n"
                 f"📊 عائم: {unrealized:+.4f}$\n"
                 f"📅 اليوم: {daily:+.4f}$\n"
-                f"🔢 {len(positions)}/{MAX_CONCURRENT_TRADES}"
+                f"👁️ مراقبة: {len(_watched_positions)}"
             )
 
         await context.bot.send_message(
@@ -1303,14 +1187,14 @@ async def hourly_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# WebSocket
+# WebSocket أوامر
 # ============================================================
 async def user_stream_task(app: Application):
     bsm = BinanceSocketManager(binance_client)
     while True:
         try:
             async with bsm.futures_user_socket() as stream:
-                log.info("🔌 WebSocket متصل")
+                log.info("🔌 WebSocket الأوامر متصل")
                 while True:
                     try:
                         msg = await stream.recv()
@@ -1324,21 +1208,10 @@ async def user_stream_task(app: Application):
                         for pos in msg["a"]["P"]:
                             amt = float(pos["pa"])
                             if amt != 0 and pos.get("bc", "0") == "0":
-                                side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
-                                if notifications_enabled:
-                                    try:
-                                        await app.bot.send_message(
-                                            chat_id=CHAT_ID,
-                                            text=(
-                                                f"🚀 <b>صفقة مفتوحة</b>\n\n"
-                                                f"{side} | <b>{pos['s']}</b>\n"
-                                                f"الحجم: {abs(amt)}\n"
-                                                f"الدخول: {pos['ep']}"
-                                            ),
-                                            parse_mode=ParseMode.HTML,
-                                        )
-                                    except Exception:
-                                        pass
+                                # مركز جديد → أضف للمراقبة
+                                asyncio.create_task(
+                                    sync_positions_and_watch()
+                                )
 
                     elif msg.get("e") == "ORDER_TRADE_UPDATE":
                         o = msg["o"]
@@ -1358,8 +1231,7 @@ async def user_stream_task(app: Application):
                                 emoji, title = "⚡", "تنفيذ"
 
                             if "TAKE_PROFIT" in otype or "STOP" in otype:
-                                _protected_positions.pop(o["s"], None)
-                                _protect_failures.pop(o["s"], None)
+                                _watched_positions.pop(o["s"], None)
 
                             if notifications_enabled:
                                 try:
@@ -1376,7 +1248,6 @@ async def user_stream_task(app: Application):
                                 except Exception:
                                     pass
         except asyncio.CancelledError:
-            log.info("🔌 WebSocket أُغلق")
             raise
         except Exception as e:
             log.warning(f"WS: {e}")
@@ -1387,38 +1258,51 @@ async def user_stream_task(app: Application):
 # Lifecycle
 # ============================================================
 async def post_init(app: Application):
-    global binance_client, _app, _user_stream_task
+    global binance_client, _app, _user_stream_task, _mark_watcher_task
     _app = app
 
     binance_client = await AsyncClient.create(API_KEY, API_SECRET)
     log.info("Binance client جاهز")
 
+    # ابدأ WebSocket الأوامر
     _user_stream_task = app.create_task(user_stream_task(app))
+
+    # ابدأ WebSocket الأسعار (مراقبة TP/SL)
+    if AUTO_PROTECT_ENABLED:
+        _mark_watcher_task = app.create_task(mark_price_watcher(app))
+
+    # مزامنة أولية
+    try:
+        await asyncio.sleep(2)
+        await sync_positions_and_watch()
+    except Exception as e:
+        log.warning(f"initial sync: {e}")
 
     try:
         await app.bot.send_message(
             chat_id=CHAT_ID,
             text=(
                 f"🤖 <b>بدأ البوت</b>\n\n"
-                f"الاستراتيجية: {'🟢' if STRATEGY_ENABLED else '🔴'}\n"
-                f"الحماية: {'🟢' if AUTO_PROTECT_ENABLED else '🔴'} "
-                f"(TP +{AUTO_PROTECT_TP_PCT}% / SL -{AUTO_PROTECT_SL_PCT}%)\n\n"
+                f"🛡️ الوضع: <b>{CLOSE_MODE}</b>\n"
+                f"TP: +{AUTO_PROTECT_TP_PCT}% | SL: -{AUTO_PROTECT_SL_PCT}%\n"
+                f"👁️ تحت المراقبة: {len(_watched_positions)}\n\n"
                 f"/help للأوامر"
             ),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        log.error(f"startup send: {e}")
+        log.error(f"startup: {e}")
 
 
 async def post_shutdown(app: Application):
-    global binance_client, _user_stream_task
-    if _user_stream_task and not _user_stream_task.done():
-        _user_stream_task.cancel()
-        try:
-            await asyncio.wait_for(_user_stream_task, timeout=3)
-        except Exception:
-            pass
+    global binance_client, _user_stream_task, _mark_watcher_task
+    for task in (_user_stream_task, _mark_watcher_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3)
+            except Exception:
+                pass
     if binance_client:
         try:
             await binance_client.close_connection()
@@ -1432,7 +1316,7 @@ async def error_handler(update, context):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
         return
-    log.error(f"❌ {err}", exc_info=err)
+    log.error(f"❌ {err}")
 
 
 # ============================================================
@@ -1440,7 +1324,7 @@ async def error_handler(update, context):
 # ============================================================
 def main():
     threading.Thread(target=_run_health, daemon=True).start()
-    print("🚀 Binance Bot...")
+    print(f"🚀 Binance Bot — وضع: {CLOSE_MODE}")
 
     app = Application.builder() \
         .token(TELEGRAM_TOKEN) \
@@ -1451,10 +1335,10 @@ def main():
     handlers = [
         ("start", cmd_start), ("help", cmd_help),
         ("positions", cmd_positions), ("balance", cmd_balance),
-        ("pnl", cmd_pnl), ("orders", cmd_orders),
+        ("pnl", cmd_pnl), ("watch", cmd_watch),
         ("status", cmd_status), ("strategy", cmd_strategy),
-        ("protect", cmd_protect), ("reset_protect", cmd_reset_protect),
-        ("close", cmd_close), ("mute", cmd_mute), ("unmute", cmd_unmute),
+        ("rescan", cmd_rescan), ("close", cmd_close),
+        ("mute", cmd_mute), ("unmute", cmd_unmute),
     ]
     for name, h in handlers:
         app.add_handler(CommandHandler(name, h))
@@ -1464,15 +1348,17 @@ def main():
         app.job_queue.run_repeating(
             hourly_job, interval=HOURLY_MIN * 60, first=300, name="hourly"
         )
+
         if STRATEGY_ENABLED:
             app.job_queue.run_repeating(
                 strategy_job, interval=STRATEGY_JOB_INTERVAL,
                 first=15, name="strategy",
             )
+
         if AUTO_PROTECT_ENABLED:
             app.job_queue.run_repeating(
-                auto_protect_job, interval=AUTO_PROTECT_INTERVAL,
-                first=25, name="auto_protect",
+                watch_sync_job, interval=AUTO_PROTECT_INTERVAL,
+                first=30, name="watch_sync",
             )
 
     print("✅ جاهز")
