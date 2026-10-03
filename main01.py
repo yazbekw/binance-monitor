@@ -1,6 +1,6 @@
 """
 Binance Monitor Bot — تقاطع EMA + مراقبة TP/SL ذاتية
-الحل: إذا فشل وضع TP/SL على Binance → يراقب السعر ويغلق بنفسه
+المراقبة عبر WebSocket bookTicker (خفيف، لا يسبب حظر)
 """
 import os
 import sys
@@ -99,15 +99,7 @@ _default_sl_pct = round(_effective_sl_ref / _notional_ref * 100, 3)
 AUTO_PROTECT_TP_PCT = float(os.getenv("AUTO_PROTECT_TP_PCT", str(_default_tp_pct)))
 AUTO_PROTECT_SL_PCT = float(os.getenv("AUTO_PROTECT_SL_PCT", str(_default_sl_pct)))
 
-CLOSE_MODE = os.getenv("CLOSE_MODE", "monitor").lower()
-if CLOSE_MODE not in ("monitor", "orders", "both"):
-    CLOSE_MODE = "monitor"
-
 # حماية من الانزلاق (محجوز للاستخدام المستقبلي)
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))
-
-
-# حماية من الانزلاق: لا تقبل سعراً أسوأ من X% عن مستوى TP/SL
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))
 
 # ============================================================
@@ -314,7 +306,8 @@ async def get_symbol_filters(symbol: str) -> tuple[str, str]:
 async def get_daily_realized_pnl() -> float:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     now = time.time()
-    if _daily_pnl_cache["date"] == today and now - _daily_pnl_cache["last_fetch"] < 45:
+    # كاش 5 دقائق (بدل 45 ثانية) لتقليل الضغط على Binance
+    if _daily_pnl_cache["date"] == today and now - _daily_pnl_cache["last_fetch"] < 300:
         return _daily_pnl_cache["pnl"]
 
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -396,9 +389,7 @@ async def try_place_tp_sl_on_binance(
     symbol: str, close_side: str, qty: float,
     tp_price: float, sl_price: float,
 ) -> tuple[bool, bool]:
-    """
-    محاولة واحدة فقط لكل أمر — لا حلقات.
-    """
+    """محاولة واحدة فقط لكل أمر — لا حلقات."""
     tp_ok, tp_err = await _try_order(
         symbol, close_side, "TAKE_PROFIT_MARKET", tp_price, qty
     )
@@ -413,7 +404,7 @@ async def try_place_tp_sl_on_binance(
 
 
 # ============================================================
-# المراقبة الذاتية — قلب الحل الجديد
+# المراقبة الذاتية
 # ============================================================
 def _get_lock(symbol: str) -> asyncio.Lock:
     if symbol not in _close_locks:
@@ -422,10 +413,7 @@ def _get_lock(symbol: str) -> asyncio.Lock:
 
 
 async def sync_positions_and_watch():
-    """
-    يزامن قائمة المراقبة مع المراكز الفعلية.
-    يُضيف الجديد، يحذف المُغلق.
-    """
+    """يزامن قائمة المراقبة مع المراكز الفعلية."""
     if binance_client is None or is_banned():
         return
 
@@ -465,7 +453,6 @@ async def sync_positions_and_watch():
 
         is_long = amt > 0
 
-        # احسب المستويات
         if is_long:
             tp = entry * (1 + AUTO_PROTECT_TP_PCT / 100)
             sl = entry * (1 - AUTO_PROTECT_SL_PCT / 100)
@@ -475,13 +462,11 @@ async def sync_positions_and_watch():
 
         existing = _watched_positions.get(symbol)
         if existing:
-            # لا تغيير في الحجم/الدخول
             same_amt = abs(existing["qty"] - abs_amt) / max(abs_amt, 1e-9) < 1e-4
             same_entry = abs(existing["entry"] - entry) / max(entry, 1e-9) < 1e-4
             if same_amt and same_entry:
                 continue
 
-        # مركز جديد أو تغيّر
         _watched_positions[symbol] = {
             "side": "LONG" if is_long else "SHORT",
             "entry": entry,
@@ -497,7 +482,6 @@ async def sync_positions_and_watch():
         log.info(f"👁️ جديد: {symbol} {('LONG' if is_long else 'SHORT')} "
                  f"| TP={tp:.4f} SL={sl:.4f}")
 
-        # إشعار بالمركز الجديد
         side_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
         try:
             await send(
@@ -515,9 +499,7 @@ async def sync_positions_and_watch():
 
 
 async def check_price_and_close(symbol: str, price: float, source: str = "ws"):
-    """
-    يفحص السعر الحالي مقابل TP/SL ويغلق عند الحاجة.
-    """
+    """يفحص السعر مقابل TP/SL ويغلق عند الحاجة."""
     pos = _watched_positions.get(symbol)
     if not pos or pos.get("closed") or pos.get("closing"):
         return
@@ -546,12 +528,9 @@ async def check_price_and_close(symbol: str, price: float, source: str = "ws"):
 
 
 async def close_position_market(symbol: str, pos: dict, reason: str, price: float):
-    """
-    يُغلق المركز بأمر MARKET.
-    """
+    """يُغلق المركز بأمر MARKET."""
     lock = _get_lock(symbol)
     async with lock:
-        # إعادة تحقق
         if pos.get("closed") or pos.get("closing"):
             return
 
@@ -560,13 +539,11 @@ async def close_position_market(symbol: str, pos: dict, reason: str, price: floa
         try:
             side = "SELL" if pos["side"] == "LONG" else "BUY"
 
-            # حاول إلغاء أي أوامر معلقة (قد تكون TP/SL يدوي)
             try:
                 await binance_client.futures_cancel_all_open_orders(symbol=symbol)
             except Exception as e:
                 log.debug(f"cancel orders {symbol}: {e}")
 
-            # أمر MARKET
             order = await binance_client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -597,7 +574,6 @@ async def close_position_market(symbol: str, pos: dict, reason: str, price: floa
 
             log.info(f"✅ {reason} {symbol} — أُغلق @ {avg or price}")
 
-            # انتظر ثم احذف
             await asyncio.sleep(10)
             _watched_positions.pop(symbol, None)
             _close_locks.pop(symbol, None)
@@ -618,12 +594,12 @@ async def close_position_market(symbol: str, pos: dict, reason: str, price: floa
 
 
 # ============================================================
-# Mark Price WebSocket (المراقبة اللحظية)
+# WebSocket bookTicker (المراقبة اللحظية — خفيف)
 # ============================================================
 async def mark_price_watcher(app: Application):
     """
-    يستمع لأسعار markPrice لكل مركز مُراقب.
-    عند وصول TP/SL → يُغلق.
+    يستمع لأسعار bookTicker لكل مركز مُراقب.
+    bookTicker أخف بكثير من markPrice@1s ولا يسبب حظر.
     """
     while True:
         try:
@@ -632,7 +608,6 @@ async def mark_price_watcher(app: Application):
                 await asyncio.sleep(5)
                 continue
 
-            # راقب فقط الرموز التي لم تُغلق
             active = [
                 s for s in symbols
                 if _watched_positions.get(s)
@@ -643,26 +618,30 @@ async def mark_price_watcher(app: Application):
                 await asyncio.sleep(5)
                 continue
 
-            streams = [f"{s.lower()}@markPrice@1s" for s in active]
+            # bookTicker أخف بكثير من markPrice@1s
+            streams = [f"{s.lower()}@bookTicker" for s in active]
             bsm = BinanceSocketManager(binance_client)
 
-            log.info(f"📡 mark watcher: {len(active)} رموز")
+            log.info(f"📡 bookTicker watcher: {len(active)} رموز")
             try:
                 async with bsm.futures_multiplex_socket(streams) as stream:
                     while True:
                         msg = await stream.recv()
                         data = msg.get("data", msg)
-                        event = data.get("e")
-                        if event != "markPriceUpdate":
+
+                        # bookTicker format: {"s": "BTCUSDT", "b": bid, "a": ask, ...}
+                        symbol = data.get("s")
+                        if not symbol:
                             continue
 
-                        symbol = data.get("s")
-                        price_str = data.get("p")
-                        if not symbol or not price_str:
+                        bid = data.get("b")
+                        ask = data.get("a")
+                        if not bid or not ask:
                             continue
 
                         try:
-                            price = float(price_str)
+                            # نستخدم منتصف السبريد كسعر تقريبي
+                            price = (float(bid) + float(ask)) / 2.0
                         except (ValueError, TypeError):
                             continue
 
@@ -670,12 +649,12 @@ async def mark_price_watcher(app: Application):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning(f"mark ws inner: {e}")
+                log.warning(f"bookTicker ws inner: {e}")
                 await asyncio.sleep(MARK_WS_RECONNECT_DELAY)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.warning(f"mark watcher: {e}")
+            log.warning(f"bookTicker watcher: {e}")
             await asyncio.sleep(MARK_WS_RECONNECT_DELAY)
 
 
@@ -702,7 +681,7 @@ async def watch_sync_job(context: ContextTypes.DEFAULT_TYPE | None = None):
     if CLOSE_MODE == "both":
         await try_place_orders_for_all()
 
-    # Fallback سعري (كما هو)
+    # Fallback سعري (للرموز التي لم تُحدَّث منذ 90 ثانية)
     now = time.time()
     for symbol, pos in list(_watched_positions.items()):
         if pos.get("closed") or pos.get("closing"):
@@ -716,6 +695,8 @@ async def watch_sync_job(context: ContextTypes.DEFAULT_TYPE | None = None):
             await check_price_and_close(symbol, price, "rest")
         except Exception as e:
             log.debug(f"rest price {symbol}: {e}")
+        # تأخير مهم بين الرموز لتقليل الضغط على REST API
+        await asyncio.sleep(1)
 
 
 async def try_place_orders_for_all():
@@ -756,6 +737,7 @@ async def try_place_orders_for_all():
             watched["tp"], watched["sl"],
         )
         log.info(f"{symbol}: orders mode TP={tp_ok} SL={sl_ok}")
+        await asyncio.sleep(1)
 
 
 # ============================================================
@@ -786,7 +768,6 @@ def fmt_position(p: dict) -> str | None:
     lines.append(f"  الرافعة: x{lev}")
     lines.append(f"  {icon} PnL: <b>{pnl:+.4f} USDT</b>")
 
-    # أضف TP/SL من قائمة المراقبة
     watched = _watched_positions.get(p["symbol"])
     if watched and not watched.get("closed"):
         lines.append(f"  🎯 TP: {watched['tp']:.4f}")
@@ -956,7 +937,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"WebSocket أسعار: {mark_status}\n"
         f"الإشعارات: {'🔔' if notifications_enabled else '🔕'}\n"
         f"الحماية: {'🟢' if AUTO_PROTECT_ENABLED else '🔴'}\n"
-        f"الوضع: <b>{CLOSE_MODE}</b>\n"   
         f"الوضع: <b>{CLOSE_MODE}</b>\n"
         f"تحت المراقبة: {len(_watched_positions)}\n"
         f"الوقت: {ts}{ban}",
@@ -1261,7 +1241,6 @@ async def user_stream_task(app: Application):
                         for pos in msg["a"]["P"]:
                             amt = float(pos["pa"])
                             if amt != 0 and pos.get("bc", "0") == "0":
-                                # مركز جديد → أضف للمراقبة
                                 asyncio.create_task(
                                     sync_positions_and_watch()
                                 )
@@ -1317,14 +1296,11 @@ async def post_init(app: Application):
     binance_client = await AsyncClient.create(API_KEY, API_SECRET)
     log.info("Binance client جاهز")
 
-    # ابدأ WebSocket الأوامر
     _user_stream_task = app.create_task(user_stream_task(app))
 
-    # ابدأ WebSocket الأسعار (مراقبة TP/SL)
     if AUTO_PROTECT_ENABLED:
         _mark_watcher_task = app.create_task(mark_price_watcher(app))
 
-    # مزامنة أولية
     try:
         await asyncio.sleep(2)
         await sync_positions_and_watch()
