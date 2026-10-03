@@ -99,6 +99,14 @@ _default_sl_pct = round(_effective_sl_ref / _notional_ref * 100, 3)
 AUTO_PROTECT_TP_PCT = float(os.getenv("AUTO_PROTECT_TP_PCT", str(_default_tp_pct)))
 AUTO_PROTECT_SL_PCT = float(os.getenv("AUTO_PROTECT_SL_PCT", str(_default_sl_pct)))
 
+CLOSE_MODE = os.getenv("CLOSE_MODE", "monitor").lower()
+if CLOSE_MODE not in ("monitor", "orders", "both"):
+    CLOSE_MODE = "monitor"
+
+# حماية من الانزلاق (محجوز للاستخدام المستقبلي)
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))
+
+
 # حماية من الانزلاق: لا تقبل سعراً أسوأ من X% عن مستوى TP/SL
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.5"))
 
@@ -675,21 +683,26 @@ async def mark_price_watcher(app: Application):
 # Job الدوري: مزامنة + fallback سعري
 # ============================================================
 async def watch_sync_job(context: ContextTypes.DEFAULT_TYPE | None = None):
-    """
-    كل AUTO_PROTECT_INTERVAL ثانية:
-    - يزامن قائمة المراقبة
-    - فحص سعري احتياطي لكل رمز لم يتحدّث مؤخراً
-    """
     if not AUTO_PROTECT_ENABLED or binance_client is None or is_banned():
         return
 
+    # في وضع orders: حاول وضع TP/SL على Binance بدل المراقبة
+    if CLOSE_MODE == "orders":
+        await try_place_orders_for_all()
+        return
+
+    # في وضع monitor أو both: شغّل المراقبة
     try:
         await sync_positions_and_watch()
     except Exception as e:
         log.exception(f"sync: {e}")
         return
 
-    # Fallback: لو WebSocket لم يُحدّث سعراً منذ 90 ثانية → افحص عبر REST
+    # في وضع both: جرّب أيضاً وضع الأوامر مرة واحدة
+    if CLOSE_MODE == "both":
+        await try_place_orders_for_all()
+
+    # Fallback سعري (كما هو)
     now = time.time()
     for symbol, pos in list(_watched_positions.items()):
         if pos.get("closed") or pos.get("closing"):
@@ -697,13 +710,52 @@ async def watch_sync_job(context: ContextTypes.DEFAULT_TYPE | None = None):
         last = pos.get("last_ws_update", 0)
         if now - last < 90:
             continue
-
         try:
             ticker = await binance_client.futures_symbol_ticker(symbol=symbol)
             price = float(ticker["price"])
             await check_price_and_close(symbol, price, "rest")
         except Exception as e:
             log.debug(f"rest price {symbol}: {e}")
+
+
+async def try_place_orders_for_all():
+    """يحاول وضع TP/SL على Binance لكل مركز (وضع orders/both)."""
+    try:
+        positions = await fetch_positions()
+    except Exception:
+        return
+    for p in positions:
+        symbol = p["symbol"]
+        try:
+            amt = float(p["positionAmt"])
+        except (KeyError, ValueError):
+            continue
+        if amt == 0:
+            continue
+        entry = float(p.get("entryPrice", 0) or 0)
+        if entry <= 0:
+            continue
+        abs_amt = abs(amt)
+        if abs_amt * entry < AUTO_PROTECT_MIN_NOTIONAL:
+            continue
+
+        watched = _watched_positions.get(symbol)
+        if not watched:
+            continue
+
+        # جرّب مرة واحدة فقط — لا حلقات
+        if watched.get("orders_tried"):
+            continue
+        watched["orders_tried"] = True
+
+        is_long = amt > 0
+        close_side = "SELL" if is_long else "BUY"
+
+        tp_ok, sl_ok = await try_place_tp_sl_on_binance(
+            symbol, close_side, abs_amt,
+            watched["tp"], watched["sl"],
+        )
+        log.info(f"{symbol}: orders mode TP={tp_ok} SL={sl_ok}")
 
 
 # ============================================================
@@ -904,6 +956,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"WebSocket أسعار: {mark_status}\n"
         f"الإشعارات: {'🔔' if notifications_enabled else '🔕'}\n"
         f"الحماية: {'🟢' if AUTO_PROTECT_ENABLED else '🔴'}\n"
+        f"الوضع: <b>{CLOSE_MODE}</b>\n"   
         f"الوضع: <b>{CLOSE_MODE}</b>\n"
         f"تحت المراقبة: {len(_watched_positions)}\n"
         f"الوقت: {ts}{ban}",
