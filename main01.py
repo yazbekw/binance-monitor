@@ -52,7 +52,7 @@ MARK_WS_RECONNECT_DELAY = 5
 # ============================================================
 STRATEGY_ENABLED = os.getenv("STRATEGY_ENABLED", "false").lower() == "true"
 
-_default_symbols = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT"
+_default_symbols = "DOGEUSDT, SOLUSDT, AVAXUSDT, XRPUSDT, LINKUSDT, ETHUSDT, ADAUSDT, BNBUSDT"
 STRATEGY_SYMBOLS = [
     s.strip().upper()
     for s in os.getenv("STRATEGY_SYMBOLS", _default_symbols).split(",")
