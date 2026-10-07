@@ -1474,7 +1474,11 @@ def health():
 
 def run_flask():
     port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    log.info(f"🌐 بدء Flask على المنفذ {port}")
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    except Exception as e:
+        log.error(f"❌ Flask فشل: {e}")
 
 # ============================================================
 # TELEGRAM COMMANDS
@@ -1720,9 +1724,16 @@ def ema_loop():
 # ============================================================
 def main():
     log.info("🚀 بدء البوت الموحّد v2.0")
+    
+    # ✅ ابدأ Flask فوراً (قبل أي شيء آخر)
+    threading.Thread(target=run_flask, daemon=True).start()
+    log.info("✅ Flask يعمل — المنفذ مفتوح")
+    
+    # ثم أكمل باقي التهيئة
     load_history()
-
-    bal = get_balance()
+    
+    bal = get_balance()  # قد ينام طويلاً، لكن Flask يعمل بالفعل
+    
     sb_status = "✅ متصل" if _supabase else "❌ غير متصل"
 
     tg_log("🤖 بدء البوت الموحّد v2.0",
@@ -1741,9 +1752,7 @@ def main():
         sb_log_event("bot_started", "Bot started v2.0",
                      {"symbols": SYMBOLS, "leverage": LEVERAGE, "mode": "LIVE"})
 
-    import_manual()
-
-    threading.Thread(target=run_flask, daemon=True).start()
+    # ابدأ باقي الـ threads
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=tg_polling_loop, daemon=True).start()
