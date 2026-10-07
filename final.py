@@ -335,10 +335,20 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, cooldown_symbol=No
                     ban_until = datetime.fromtimestamp(int(m.group(1)) / 1000, tz=timezone.utc)
                     wait = (ban_until - datetime.now(timezone.utc)).total_seconds()
                     if wait > 0:
-                        log.error(f"🚫 IP محظور حتى {syr_str(ban_until)}")
-                        tg_log("🚫 IP محظور", f"ينتهي: {syr_str(ban_until)}", "🚫")
+                        log.error(f"🚫 IP محظور حتى {syr_str(ban_until)} (باقي {wait/60:.0f} دقيقة)")
+                        tg_log("🚫 IP محظور", 
+                               f"ينتهي: {syr_str(ban_until)}\n"
+                               f"الوقت المتبقي: {wait/60:.0f} دقيقة", 
+                               "🚫")
                         sb_log_event("rate_limit", "IP banned", {"until": ban_until.isoformat()})
-                        time.sleep(min(wait + 5, 7200))
+    
+                        # نوم مُقطّع لإتاحة المراقبة
+                        remaining = wait + 10
+                        while remaining > 0:
+                            chunk = min(remaining, 600)  # كل 10 دقائق
+                            log.info(f"⏸️ محظور — باقي {remaining/60:.1f} دقيقة")
+                            time.sleep(chunk)
+                            remaining -= chunk
                         continue
                 wait = BACKOFF_BASE * (2 ** attempt)
                 log.warning(f"⚠️ Rate limit — {wait}s")
