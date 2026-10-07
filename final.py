@@ -962,11 +962,19 @@ def update_trailing(symbol, info, price):
 def import_manual():
     try:
         positions = safe_api_call(client.futures_position_information, weight=5)
-        for p in positions or []:
+        if not positions:
+            log.warning("import_manual: لا توجد positions")
+            return
+        
+        imported_count = 0
+        for p in positions:
             symbol = p["symbol"]
             amt = float(p["positionAmt"])
-            if amt == 0 or symbol not in SYMBOLS:
+            
+            if amt == 0:
                 continue
+            
+            # ✅ استورد الصفقة بغض النظر عن SYMBOLS
             with state_lock:
                 if symbol in open_positions:
                     continue
@@ -978,47 +986,66 @@ def import_manual():
             unrl = float(p.get("unRealizedProfit", 0))
             mark = float(p.get("markPrice", entry))
 
-            df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
-            if df is not None:
-                df = add_indicators(df)
-                atr = float(df.iloc[-1]["atr"])
-            else:
+            # احصل على ATR (إذا فشل، استخدم 1% من السعر)
+            try:
+                df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
+                if df is not None:
+                    df = add_indicators(df)
+                    atr = float(df.iloc[-1]["atr"])
+                else:
+                    atr = entry * 0.01
+            except Exception:
                 atr = entry * 0.01
 
+            # ابحث عن SL موجود على Binance
             sl = None
             sl_id = None
+            tp_orders = []
             try:
                 orders = safe_api_call(client.futures_get_open_orders, symbol=symbol, weight=5)
                 for o in orders or []:
-                    if o["type"] in ("STOP_MARKET", "STOP"):
+                    otype = o["type"]
+                    if otype in ("STOP_MARKET", "STOP"):
                         sl = float(o["stopPrice"])
                         sl_id = o["orderId"]
-                        break
+                    elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                        tp_orders.append({
+                            "id": o["orderId"],
+                            "price": float(o["stopPrice"]),
+                        })
             except Exception:
                 pass
 
             opened_at = datetime.now(timezone.utc)
 
+            # استخرج TP1 و TP2 إذا وُجدا
+            tp1_price = tp_orders[0]["price"] if len(tp_orders) > 0 else None
+            tp2_price = tp_orders[1]["price"] if len(tp_orders) > 1 else None
+            tp1_id = tp_orders[0]["id"] if len(tp_orders) > 0 else None
+            tp2_id = tp_orders[1]["id"] if len(tp_orders) > 1 else None
+
             with state_lock:
                 open_positions[symbol] = {
                     "side": side, "entry": entry, "qty": qty, "atr": atr,
                     "current_sl": sl, "sl_order_id": sl_id,
-                    "tp1_order_id": None, "tp2_order_id": None,
-                    "tp1_price": None, "tp2_price": None,
+                    "tp1_order_id": tp1_id, "tp2_order_id": tp2_id,
+                    "tp1_price": tp1_price, "tp2_price": tp2_price,
                     "sl_on_exchange": sl_id is not None,
-                    "tp1_on_exchange": False, "tp2_on_exchange": False,
+                    "tp1_on_exchange": tp1_id is not None,
+                    "tp2_on_exchange": tp2_id is not None,
                     "tp1_executed": False, "tp2_executed": False,
                     "trailing_stage": 0,
                     "opened_at": opened_at,
                     "strategy": "MANUAL", "source": "MANUAL",
                     "notional": notional,
+                    "in_watchlist": symbol in [s for s in SYMBOLS],  # ← لتمييز إن كانت في القائمة
                 }
 
-            # حفظ في Supabase
             sb_id = sb_insert_trade({
                 "symbol": symbol, "strategy": "MANUAL", "side": side,
                 "entry_price": entry, "qty": qty, "notional": notional,
                 "leverage": LEVERAGE, "sl_price": sl,
+                "tp1_price": tp1_price, "tp2_price": tp2_price,
                 "opened_at": opened_at.isoformat(),
                 "status": "OPEN", "source": "MANUAL",
                 "notes": f"imported manually, pnl={unrl:.2f}",
@@ -1027,11 +1054,19 @@ def import_manual():
                 with state_lock:
                     open_positions[symbol]["sb_id"] = sb_id
 
+            imported_count += 1
+
+            # تمييز: في القائمة أم لا
+            wl = "✅ في القائمة" if symbol in SYMBOLS else "⚠️ خارج القائمة"
             tg_log("📥 استيراد صفقة يدوية",
-                   f"💠 {symbol}\n📊 {side}\n💵 {entry}\n📦 {qty}\n"
-                   f"💰 {unrl:+.2f} USDT\n🛡️ SL: {sl or 'لا يوجد'}",
+                   f"💠 <b>{symbol}</b> ({wl})\n"
+                   f"📊 {side}\n💵 {entry}\n📦 {qty}\n"
+                   f"💰 {unrl:+.2f} USDT\n"
+                   f"🛡️ SL: {sl or 'لا يوجد'}\n"
+                   f"🎯 TP: {tp1_price or '—'} / {tp2_price or '—'}",
                    "📥")
 
+            # أضف SL تلقائي إذا لم يوجد
             if sl is None and AUTO_SL_MANUAL:
                 auto_sl = round_price(symbol,
                                      entry - 1.5*atr if side == "LONG" else entry + 1.5*atr)
@@ -1045,8 +1080,12 @@ def import_manual():
                 if sl_order:
                     tg_log("🛡️ SL تلقائي", f"{symbol}: {auto_sl}", "🛡️")
                     sb_update_trade(sb_id, {"sl_price": auto_sl})
+        
+        log.info(f"import_manual: استُوردت {imported_count} صفقة")
+    
     except Exception as e:
-        log.error(f"import_manual: {e}")
+        log.exception(f"import_manual: {e}")
+        tg_log("⚠️ خطأ في استيراد الصفقات", str(e), "⚠️")
 
 # ============================================================
 # MONITOR
