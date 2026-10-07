@@ -4,26 +4,21 @@ Momentum Bot v2.2
 Strategy : Early Momentum Catch
 Indicators: EMA (7/25/50/200) + MACD + RSI + ATR + VWAP + Volume MA
 Features :
-  - Binance Futures execution (Market entry + SL + 2 TP levels)
-  - Telegram notifications (full lifecycle, no scan spam)
+  - Binance Futures execution (Market + SL + 2 TPs)
+  - Balance check based on MARGIN (not full position size)
   - Multi-stage Trailing Stop (BE → locked profit → dynamic trail)
   - Max concurrent trades limit
-  - Manual position import (with full details + SL/TP detection)
-  - Auto SL for manual positions without one
-  - Exchange info caching + batch price fetching (rate-limit safe)
-  - Session filter (London + NY only)
+  - Manual position import (full details + auto SL)
+  - Exchange info caching + batch price fetching
+  - Session filter (London + NY)
+  - Detailed error reporting with Binance error codes
   - Flask health check for Render
-  - Step-by-step error tracking in open_trade
-  - Non-blocking leverage/margin setup
-  - Auto-detect Hedge vs One-way mode
-  - Balance check before entry
 """
 import os
 import time
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal, ROUND_DOWN
 
 import pandas as pd
 import numpy as np
@@ -48,13 +43,14 @@ SYMBOLS            = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT")
 POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", 200))
 LEVERAGE           = int(os.getenv("LEVERAGE", 20))
 TIMEFRAME          = os.getenv("TIMEFRAME", "15m")
-TESTNET            = os.getenv("TESTNET", "False").lower() == "true"
+TESTNET            = os.getenv("TESTNET", "false").strip().lower() == "true"
 MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", 3))
 TRAILING_ENABLED   = os.getenv("TRAILING_ENABLED", "True").lower() == "true"
 MIN_SCORE          = int(os.getenv("MIN_SCORE", 6))
 MONITOR_INTERVAL   = int(os.getenv("MONITOR_INTERVAL", 30))
 SCAN_INTERVAL_MIN  = int(os.getenv("SCAN_INTERVAL_MIN", 15))
 AUTO_SL_MANUAL     = os.getenv("AUTO_SL_MANUAL", "True").lower() == "true"
+MARGIN_SAFETY      = float(os.getenv("MARGIN_SAFETY", 1.3))  # 30% safety buffer
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -66,19 +62,10 @@ log = logging.getLogger("MomentumBot")
 # ==================== STATE ====================
 open_positions = {}
 lock = threading.Lock()
-DUAL_SIDE = False   # True if account is in Hedge Mode
 
 # ==================== CACHING ====================
 _exchange_info_cache = None
 _exchange_info_lock = threading.Lock()
-
-def get_exchange_info_cached():
-    global _exchange_info_cache
-    with _exchange_info_lock:
-        if _exchange_info_cache is None:
-            _exchange_info_cache = client.futures_exchange_info()
-            log.info("✅ تم تحميل exchange_info إلى الكاش")
-        return _exchange_info_cache
 
 # ==================== FLASK ====================
 app = Flask(__name__)
@@ -90,11 +77,10 @@ def health():
     return {
         "status": "alive",
         "time": datetime.now(timezone.utc).isoformat(),
-        "symbols": SYMBOLS,
         "mode": "TESTNET" if TESTNET else "LIVE",
+        "symbols": SYMBOLS,
         "active_positions": active,
-        "max_concurrent": MAX_CONCURRENT_TRADES,
-        "dual_side": DUAL_SIDE
+        "max_concurrent": MAX_CONCURRENT_TRADES
     }
 
 def run_flask():
@@ -155,16 +141,13 @@ def safe_api_call(func, *args, retries=3, **kwargs):
             time.sleep(2)
     raise Exception(f"فشل بعد {retries} محاولات")
 
-def detect_position_mode():
-    """Detect if account uses Hedge Mode (dualSidePosition=True) or One-way."""
-    global DUAL_SIDE
-    try:
-        res = client.futures_get_position_mode()
-        DUAL_SIDE = bool(res.get("dualSidePosition", False))
-        log.info(f"📐 وضع المركز: {'HEDGE (ثنائي)' if DUAL_SIDE else 'ONE-WAY (أحادي)'}")
-    except Exception as e:
-        log.warning(f"تعذر تحديد وضع المركز: {e} — سيُفترض One-way")
-        DUAL_SIDE = False
+def get_exchange_info_cached():
+    global _exchange_info_cache
+    with _exchange_info_lock:
+        if _exchange_info_cache is None:
+            _exchange_info_cache = client.futures_exchange_info()
+            log.info("✅ تم تحميل exchange_info إلى الكاش")
+        return _exchange_info_cache
 
 def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     raw = safe_api_call(client.futures_klines, symbol=symbol, interval=interval, limit=limit)
@@ -177,25 +160,28 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df
 
-def get_balance_usdt() -> float:
+def get_balance() -> dict:
+    """إرجاع dict فيه الرصيد الكلي، المتاح، الربح غير المحقق."""
     try:
         balances = safe_api_call(client.futures_account_balance)
         for b in balances:
             if b["asset"] == "USDT":
-                return float(b["balance"])
+                return {
+                    "balance": float(b["balance"]),
+                    "available": float(b.get("availableBalance", b["balance"])),
+                    "unrealized_pnl": float(b.get("crossUnPnl", 0))
+                }
     except Exception as e:
         log.error(f"Balance error: {e}")
-    return 0.0
+    return {"balance": 0.0, "available": 0.0, "unrealized_pnl": 0.0}
 
-def get_available_balance_usdt() -> float:
-    try:
-        balances = safe_api_call(client.futures_account_balance)
-        for b in balances:
-            if b["asset"] == "USDT":
-                return float(b.get("availableBalance", b["balance"]))
-    except Exception as e:
-        log.error(f"Available balance error: {e}")
-    return 0.0
+def get_balance_display() -> str:
+    b = get_balance()
+    return (
+        f"💰 <b>الرصيد الكلي:</b> {b['balance']:.2f} USDT\n"
+        f"💵 <b>المتاح:</b> {b['available']:.2f} USDT\n"
+        f"📈 <b>غير محقق:</b> {b['unrealized_pnl']:+.2f} USDT"
+    )
 
 def get_all_prices() -> dict:
     try:
@@ -206,40 +192,24 @@ def get_all_prices() -> dict:
         return {}
 
 def set_leverage_and_margin(symbol: str):
-    """
-    Configures leverage and margin type. Failures are logged but
-    do NOT block opening the trade (account may already be configured).
-    """
     try:
         safe_api_call(client.futures_change_leverage, symbol=symbol, leverage=LEVERAGE)
-        log.info(f"✅ {symbol}: رافعة {LEVERAGE}x مضبوطة")
-    except BinanceAPIException as e:
-        log.warning(f"⚠️ {symbol}: تعذر تغيير الرافعة ({e.code}): {e.message}")
     except Exception as e:
-        log.warning(f"⚠️ {symbol}: خطأ غير متوقع في الرافعة: {e}")
-
+        log.warning(f"Leverage warn {symbol}: {e}")
     try:
         safe_api_call(client.futures_change_margin_type, symbol=symbol, marginType="ISOLATED")
-        log.info(f"✅ {symbol}: هامش ISOLATED مضبوط")
     except BinanceAPIException as e:
-        if "No need to change margin type" in str(e.message):
-            log.info(f"ℹ️ {symbol}: الهامش ISOLATED مسبقاً")
-        else:
-            log.warning(f"⚠️ {symbol}: تعذر تغيير الهامش ({e.code}): {e.message}")
-    except Exception as e:
-        log.warning(f"⚠️ {symbol}: خطأ غير متوقع في الهامش: {e}")
+        if "No need to change margin type" not in str(e):
+            log.warning(f"Margin type warn {symbol}: {e}")
 
 # ==================== INDICATORS ====================
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    dif = ema_fast - ema_slow
+    dif = ema(series, fast) - ema(series, slow)
     dea = ema(dif, signal)
-    hist = dif - dea
-    return dif, dea, hist
+    return dif, dea, dif - dea
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -278,67 +248,52 @@ def in_trading_session() -> bool:
     now = datetime.now(timezone.utc)
     return 7 <= now.hour < 21
 
-# ==================== SIGNAL EVALUATION ====================
+# ==================== SIGNAL ====================
 def evaluate_signal(df: pd.DataFrame, direction: str) -> dict:
     last  = df.iloc[-1]
     prev  = df.iloc[-2]
     prev2 = df.iloc[-3]
-
     score = 0
     reasons = []
     price = last["close"]
 
     if direction == "LONG":
-        if price > last["ema200"]:
-            score += 2; reasons.append("✅ فوق EMA200 (سياق صاعد) +2")
-        if price > last["ema50"]:
-            score += 1; reasons.append("✅ فوق EMA50 +1")
+        if price > last["ema200"]:  score += 2; reasons.append("✅ فوق EMA200 +2")
+        if price > last["ema50"]:   score += 1; reasons.append("✅ فوق EMA50 +1")
         if prev["dif"] <= prev["dea"] and last["dif"] > last["dea"]:
             score += 2; reasons.append("✅ تقاطع MACD إيجابي +2")
         if prev2["hist"] < prev["hist"] < 0 and last["hist"] > prev["hist"]:
-            score += 1; reasons.append("✅ تحول الهيستوجرام للأخضر +1")
+            score += 1; reasons.append("✅ تحول الهيستوجرام +1")
         if last["volume"] > last["vol_ma5"]:
-            score += 2; reasons.append("✅ حجم أعلى من المتوسط +2")
-        if price > last["vwap"]:
-            score += 1; reasons.append("✅ فوق VWAP +1")
+            score += 2; reasons.append("✅ حجم مرتفع +2")
+        if price > last["vwap"]:    score += 1; reasons.append("✅ فوق VWAP +1")
         if last["rsi"] > prev["rsi"] and price < prev["close"]:
-            score += 1; reasons.append("✅ انحراف RSI إيجابي +1")
-
+            score += 1; reasons.append("✅ انحراف RSI +1")
         entry = price
         sl    = entry - (1.5 * last["atr"])
         tp1   = last["ema50"]
         tp2   = last["ema200"]
-
     else:
-        if price < last["ema200"]:
-            score += 2; reasons.append("✅ تحت EMA200 (سياق هابط) +2")
-        if price < last["ema50"]:
-            score += 1; reasons.append("✅ تحت EMA50 +1")
+        if price < last["ema200"]:  score += 2; reasons.append("✅ تحت EMA200 +2")
+        if price < last["ema50"]:   score += 1; reasons.append("✅ تحت EMA50 +1")
         if prev["dif"] >= prev["dea"] and last["dif"] < last["dea"]:
             score += 2; reasons.append("✅ تقاطع MACD سلبي +2")
         if prev2["hist"] > prev["hist"] > 0 and last["hist"] < prev["hist"]:
-            score += 1; reasons.append("✅ تحول الهيستوجرام للأحمر +1")
+            score += 1; reasons.append("✅ تحول الهيستوجرام +1")
         if last["volume"] > last["vol_ma5"]:
-            score += 2; reasons.append("✅ حجم أعلى من المتوسط +2")
-        if price < last["vwap"]:
-            score += 1; reasons.append("✅ تحت VWAP +1")
+            score += 2; reasons.append("✅ حجم مرتفع +2")
+        if price < last["vwap"]:    score += 1; reasons.append("✅ تحت VWAP +1")
         if last["rsi"] < prev["rsi"] and price > prev["close"]:
-            score += 1; reasons.append("✅ انحراف RSI سلبي +1")
-
+            score += 1; reasons.append("✅ انحراف RSI +1")
         entry = price
         sl    = entry + (1.5 * last["atr"])
         tp1   = last["ema50"]
         tp2   = last["ema200"]
 
     return {
-        "score": score,
-        "reasons": reasons,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "atr": last["atr"],
-        "rsi": last["rsi"]
+        "score": score, "reasons": reasons,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+        "atr": last["atr"], "rsi": last["rsi"]
     }
 
 # ==================== HELPERS ====================
@@ -381,110 +336,102 @@ def round_price(symbol: str, price: float) -> float:
                     return round(round(price / tick) * tick, precision)
     return round(price, 4)
 
-def parse_avg_price(order: dict, fallback: float) -> float:
-    """Safely extract average fill price from order response."""
-    for key in ("avgPrice", "price"):
-        val = order.get(key)
-        if val is None:
-            continue
-        try:
-            f = float(val)
-            if f > 0:
-                return f
-        except (ValueError, TypeError):
-            continue
-    return fallback
-
-def get_position_side_param(direction: str) -> dict:
-    """In Hedge Mode, Binance requires positionSide. In One-way, omit it."""
-    if DUAL_SIDE:
-        return {"positionSide": "LONG" if direction == "LONG" else "SHORT"}
-    return {}
+def get_min_notional(symbol: str) -> float:
+    """الحد الأدنى لقيمة الصفقة بالدولار"""
+    info = get_exchange_info_cached()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            for f in s["filters"]:
+                if f["filterType"] == "MIN_NOTIONAL":
+                    return float(f.get("notional", 5))
+    return 5.0
 
 # ==================== OPEN TRADE ====================
 def open_trade(symbol: str, direction: str, signal: dict):
-    step = "init"
     try:
-        # === 1. Check balance ===
-        step = "balance check"
-        required_margin = (POSITION_SIZE_USDT * LEVERAGE) / LEVERAGE  # = POSITION_SIZE_USDT
-        available = get_available_balance_usdt()
-        if available < required_margin * 1.05:  # 5% buffer
+        # === 1. فحص الرصيد بـ MARGIN وليس الحجم الكامل ===
+        bal = get_balance()
+        required_margin = POSITION_SIZE_USDT / LEVERAGE
+        total_required  = required_margin * MARGIN_SAFETY
+
+        if bal["available"] < total_required:
             tg_log(
                 "⚠️ رصيد غير كافٍ",
                 f"💠 <b>العملة:</b> {symbol}\n"
-                f"💰 <b>المتاح:</b> {available:.2f} USDT\n"
-                f"📊 <b>المطلوب:</b> ~{required_margin:.2f} USDT",
+                f"💰 <b>المتاح:</b> {bal['available']:.2f} USDT\n"
+                f"📊 <b>الهامش المطلوب:</b> {required_margin:.2f} USDT\n"
+                f"🛡️ <b>مع هامش الأمان:</b> {total_required:.2f} USDT\n"
+                f"⚙️ <b>الرافعة:</b> {LEVERAGE}x\n"
+                f"💼 <b>حجم الصفقة:</b> {POSITION_SIZE_USDT} USDT\n\n"
+                f"<b>الحل:</b> حوّل USDT إلى Futures Wallet",
                 "⚠️"
             )
             return
 
-        # === 2. Leverage & margin (non-blocking) ===
-        step = "leverage/margin setup"
+        # === 2. حساب الكمية ===
         set_leverage_and_margin(symbol)
-
-        # === 3. Entry order ===
-        step = "entry order"
         price = signal["entry"]
-        qty_usdt = POSITION_SIZE_USDT * LEVERAGE
-        qty = round_step(symbol, qty_usdt / price)
+        qty = round_step(symbol, (POSITION_SIZE_USDT * LEVERAGE) / price)
 
-        if qty <= 0:
-            raise Exception(f"الكمية المحسوبة = {qty}. تحقق من الرصيد والسعر.")
+        # فحص الحد الأدنى للصفقة
+        notional = qty * price
+        min_notional = get_min_notional(symbol)
+        if notional < min_notional:
+            tg_log(
+                "⚠️ حجم الصفقة أقل من الحد الأدنى",
+                f"💠 <b>العملة:</b> {symbol}\n"
+                f"📊 <b>قيمة الصفقة:</b> {notional:.2f} USDT\n"
+                f"📉 <b>الحد الأدنى:</b> {min_notional} USDT",
+                "⚠️"
+            )
+            return
 
         side = SIDE_BUY if direction == "LONG" else SIDE_SELL
         opposite = SIDE_SELL if direction == "LONG" else SIDE_BUY
-        position_side_param = get_position_side_param(direction)
 
+        # === 3. أمر الدخول Market ===
         order = safe_api_call(
             client.futures_create_order,
             symbol=symbol, side=side,
-            type=ORDER_TYPE_MARKET, quantity=qty,
-            **position_side_param
+            type=ORDER_TYPE_MARKET, quantity=qty
         )
-        fill_price = parse_avg_price(order, price)
+        fill_price = float(order.get("avgPrice", price)) or price
+        if fill_price == 0:
+            fill_price = price
 
+        # === 4. SL ===
         sl_price  = round_price(symbol, signal["sl"])
         tp1_price = round_price(symbol, signal["tp1"])
         tp2_price = round_price(symbol, signal["tp2"])
 
-        # === 4. Stop Loss ===
-        step = "stop loss order"
         sl_order = safe_api_call(
             client.futures_create_order,
             symbol=symbol, side=opposite,
             type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice=sl_price,
-            closePosition=True,
-            workingType="MARK_PRICE",
-            **position_side_param
+            stopPrice=sl_price, closePosition=True,
+            workingType="MARK_PRICE"
         )
 
         # === 5. TP1 ===
-        step = "take profit 1"
         half_qty = round_step(symbol, qty / 2)
         tp1_order = safe_api_call(
             client.futures_create_order,
             symbol=symbol, side=opposite,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
             stopPrice=tp1_price, quantity=half_qty,
-            reduceOnly=True, workingType="MARK_PRICE",
-            **position_side_param
+            reduceOnly=True, workingType="MARK_PRICE"
         )
 
         # === 6. TP2 ===
-        step = "take profit 2"
         remaining_qty = round_step(symbol, qty - half_qty)
         tp2_order = safe_api_call(
             client.futures_create_order,
             symbol=symbol, side=opposite,
             type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
             stopPrice=tp2_price, quantity=remaining_qty,
-            reduceOnly=True, workingType="MARK_PRICE",
-            **position_side_param
+            reduceOnly=True, workingType="MARK_PRICE"
         )
 
-        # === 7. Register ===
         with lock:
             open_positions[symbol] = {
                 "side": direction,
@@ -509,68 +456,45 @@ def open_trade(symbol: str, direction: str, signal: dict):
             f"📈 <b>الاتجاه:</b> {direction}\n"
             f"💵 <b>سعر الدخول:</b> {fill_price}\n"
             f"📦 <b>الكمية:</b> {qty}\n"
-            f"💼 <b>الحجم الفعلي:</b> {round(qty * fill_price, 2)} USDT\n"
-            f"⚙️ <b>الرافعة:</b> {LEVERAGE}x\n"
-            f"📐 <b>وضع المركز:</b> {'HEDGE' if DUAL_SIDE else 'ONE-WAY'}\n\n"
-            f"🛑 <b>وقف الخسارة:</b> {sl_price} (1.5×ATR)\n"
-            f"🎯 <b>هدف 1:</b> {tp1_price} (EMA50) - 50%\n"
-            f"🎯 <b>هدف 2:</b> {tp2_price} (EMA200) - 50%\n"
+            f"💼 <b>قيمة الصفقة:</b> {round(qty * fill_price, 2)} USDT\n"
+            f"⚙️ <b>الرافعة:</b> {LEVERAGE}x\n\n"
+            f"🛑 <b>وقف الخسارة:</b> {sl_price}\n"
+            f"🎯 <b>هدف 1:</b> {tp1_price} (50%)\n"
+            f"🎯 <b>هدف 2:</b> {tp2_price} (50%)\n"
             f"🔄 <b>الوقف المتحرك:</b> {'مُفعّل' if TRAILING_ENABLED else 'معطّل'}\n\n"
             f"📊 <b>النقاط:</b> {signal['score']}/10\n"
             f"📝 <b>الأسباب:</b>\n" + "\n".join(signal["reasons"])
         )
         tg_log("🚀 تم فتح صفقة", body, "🚀")
 
-    except (BinanceAPIException, BinanceOrderException) as e:
-        # Detailed diagnosis
-        hint = ""
-        if e.code == -2015:
-            hint = (
-                "\n\n🔍 <b>الأسباب المحتملة:</b>\n"
-                "1. صلاحية Futures غير مُفعّلة على المفتاح\n"
-                "2. الحساب لم يُفعّل Futures Trading بعد\n"
-                "3. قيود IP تمنع الطلب\n"
-                "4. المفتاح من Testnet والكود Live (أو العكس)"
-            )
-        elif e.code == -4046:
-            hint = "\n\n💡 لا حاجة لتغيير الرافعة - مُفعّلة مسبقاً"
-        elif e.code == -4061:
-            hint = "\n\n💡 وضع المركز خاطئ (Hedge/One-way)"
-        elif e.code == -2019:
-            hint = "\n\n💡 الرصيد غير كافٍ"
-        elif e.code == -4164:
-            hint = "\n\n💡 حجم الصفقة صغير جداً (الحد الأدنى 5 USDT)"
-
-        tg_log(
-            f"❌ فشل فتح صفقة {symbol}",
-            f"🔧 <b>الخطوة التي فشلت:</b> {step}\n"
-            f"🔢 <b>كود الخطأ:</b> {e.code}\n"
-            f"📝 <b>الرسالة:</b> {e.message}"
-            f"{hint}",
-            "❌"
-        )
+    except BinanceAPIException as e:
+        # تشخيص مفصّل
+        diag = f"Binance Error <b>{e.code}</b>: {e.message}\n\n"
+        hints = {
+            -2015: "🔍 الأسباب: صلاحية Futures غير مُفعّلة / الحساب لم يُفعّل Futures / IP غير مسموح / Testnet vs Live mismatch",
+            -2019: "🔍 السبب: هامش غير كافٍ. حوّل USDT إلى Futures Wallet أو قلّل POSITION_SIZE_USDT",
+            -4164: "🔍 السبب: قيمة الصفقة أقل من الحد الأدنى (5-10 USDT)",
+            -2027: "🔍 السبب: تجاوزت الحد الأقصى للمركز",
+            -1111: "🔍 السبب: دقة الكمية خاطئة (خطأ برمجي في round_step)",
+            -4131: "🔍 السبب: أمر TP/SL غير موجود. ألغِ الأوامر المعلقة يدوياً وأعد التشغيل",
+        }
+        diag += hints.get(e.code, "🔍 راجع Logs في Render لتفاصيل أكثر")
+        tg_log(f"❌ فشل فتح صفقة {symbol}", diag, "❌")
+    except BinanceOrderException as e:
+        tg_log(f"❌ فشل الأمر {symbol}", f"{e.message}", "❌")
     except Exception as e:
-        tg_log(
-            "❌ خطأ غير متوقع",
-            f"💠 <b>العملة:</b> {symbol}\n"
-            f"🔧 <b>الخطوة:</b> {step}\n"
-            f"📝 <b>الخطأ:</b> {e}",
-            "❌"
-        )
+        tg_log(f"❌ خطأ غير متوقع {symbol}", str(e), "❌")
 
 # ==================== TRAILING STOP ====================
 def update_trailing_stop(symbol: str, info: dict, current_price: float):
     if not TRAILING_ENABLED:
         return
-
     side = info["side"]
     entry = info["entry"]
     atr_val = info["atr"]
     stage = info["trailing_stage"]
     current_sl = info["current_sl"]
     opposite = SIDE_SELL if side == "LONG" else SIDE_BUY
-    position_side_param = get_position_side_param(side)
-
     if atr_val <= 0:
         return
 
@@ -587,7 +511,7 @@ def update_trailing_stop(symbol: str, info: dict, current_price: float):
             new_sl = round_price(symbol, entry + 2 * atr_val); new_stage = 3
         elif stage >= 3:
             trailing_sl = round_price(symbol, current_price - 1 * atr_val)
-            if current_sl is None or trailing_sl > current_sl:
+            if trailing_sl > current_sl:
                 new_sl = trailing_sl; new_stage = stage + 1
     else:
         move = entry - current_price
@@ -599,7 +523,7 @@ def update_trailing_stop(symbol: str, info: dict, current_price: float):
             new_sl = round_price(symbol, entry - 2 * atr_val); new_stage = 3
         elif stage >= 3:
             trailing_sl = round_price(symbol, current_price + 1 * atr_val)
-            if current_sl is None or trailing_sl < current_sl:
+            if trailing_sl < current_sl:
                 new_sl = trailing_sl; new_stage = stage + 1
 
     if new_sl is None or new_sl == current_sl:
@@ -617,8 +541,7 @@ def update_trailing_stop(symbol: str, info: dict, current_price: float):
             symbol=symbol, side=opposite,
             type=FUTURE_ORDER_TYPE_STOP_MARKET,
             stopPrice=new_sl, closePosition=True,
-            workingType="MARK_PRICE",
-            **position_side_param
+            workingType="MARK_PRICE"
         )
 
         with lock:
@@ -647,7 +570,7 @@ def update_trailing_stop(symbol: str, info: dict, current_price: float):
     except Exception as e:
         log.error(f"Trailing update error {symbol}: {e}")
 
-# ==================== MANUAL POSITION IMPORT ====================
+# ==================== MANUAL IMPORT ====================
 def import_manual_positions():
     imported = []
     try:
@@ -658,7 +581,6 @@ def import_manual_positions():
             if amt == 0:
                 continue
             if symbol not in SYMBOLS:
-                log.info(f"⏭️ {symbol} ليس في SYMBOLS - تخطي")
                 continue
             with lock:
                 if symbol in open_positions:
@@ -673,12 +595,8 @@ def import_manual_positions():
             mark_price = float(p.get("markPrice", entry))
             liquidation = float(p.get("liquidationPrice", 0))
 
-            sl_order_id = None
-            tp1_order_id = None
-            tp2_order_id = None
-            sl_price = None
-            tp1_price = None
-            tp2_price = None
+            sl_order_id = tp1_order_id = tp2_order_id = None
+            sl_price = tp1_price = tp2_price = None
             pending_orders = []
 
             try:
@@ -686,25 +604,17 @@ def import_manual_positions():
                 for o in orders:
                     o_type = o["type"]
                     o_stop = float(o.get("stopPrice", 0)) or None
-                    pending_orders.append({
-                        "id": o["orderId"],
-                        "type": o_type,
-                        "side": o["side"],
-                        "stopPrice": o_stop,
-                    })
+                    pending_orders.append({"id": o["orderId"], "type": o_type, "stopPrice": o_stop})
 
                     if o_type in ("STOP_MARKET", "STOP"):
-                        sl_order_id = o["orderId"]
-                        sl_price = o_stop
+                        sl_order_id = o["orderId"]; sl_price = o_stop
                     elif o_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
                         if tp1_order_id is None:
-                            tp1_order_id = o["orderId"]
-                            tp1_price = o_stop
+                            tp1_order_id = o["orderId"]; tp1_price = o_stop
                         else:
-                            tp2_order_id = o["orderId"]
-                            tp2_price = o_stop
+                            tp2_order_id = o["orderId"]; tp2_price = o_stop
             except Exception as e:
-                log.warning(f"تعذر جلب أوامر {symbol}: {e}")
+                log.warning(f"Orders fetch {symbol}: {e}")
 
             try:
                 df = get_klines(symbol, TIMEFRAME, limit=100)
@@ -715,25 +625,16 @@ def import_manual_positions():
 
             with lock:
                 open_positions[symbol] = {
-                    "side": side,
-                    "entry": entry,
-                    "qty": qty,
-                    "atr": atr_val,
+                    "side": side, "entry": entry, "qty": qty, "atr": atr_val,
                     "initial_sl": sl_price if sl_price else (
                         entry - 1.5 * atr_val if side == "LONG" else entry + 1.5 * atr_val
                     ),
-                    "current_sl": sl_price,
-                    "sl_order_id": sl_order_id,
-                    "tp1_order_id": tp1_order_id,
-                    "tp2_order_id": tp2_order_id,
-                    "tp1_price": tp1_price,
-                    "tp2_price": tp2_price,
-                    "tp1_hit": False,
-                    "trailing_stage": 0,
+                    "current_sl": sl_price, "sl_order_id": sl_order_id,
+                    "tp1_order_id": tp1_order_id, "tp2_order_id": tp2_order_id,
+                    "tp1_price": tp1_price, "tp2_price": tp2_price,
+                    "tp1_hit": False, "trailing_stage": 0,
                     "opened_at": datetime.now(timezone.utc),
-                    "source": "MANUAL",
-                    "leverage": leverage,
-                    "margin_type": margin_type,
+                    "source": "MANUAL", "leverage": leverage, "margin_type": margin_type,
                 }
             imported.append(symbol)
 
@@ -744,18 +645,18 @@ def import_manual_positions():
                     label = "🛑 SL" if "STOP" in o["type"] and "TAKE" not in o["type"] else "🎯 TP"
                     orders_info += f"  {label} | {o['stopPrice']} | {o['type']}\n"
             else:
-                orders_info = "\n\n⚠️ <b>لا توجد أوامر SL/TP معلقة</b>"
+                orders_info = "\n\n⚠️ <b>لا توجد أوامر SL/TP</b>"
 
             tg_log(
                 "📥 استيراد صفقة يدوية",
                 f"💠 <b>العملة:</b> {symbol}\n"
                 f"📊 <b>الاتجاه:</b> {side}\n"
-                f"💵 <b>سعر الدخول:</b> {entry}\n"
+                f"💵 <b>الدخول:</b> {entry}\n"
                 f"📦 <b>الكمية:</b> {qty}\n"
                 f"⚙️ <b>الرافعة:</b> {leverage}x ({margin_type})\n"
-                f"📈 <b>السعر الحالي:</b> {mark_price}\n"
-                f"💰 <b>ربح/خسارة:</b> {unrealized_pnl:.2f} USDT\n"
-                f"💥 <b>سعر التصفية:</b> {liquidation}\n"
+                f"📈 <b>الحالي:</b> {mark_price}\n"
+                f"💰 <b>PnL:</b> {unrealized_pnl:.2f} USDT\n"
+                f"💥 <b>التصفية:</b> {liquidation}\n"
                 f"📊 <b>ATR:</b> {atr_val:.6f}\n"
                 f"🛡️ <b>SL الحالي:</b> {sl_price if sl_price else 'لا يوجد'}"
                 f"{orders_info}",
@@ -767,37 +668,32 @@ def import_manual_positions():
                     opposite = SIDE_SELL if side == "LONG" else SIDE_BUY
                     auto_sl = entry - 1.5 * atr_val if side == "LONG" else entry + 1.5 * atr_val
                     auto_sl = round_price(symbol, auto_sl)
-                    position_side_param = get_position_side_param(side)
                     sl_order = safe_api_call(
                         client.futures_create_order,
                         symbol=symbol, side=opposite,
                         type=FUTURE_ORDER_TYPE_STOP_MARKET,
                         stopPrice=auto_sl, closePosition=True,
-                        workingType="MARK_PRICE",
-                        **position_side_param
+                        workingType="MARK_PRICE"
                     )
                     with lock:
                         open_positions[symbol]["sl_order_id"] = sl_order["orderId"]
                         open_positions[symbol]["current_sl"] = auto_sl
                     tg_log(
-                        "🛡️ إضافة وقف خسارة تلقائي",
-                        f"💠 <b>العملة:</b> {symbol}\n"
-                        f"🛑 <b>الوقف الجديد:</b> {auto_sl}\n"
-                        f"📝 <b>السبب:</b> لا يوجد SL على الصفقة اليدوية",
+                        "🛡️ إضافة SL تلقائي",
+                        f"💠 {symbol}\n🛑 <b>الوقف:</b> {auto_sl}",
                         "🛡️"
                     )
                 except Exception as e:
                     log.error(f"Auto SL error {symbol}: {e}")
 
         if not imported:
-            log.info("🔎 لا توجد صفقات يدوية لاستيرادها")
+            log.info("🔎 لا توجد صفقات يدوية")
         return imported
-
     except Exception as e:
         log.error(f"import_manual_positions error: {e}")
         return []
 
-# ==================== MONITOR POSITIONS ====================
+# ==================== MONITOR ====================
 def monitor_positions():
     last_prices = {}
     while True:
@@ -844,16 +740,17 @@ def monitor_positions():
                                     except Exception:
                                         pass
                             duration = datetime.now(timezone.utc) - closed_info["opened_at"]
-                            body = (
+                            tg_log(
+                                "✅ تم إغلاق الصفقة",
                                 f"💠 <b>العملة:</b> {symbol}\n"
                                 f"📊 <b>الاتجاه:</b> {closed_info['side']}\n"
                                 f"💵 <b>الدخول:</b> {closed_info['entry']}\n"
                                 f"🛑 <b>آخر وقف:</b> {closed_info['current_sl']}\n"
-                                f"📈 <b>المرحلة النهائية:</b> {closed_info['trailing_stage']}\n"
+                                f"📈 <b>المرحلة:</b> {closed_info['trailing_stage']}\n"
                                 f"📦 <b>المصدر:</b> {closed_info.get('source', 'BOT')}\n"
-                                f"⏱️ <b>المدة:</b> {duration}"
+                                f"⏱️ <b>المدة:</b> {duration}",
+                                "✅"
                             )
-                            tg_log("✅ تم إغلاق الصفقة", body, "✅")
             time.sleep(MONITOR_INTERVAL)
         except Exception as e:
             log.error(f"Monitor error: {e}")
@@ -866,17 +763,17 @@ def wait_for_candle_close(interval_minutes: int = 15):
         minute=0, second=0, microsecond=0
     )
     wait = (next_close - now).total_seconds() + 3
-    log.info(f"⏳ انتظار إغلاق الشمعة: {wait:.0f} ثانية")
+    log.info(f"⏳ انتظار إغلاق الشمعة: {wait:.0f}s")
     time.sleep(max(wait, 5))
 
 def scan_once():
     if not in_trading_session():
-        log.info("⏸️ خارج جلسة التداول (London/NY فقط)")
+        log.info("⏸️ خارج جلسة التداول")
         return
 
     active_count = get_active_count()
     if active_count >= MAX_CONCURRENT_TRADES:
-        log.info(f"⛔ وصلنا للحد الأقصى ({active_count}/{MAX_CONCURRENT_TRADES}) - تخطي المسح")
+        log.info(f"⛔ الحد الأقصى ({active_count}/{MAX_CONCURRENT_TRADES})")
         return
 
     log.info(f"🔍 مسح: {len(SYMBOLS)} عملات | نشطة: {active_count}/{MAX_CONCURRENT_TRADES}")
@@ -884,11 +781,8 @@ def scan_once():
     for symbol in SYMBOLS:
         try:
             if get_active_count() >= MAX_CONCURRENT_TRADES:
-                log.info("⛔ وصلنا للحد الأقصى خلال المسح - توقف")
                 break
-
             if has_open_position(symbol):
-                log.info(f"⏭️ {symbol}: صفقة مفتوحة، تخطي")
                 continue
 
             df = get_klines(symbol, TIMEFRAME, limit=300)
@@ -904,27 +798,28 @@ def scan_once():
                 open_trade(symbol, "LONG", long_sig)
             elif short_sig["score"] >= MIN_SCORE:
                 open_trade(symbol, "SHORT", short_sig)
-
         except Exception as e:
             log.error(f"Scan error {symbol}: {e}")
-            tg_log("⚠️ خطأ في المسح", f"العملة: {symbol}\n{e}", "⚠️")
+            tg_log("⚠️ خطأ في المسح", f"{symbol}: {e}", "⚠️")
 
-# ==================== MAIN LOOP ====================
+# ==================== MAIN ====================
 def main_loop():
+    bal = get_balance()
+    required_margin = POSITION_SIZE_USDT / LEVERAGE
+
     tg_log(
         "🤖 بدء تشغيل البوت",
         f"📊 <b>الاستراتيجية:</b> Early Momentum Catch v2.2\n"
         f"⏱️ <b>الفريم:</b> {TIMEFRAME}\n"
         f"💼 <b>حجم الصفقة:</b> {POSITION_SIZE_USDT} USDT\n"
         f"⚙️ <b>الرافعة:</b> {LEVERAGE}x\n"
-        f"📐 <b>وضع المركز:</b> {'HEDGE' if DUAL_SIDE else 'ONE-WAY'}\n"
+        f"🛡️ <b>الهامش لكل صفقة:</b> {required_margin:.2f} USDT\n"
         f"📋 <b>العملات:</b> {', '.join(SYMBOLS)}\n"
-        f"🔢 <b>حد الصفقات المتزامنة:</b> {MAX_CONCURRENT_TRADES}\n"
+        f"🔢 <b>حد الصفقات:</b> {MAX_CONCURRENT_TRADES}\n"
         f"🎯 <b>الحد الأدنى للنقاط:</b> {MIN_SCORE}/10\n"
         f"🔄 <b>الوقف المتحرك:</b> {'مُفعّل' if TRAILING_ENABLED else 'معطّل'}\n"
-        f"🌐 <b>الوضع:</b> {'TESTNET' if TESTNET else 'LIVE'}\n"
-        f"💰 <b>الرصيد:</b> {get_balance_usdt():.2f} USDT\n"
-        f"💵 <b>المتاح:</b> {get_available_balance_usdt():.2f} USDT",
+        f"🌐 <b>الوضع:</b> {'TESTNET' if TESTNET else 'LIVE'}\n\n"
+        f"{get_balance_display()}",
         "🤖"
     )
 
@@ -939,15 +834,16 @@ def main_loop():
             tg_log("💥 خطأ رئيسي", str(e), "💥")
             time.sleep(60)
 
-# ==================== ENTRY POINT ====================
+# ==================== ENTRY ====================
 if __name__ == "__main__":
-    # Detect position mode first (Hedge vs One-way)
-    detect_position_mode()
+    # فحص أولي للاتصال
+    log.info(f"🔍 TESTNET={TESTNET} | SYMBOLS={SYMBOLS}")
+    log.info(f"🔑 API Key: {'✅' if BINANCE_API_KEY else '❌'}")
+    log.info(f"🔑 Secret:  {'✅' if BINANCE_SECRET_KEY else '❌'}")
+    log.info(f"📱 TG Token: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+    log.info(f"📱 TG Chat:  {'✅' if TELEGRAM_CHAT_ID else '❌'}")
 
-    # Flask (health check)
     threading.Thread(target=run_flask, daemon=True).start()
-    # Position monitor
     threading.Thread(target=monitor_positions, daemon=True).start()
     time.sleep(2)
-    # Main loop (blocking)
     main_loop()
