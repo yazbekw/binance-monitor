@@ -316,16 +316,19 @@ def evaluate_signal(df, direction):
             score += pts
             reasons.append(f"✅ {label} +{pts}")
 
+    atr_val = last["atr"]
+
     if direction == "LONG":
         entry = price
-        sl    = entry - 1.5 * last["atr"]
-        tp1   = last["ema50"]
-        tp2   = last["ema200"]
-    else:
+        sl    = entry - (1.5 * atr_val)
+        tp1   = entry + (1.5 * atr_val)   # R:R = 1:1
+        tp2   = entry + (3.0 * atr_val)   # R:R = 1:2
+    else:  # SHORT
         entry = price
-        sl    = entry + 1.5 * last["atr"]
-        tp1   = last["ema50"]
-        tp2   = last["ema200"]
+        sl    = entry + (1.5 * atr_val)
+        tp1   = entry - (1.5 * atr_val)   # R:R = 1:1
+        tp2   = entry - (3.0 * atr_val)   # R:R = 1:2
+
 
     return {
         "score": score,
