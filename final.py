@@ -293,7 +293,14 @@ def tg_log(title, body, emoji="ℹ️"):
 # ============================================================
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=TESTNET)
 
-def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, symbol=None, **kwargs):
+def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, cooldown_symbol=None, **kwargs):
+    """
+    Wrapper for Binance API calls with rate limiting + cooldown + backoff.
+    
+    Args:
+        cooldown_symbol: use this (instead of symbol) to track cooldown per trading pair.
+                         This avoids collision with the symbol argument passed to Binance functions.
+    """
     global _global_pause_until
     now = time.time()
 
@@ -303,10 +310,10 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, symbol=None, **kwa
         time.sleep(min(wait, 30))
         return None
 
-    if symbol:
-        cd_until = _symbol_cooldown.get(symbol, 0)
+    if cooldown_symbol:
+        cd_until = _symbol_cooldown.get(cooldown_symbol, 0)
         if now < cd_until:
-            log.debug(f"⏸️ {symbol} في كولداون")
+            log.debug(f"⏸️ {cooldown_symbol} في كولداون")
             return None
 
     for attempt in range(retries):
@@ -314,8 +321,8 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, symbol=None, **kwa
             rate_limiter.throttle()
             rate_limiter.add(weight)
             result = func(*args, **kwargs)
-            if symbol:
-                _symbol_cooldown.pop(symbol, None)
+            if cooldown_symbol:
+                _symbol_cooldown.pop(cooldown_symbol, None)
             return result
         except AttributeError:
             raise
@@ -352,7 +359,7 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, symbol=None, **kwa
 def fetch_ohlcv(symbol, tf, limit=300):
     try:
         raw = safe_api_call(client.futures_klines, symbol=symbol, interval=tf,
-                           limit=limit, weight=5, symbol=symbol)
+                           limit=limit, weight=5, cooldown_symbol=symbol)
         if not raw:
             return None
         df = pd.DataFrame(raw, columns=[
@@ -402,7 +409,7 @@ def get_balance():
 
 def get_price(symbol):
     try:
-        t = safe_api_call(client.futures_symbol_ticker, symbol=symbol, weight=1, symbol=symbol)
+        t = safe_api_call(client.futures_symbol_ticker, symbol=symbol, weight=1, cooldown_symbol=symbol)
         return float(t["price"]) if t else 0.0
     except Exception:
         return 0.0
