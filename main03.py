@@ -1,11 +1,14 @@
 """
-Momentum Bot v3.0 — FINAL
+Momentum Bot v3.1 — FINAL
 ==========================
 - Syria timezone (UTC+3) in all notifications
 - Full lifecycle notifications
 - Real rate limiter (weight-aware)
-- Multi-fallback for SL/TP orders
-- Detailed trade open reasons with indicators
+- Multi-fallback for SL/TP orders (3 attempts each)
+- TP price sanity check (avoid -2021)
+- Client-side SL/TP fallback (software-based execution)
+- Auto SL for manual positions
+- Heartbeat + session change notifications
 """
 import os
 import re
@@ -30,7 +33,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS            = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT").split(",") if s.strip()]
-POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", 200))   # notional size
+POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", 200))
 LEVERAGE           = int(os.getenv("LEVERAGE", 20))
 TIMEFRAME          = os.getenv("TIMEFRAME", "15m")
 TESTNET            = os.getenv("TESTNET", "False").lower() == "true"
@@ -43,14 +46,15 @@ AUTO_SL_MANUAL     = os.getenv("AUTO_SL_MANUAL", "True").lower() == "true"
 NOTIFY_SCAN        = os.getenv("NOTIFY_SCAN", "True").lower() == "true"
 NOTIFY_HEARTBEAT   = os.getenv("NOTIFY_HEARTBEAT", "True").lower() == "true"
 HEARTBEAT_HOURS    = int(os.getenv("HEARTBEAT_HOURS", 4))
+FALLBACK_ENABLED   = os.getenv("FALLBACK_ENABLED", "True").lower() == "true"
 
 # ==================== TIMEZONE (Syria UTC+3) ====================
 SYRIA_TZ = timezone(timedelta(hours=3))
 
-def syr_now() -> datetime:
+def syr_now():
     return datetime.now(SYRIA_TZ)
 
-def syr_str(dt: datetime = None) -> str:
+def syr_str(dt=None):
     if dt is None:
         dt = syr_now()
     elif dt.tzinfo is None:
@@ -70,15 +74,14 @@ lock = threading.Lock()
 
 # ==================== RATE LIMITER ====================
 class RateLimiter:
-    """Track Binance API weight and prevent rate limit violations."""
     def __init__(self, max_weight_per_min=1200):
         self.max_weight = max_weight_per_min
-        self.weight_window = []  # list of (timestamp, weight)
+        self.weight_window = []
         self.lock = threading.Lock()
-        self.min_interval = 0.15  # 150ms between requests
+        self.min_interval = 0.15
         self.last_request = 0
 
-    def add(self, weight: int):
+    def add(self, weight):
         with self.lock:
             now = time.time()
             self.weight_window = [(t, w) for t, w in self.weight_window if now - t < 60]
@@ -140,7 +143,7 @@ class Telegram:
         self.chat_id = TELEGRAM_CHAT_ID
         self.base = f"https://api.telegram.org/bot{self.token}" if self.token else None
 
-    def send(self, message: str):
+    def send(self, message):
         if not self.token or not self.chat_id:
             return
         try:
@@ -159,24 +162,22 @@ class Telegram:
 
 tg = Telegram()
 
-def tg_log(title: str, body: str, emoji: str = "ℹ️"):
+def tg_log(title, body, emoji="ℹ️"):
     msg = f"{emoji} <b>{title}</b>\n\n🕐 <b>الوقت (دمشق):</b> {syr_str()}\n\n{body}"
     tg.send(msg)
     log.info(f"{title} | {body.replace(chr(10), ' | ')}")
 
-# ==================== BINANCE CLIENT ====================
+# ==================== BINANCE ====================
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=TESTNET)
 
-# ==================== SAFE API CALL ====================
 def safe_api_call(func, *args, weight=1, retries=3, **kwargs):
-    """Wrapper with rate limiting + retry on transient errors."""
     for attempt in range(retries):
         try:
             rate_limiter.throttle()
             rate_limiter.add(weight)
             return func(*args, **kwargs)
         except AttributeError:
-            raise  # Code bug, don't retry
+            raise
         except BinanceAPIException as e:
             if e.code == -1003:
                 msg = str(e.message)
@@ -195,16 +196,16 @@ def safe_api_call(func, *args, weight=1, retries=3, **kwargs):
                 time.sleep(wait)
             elif e.code == -1021:
                 time.sleep(1)
-            elif e.code in (-4120, -1102, -1111):
-                raise  # Order format issues, don't retry
+            elif e.code in (-4120, -1102, -1111, -2021):
+                raise
             else:
                 raise
         except BinanceRequestException:
             time.sleep(2)
     raise Exception(f"فشل بعد {retries} محاولات")
 
-# ==================== BASIC HELPERS ====================
-def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+# ==================== HELPERS ====================
+def get_klines(symbol, interval, limit=300):
     raw = safe_api_call(client.futures_klines, symbol=symbol, interval=interval, limit=limit, weight=5)
     df = pd.DataFrame(raw, columns=[
         "open_time","open","high","low","close","volume",
@@ -215,7 +216,7 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df
 
-def get_balance_usdt() -> dict:
+def get_balance_usdt():
     try:
         balances = safe_api_call(client.futures_account_balance, weight=5)
         for b in balances:
@@ -229,7 +230,7 @@ def get_balance_usdt() -> dict:
         log.error(f"Balance error: {e}")
     return {"balance": 0.0, "available": 0.0, "unrealized_pnl": 0.0}
 
-def get_current_price(symbol: str) -> float:
+def get_current_price(symbol):
     try:
         ticker = safe_api_call(client.futures_symbol_ticker, symbol=symbol, weight=1)
         return float(ticker["price"])
@@ -237,11 +238,28 @@ def get_current_price(symbol: str) -> float:
         log.error(f"Price fetch error {symbol}: {e}")
         return 0.0
 
-def set_leverage_and_margin(symbol: str):
+def set_leverage_and_margin(symbol):
     try:
         safe_api_call(client.futures_change_leverage, symbol=symbol, leverage=LEVERAGE, weight=1)
     except Exception as e:
         log.warning(f"Leverage set {symbol}: {e}")
+
+def has_open_position(symbol):
+    with lock:
+        if symbol in open_positions:
+            return True
+    try:
+        positions = safe_api_call(client.futures_position_information, symbol=symbol, weight=5)
+        for p in positions:
+            if float(p["positionAmt"]) != 0:
+                return True
+    except Exception as e:
+        log.error(f"Position check error: {e}")
+    return False
+
+def get_active_count():
+    with lock:
+        return len(open_positions)
 
 # ==================== INDICATORS ====================
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
@@ -280,10 +298,33 @@ def add_indicators(df):
     return df
 
 # ==================== SESSION ====================
-def in_trading_session() -> bool:
+def in_trading_session():
     return 7 <= datetime.now(timezone.utc).hour < 21
 
-# ==================== SIGNAL EVALUATION ====================
+# ==================== ROUNDING ====================
+def round_step(symbol, qty):
+    info = get_exchange_info_cached()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            for f in s["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+                    precision = int(round(-np.log10(step)))
+                    return round(np.floor(qty / step) * step, precision)
+    return round(qty, 3)
+
+def round_price(symbol, price):
+    info = get_exchange_info_cached()
+    for s in info["symbols"]:
+        if s["symbol"] == symbol:
+            for f in s["filters"]:
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                    precision = int(round(-np.log10(tick)))
+                    return round(round(price / tick) * tick, precision)
+    return round(price, 4)
+
+# ==================== SIGNAL ====================
 def evaluate_signal(df, direction):
     last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
     score = 0
@@ -321,22 +362,17 @@ def evaluate_signal(df, direction):
     if direction == "LONG":
         entry = price
         sl    = entry - (1.5 * atr_val)
-        tp1   = entry + (1.5 * atr_val)   # R:R = 1:1
-        tp2   = entry + (3.0 * atr_val)   # R:R = 1:2
-    else:  # SHORT
+        tp1   = entry + (1.5 * atr_val)
+        tp2   = entry + (3.0 * atr_val)
+    else:
         entry = price
         sl    = entry + (1.5 * atr_val)
-        tp1   = entry - (1.5 * atr_val)   # R:R = 1:1
-        tp2   = entry - (3.0 * atr_val)   # R:R = 1:2
-
+        tp1   = entry - (1.5 * atr_val)
+        tp2   = entry - (3.0 * atr_val)
 
     return {
-        "score": score,
-        "reasons": reasons,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
+        "score": score, "reasons": reasons,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
         "atr": float(last["atr"]),
         "rsi": float(last["rsi"]),
         "ema50": float(last["ema50"]),
@@ -348,17 +384,14 @@ def evaluate_signal(df, direction):
         "dea": float(last["dea"]),
     }
 
-# ==================== ORDER HELPERS (FALLBACKS) ====================
+# ==================== ORDER PLACEMENT (with fallbacks) ====================
 def place_stop_loss(symbol, side, stop_price, qty):
-    """Try multiple methods to place SL. Returns order dict or None."""
+    """Try 3 methods to place SL. Returns order dict or None."""
     attempts = [
-        # Method 1: closePosition (simplest, self-managing)
         dict(symbol=symbol, side=side, type="STOP_MARKET",
              stopPrice=stop_price, closePosition=True),
-        # Method 2: closePosition + workingType
         dict(symbol=symbol, side=side, type="STOP_MARKET",
              stopPrice=stop_price, closePosition=True, workingType="MARK_PRICE"),
-        # Method 3: reduceOnly + qty
         dict(symbol=symbol, side=side, type="STOP_MARKET",
              stopPrice=stop_price, quantity=qty, reduceOnly=True),
     ]
@@ -374,12 +407,14 @@ def place_stop_loss(symbol, side, stop_price, qty):
     return None
 
 def place_take_profit(symbol, side, tp_price, qty):
-    """Try multiple methods to place TP. Returns order dict or None."""
+    """Try 3 methods to place TP. Returns order dict or None."""
     attempts = [
         dict(symbol=symbol, side=side, type="TAKE_PROFIT_MARKET",
              stopPrice=tp_price, quantity=qty, reduceOnly=True),
         dict(symbol=symbol, side=side, type="TAKE_PROFIT_MARKET",
              stopPrice=tp_price, quantity=qty, reduceOnly=True, workingType="MARK_PRICE"),
+        dict(symbol=symbol, side=side, type="TAKE_PROFIT_MARKET",
+             stopPrice=tp_price, quantity=qty),
     ]
     last_err = None
     for i, params in enumerate(attempts, 1):
@@ -392,62 +427,41 @@ def place_take_profit(symbol, side, tp_price, qty):
     log.error(f"❌ كل محاولات TP فشلت: {last_err}")
     return None
 
-# ==================== ROUNDING ====================
-def round_step(symbol, qty):
-    info = get_exchange_info_cached()
-    for s in info["symbols"]:
-        if s["symbol"] == symbol:
-            for f in s["filters"]:
-                if f["filterType"] == "LOT_SIZE":
-                    step = float(f["stepSize"])
-                    precision = int(round(-np.log10(step)))
-                    return round(np.floor(qty / step) * step, precision)
-    return round(qty, 3)
-
-def round_price(symbol, price):
-    info = get_exchange_info_cached()
-    for s in info["symbols"]:
-        if s["symbol"] == symbol:
-            for f in s["filters"]:
-                if f["filterType"] == "PRICE_FILTER":
-                    tick = float(f["tickSize"])
-                    precision = int(round(-np.log10(tick)))
-                    return round(round(price / tick) * tick, precision)
-    return round(price, 4)
-
-# ==================== HELPERS ====================
-def has_open_position(symbol):
-    with lock:
-        if symbol in open_positions:
-            return True
+def close_position_market(symbol, side, qty, reason=""):
+    """Close position by market order (software fallback)."""
+    opposite = "SELL" if side == "LONG" else "BUY"
     try:
-        positions = safe_api_call(client.futures_position_information, symbol=symbol, weight=5)
-        for p in positions:
-            if float(p["positionAmt"]) != 0:
-                return True
-    except Exception as e:
-        log.error(f"Position check error: {e}")
-    return False
-
-def get_active_count():
-    with lock:
-        return len(open_positions)
+        order = safe_api_call(
+            client.futures_create_order, weight=1,
+            symbol=symbol, side=opposite,
+            type="MARKET", quantity=qty, reduceOnly=True
+        )
+        return order
+    except BinanceAPIException as e:
+        log.error(f"❌ close_position_market فشل {symbol}: {e.code} {e.message}")
+        tg_log(
+            "🚨 فشل إغلاق الصفقة",
+            f"💠 <b>العملة:</b> {symbol}\n"
+            f"📊 <b>الاتجاه:</b> {side}\n"
+            f"📦 <b>الكمية:</b> {qty}\n"
+            f"⚠️ <b>السبب:</b> {e.message}\n"
+            f"📝 <b>يجب الإغلاق يدوياً من Binance!</b>",
+            "🚨"
+        )
+        return None
 
 # ==================== OPEN TRADE ====================
 def open_trade(symbol, direction, signal):
-    # Pre-check balance
     bal = get_balance_usdt()
     required_margin = POSITION_SIZE_USDT / LEVERAGE
-    safety_margin = required_margin * 0.3
-    total_required = required_margin + safety_margin
+    total_required = required_margin * 1.3
 
     if bal["available"] < total_required:
         tg_log(
             "⚠️ رصيد غير كافٍ",
             f"💠 <b>العملة:</b> {symbol}\n"
             f"💰 <b>المتاح:</b> {bal['available']:.2f} USDT\n"
-            f"📊 <b>الهامش المطلوب:</b> {required_margin:.2f} USDT\n"
-            f"🛡️ <b>مع هامش الأمان:</b> {total_required:.2f} USDT\n"
+            f"📊 <b>المطلوب:</b> {total_required:.2f} USDT\n"
             f"⚙️ <b>الرافعة:</b> {LEVERAGE}x",
             "⚠️"
         )
@@ -457,9 +471,7 @@ def open_trade(symbol, direction, signal):
         set_leverage_and_margin(symbol)
 
         price = signal["entry"]
-        # Notional = POSITION_SIZE_USDT, margin = notional / leverage
-        qty_notional = POSITION_SIZE_USDT
-        qty = round_step(symbol, qty_notional / price)
+        qty = round_step(symbol, POSITION_SIZE_USDT / price)
 
         if qty <= 0:
             tg_log("⚠️ كمية غير صالحة", f"{symbol}: qty={qty}", "⚠️")
@@ -476,26 +488,51 @@ def open_trade(symbol, direction, signal):
         fill_price = float(order.get("avgPrice", price)) or price
         actual_notional = qty * fill_price
 
-        # Prices
-        sl_price  = round_price(symbol, signal["sl"])
-        tp1_price = round_price(symbol, signal["tp1"])
-        tp2_price = round_price(symbol, signal["tp2"])
+        # === TP sanity check (avoid -2021) ===
+        # Re-calculate targets based on actual fill price + ATR
+        atr_val = signal["atr"]
 
-        # SL
+        if direction == "LONG":
+            raw_sl  = fill_price - (1.5 * atr_val)
+            raw_tp1 = fill_price + (1.5 * atr_val)
+            raw_tp2 = fill_price + (3.0 * atr_val)
+        else:
+            raw_sl  = fill_price + (1.5 * atr_val)
+            raw_tp1 = fill_price - (1.5 * atr_val)
+            raw_tp2 = fill_price - (3.0 * atr_val)
+
+        sl_price  = round_price(symbol, raw_sl)
+        tp1_price = round_price(symbol, raw_tp1)
+        tp2_price = round_price(symbol, raw_tp2)
+
+        # Prevent immediate trigger (min 0.1% away from current)
+        if direction == "LONG":
+            min_dist = fill_price * 1.001
+            if tp1_price < min_dist:
+                tp1_price = round_price(symbol, min_dist)
+            if tp2_price <= tp1_price:
+                tp2_price = round_price(symbol, tp1_price * 1.001)
+        else:
+            max_dist = fill_price * 0.999
+            if tp1_price > max_dist:
+                tp1_price = round_price(symbol, max_dist)
+            if tp2_price >= tp1_price:
+                tp2_price = round_price(symbol, tp1_price * 0.999)
+
+        # === Place orders ===
         sl_order = place_stop_loss(symbol, opposite, sl_price, qty)
 
-        # TP1 & TP2
         half_qty = round_step(symbol, qty / 2)
         tp1_order = place_take_profit(symbol, opposite, tp1_price, half_qty)
         tp2_order = place_take_profit(symbol, opposite, tp2_price, qty - half_qty)
 
-        # Register
+        # === Register ===
         with lock:
             open_positions[symbol] = {
                 "side": direction,
                 "entry": fill_price,
                 "qty": qty,
-                "atr": signal["atr"],
+                "atr": atr_val,
                 "initial_sl": sl_price,
                 "current_sl": sl_price if sl_order else None,
                 "sl_order_id": sl_order["orderId"] if sl_order else None,
@@ -503,25 +540,56 @@ def open_trade(symbol, direction, signal):
                 "tp2_order_id": tp2_order["orderId"] if tp2_order else None,
                 "tp1_price": tp1_price,
                 "tp2_price": tp2_price,
+                # --- Fallback tracking ---
+                "sl_on_exchange":  sl_order  is not None,
+                "tp1_on_exchange": tp1_order is not None,
+                "tp2_on_exchange": tp2_order is not None,
+                "tp1_executed": False,
+                "tp2_executed": False,
+                # ---
                 "tp1_hit": False,
                 "trailing_stage": 0,
                 "opened_at": datetime.now(timezone.utc),
-                "source": "BOT"
+                "source": "BOT",
+                "sl_price_fallback": sl_price,
             }
 
-        # Calculations for report
+        # === Notifications for failures ===
+        if not sl_order:
+            tg_log(
+                "🚨 خطر: صفقة بدون وقف خسارة على Binance",
+                f"💠 <b>العملة:</b> {symbol}\n"
+                f"📊 <b>الاتجاه:</b> {direction}\n"
+                f"💵 <b>الدخول:</b> {fill_price}\n"
+                f"🛑 <b>الوقف المقصود:</b> {sl_price}\n\n"
+                f"✅ <b>البوت سيتولى المراقبة اليدوية</b>\n"
+                f"سيُغلق الصفقة تلقائياً عند لمس {sl_price}",
+                "🚨"
+            )
+        if not tp1_order:
+            tg_log("⚠️ فشل TP1", f"{symbol}: البوت سيراقب وينفذ يدوياً عند {tp1_price}", "⚠️")
+        if not tp2_order:
+            tg_log("⚠️ فشل TP2", f"{symbol}: البوت سيراقب وينفذ يدوياً عند {tp2_price}", "⚠️")
+
+        # === Calculations for report ===
         sl_pct = abs(fill_price - sl_price) / fill_price * 100
         tp1_pct = abs(tp1_price - fill_price) / fill_price * 100
         tp2_pct = abs(tp2_price - fill_price) / fill_price * 100
         rr1 = abs(tp1_price - fill_price) / abs(fill_price - sl_price) if sl_price != fill_price else 0
         rr2 = abs(tp2_price - fill_price) / abs(fill_price - sl_price) if sl_price != fill_price else 0
 
-        # Detailed reasons
         reasons_txt = "\n".join(signal["reasons"])
-        ema50_state = "فوق" if fill_price > signal["ema50"] else "تحت"
+        ema50_state  = "فوق" if fill_price > signal["ema50"] else "تحت"
         ema200_state = "فوق" if fill_price > signal["ema200"] else "تحت"
-        vwap_state = "فوق" if fill_price > signal["vwap"] else "تحت"
-        macd_state = "صاعد" if signal["dif"] > signal["dea"] else "هابط"
+        vwap_state   = "فوق" if fill_price > signal["vwap"] else "تحت"
+        macd_state   = "صاعد" if signal["dif"] > signal["dea"] else "هابط"
+
+        fallback_note = ""
+        if not sl_order or not tp1_order or not tp2_order:
+            fallback_note = (
+                "\n\n⚠️ <b>وضع الحماية الاحتياطية مُفعّل</b>\n"
+                "بعض الأوامر لم توضع على Binance — سيتولى البوت التنفيذ."
+            )
 
         body = (
             f"💠 <b>العملة:</b> {symbol}\n"
@@ -531,15 +599,12 @@ def open_trade(symbol, direction, signal):
             f"💼 <b>القيمة الاسمية:</b> {actual_notional:.2f} USDT\n"
             f"💰 <b>الهامش المستخدم:</b> {actual_notional/LEVERAGE:.2f} USDT\n"
             f"⚙️ <b>الرافعة:</b> {LEVERAGE}x\n\n"
-
             f"🛑 <b>وقف الخسارة:</b> {sl_price} ({sl_pct:.2f}%)\n"
             f"🎯 <b>هدف 1:</b> {tp1_price} ({tp1_pct:.2f}%) — R:R 1:{rr1:.2f}\n"
             f"🎯 <b>هدف 2:</b> {tp2_price} ({tp2_pct:.2f}%) — R:R 1:{rr2:.2f}\n"
             f"🔄 <b>الوقف المتحرك:</b> {'مُفعّل' if TRAILING_ENABLED else 'معطّل'}\n\n"
-
             f"📊 <b>النقاط:</b> {signal['score']}/10\n"
             f"📝 <b>الأسباب:</b>\n{reasons_txt}\n\n"
-
             f"🔬 <b>قراءة المؤشرات:</b>\n"
             f"• EMA50: {ema50_state}\n"
             f"• EMA200: {ema200_state}\n"
@@ -548,6 +613,7 @@ def open_trade(symbol, direction, signal):
             f"• RSI: {signal['rsi']:.1f}\n"
             f"• ATR: {signal['atr']:.6f}\n"
             f"• نسبة الحجم: {signal['vol_ratio']:.2f}x"
+            f"{fallback_note}"
         )
         tg_log("🚀 فتح صفقة", body, "🚀")
 
@@ -568,7 +634,7 @@ def update_trailing_stop(symbol, info, current_price):
     if not TRAILING_ENABLED:
         return
     if not info.get("current_sl"):
-        return  # No SL to trail
+        return
 
     side = info["side"]
     entry = info["entry"]
@@ -611,24 +677,27 @@ def update_trailing_stop(symbol, info, current_price):
     if new_sl is None or new_sl == current_sl:
         return
 
-    # Cancel old SL
-    try:
-        if info.get("sl_order_id"):
+    # Try to cancel old SL (if it exists on exchange)
+    if info.get("sl_on_exchange") and info.get("sl_order_id"):
+        try:
             safe_api_call(client.futures_cancel_order, symbol=symbol,
                           orderId=info["sl_order_id"], weight=1)
-    except BinanceAPIException as e:
-        log.warning(f"Cancel SL: {e.message}")
+        except BinanceAPIException as e:
+            log.warning(f"Cancel SL: {e.message}")
 
-    # Place new SL
+    # Try to place new SL
     new_order = place_stop_loss(symbol, opposite, new_sl, info["qty"])
-    if not new_order:
-        tg_log("⚠️ فشل تحديث الوقف", f"{symbol}: تعذّر تحديث الوقف إلى {new_sl}", "⚠️")
-        return
 
     with lock:
-        info["sl_order_id"] = new_order["orderId"]
         info["current_sl"] = new_sl
         info["trailing_stage"] = new_stage
+        if new_order:
+            info["sl_order_id"] = new_order["orderId"]
+            info["sl_on_exchange"] = True
+        else:
+            # Fallback: no exchange order, but track SL in memory
+            info["sl_on_exchange"] = False
+            info["sl_order_id"] = None
 
     if new_stage == 1:
         protection = "Break-Even (نقطة الدخول)"
@@ -638,6 +707,7 @@ def update_trailing_stop(symbol, info, current_price):
         else:
             protection = f"ربح مضمون +{round(entry - new_sl, 6)}"
 
+    fb_note = "" if new_order else "\n⚠️ <b>سيُنفّذ يدوياً</b> (لم يوضع على Binance)"
     tg_log(
         "🔄 تحديث الوقف المتحرك",
         f"💠 <b>العملة:</b> {symbol}\n"
@@ -645,7 +715,8 @@ def update_trailing_stop(symbol, info, current_price):
         f"💰 <b>السعر الحالي:</b> {current_price}\n"
         f"🛑 <b>الوقف الجديد:</b> {new_sl}\n"
         f"📈 <b>المرحلة:</b> {new_stage}\n"
-        f"🛡️ <b>الحماية:</b> {protection}",
+        f"🛡️ <b>الحماية:</b> {protection}"
+        f"{fb_note}",
         "🔄"
     )
 
@@ -673,11 +744,10 @@ def import_manual_positions():
             mark_price = float(p.get("markPrice", entry))
             liquidation = float(p.get("liquidationPrice", 0))
 
-            # Leverage calculation
             if margin_type == "cross":
                 actual_margin = get_balance_usdt()["available"]
                 actual_lev_txt = "Cross Margin"
-                lev_note = f"\n⚠️ <b>وضع Cross Margin</b> — الهامش = الرصيد الكلي"
+                lev_note = "\n⚠️ <b>وضع Cross Margin</b> — الهامش = الرصيد الكلي"
             else:
                 im = float(p.get("isolatedMargin", 0) or 0)
                 pim = float(p.get("positionInitialMargin", 0) or 0)
@@ -686,7 +756,6 @@ def import_manual_positions():
                 actual_lev_txt = f"{actual_lev:.2f}x"
                 lev_note = ""
 
-            # Fetch existing orders
             sl_id = tp1_id = tp2_id = None
             sl_p = tp1_p = tp2_p = None
             pending = []
@@ -706,7 +775,6 @@ def import_manual_positions():
             except Exception as e:
                 log.warning(f"تعذّر جلب أوامر {symbol}: {e}")
 
-            # ATR
             try:
                 df = get_klines(symbol, TIMEFRAME, limit=100)
                 df = add_indicators(df)
@@ -726,6 +794,11 @@ def import_manual_positions():
                     "tp2_order_id": tp2_id,
                     "tp1_price": tp1_p,
                     "tp2_price": tp2_p,
+                    "sl_on_exchange":  sl_id  is not None,
+                    "tp1_on_exchange": tp1_id is not None,
+                    "tp2_on_exchange": tp2_id is not None,
+                    "tp1_executed": False,
+                    "tp2_executed": False,
                     "tp1_hit": False,
                     "trailing_stage": 0,
                     "opened_at": datetime.now(timezone.utc),
@@ -763,16 +836,24 @@ def import_manual_positions():
                 "📥"
             )
 
-            # Auto SL
+            # Auto SL if missing
             if sl_p is None and AUTO_SL_MANUAL:
                 auto_sl = entry - 1.5 * atr_val if side == "LONG" else entry + 1.5 * atr_val
                 auto_sl = round_price(symbol, auto_sl)
                 opposite = "SELL" if side == "LONG" else "BUY"
                 sl_order = place_stop_loss(symbol, opposite, auto_sl, qty)
-                if sl_order:
-                    with lock:
+
+                with lock:
+                    open_positions[symbol]["current_sl"] = auto_sl
+                    open_positions[symbol]["initial_sl"] = auto_sl
+                    if sl_order:
                         open_positions[symbol]["sl_order_id"] = sl_order["orderId"]
-                        open_positions[symbol]["current_sl"] = auto_sl
+                        open_positions[symbol]["sl_on_exchange"] = True
+                    else:
+                        open_positions[symbol]["sl_on_exchange"] = False
+                        open_positions[symbol]["sl_order_id"] = None
+
+                if sl_order:
                     tg_log(
                         "🛡️ إضافة وقف خسارة تلقائي",
                         f"💠 <b>العملة:</b> {symbol}\n"
@@ -781,7 +862,13 @@ def import_manual_positions():
                         "🛡️"
                     )
                 else:
-                    tg_log("⚠️ فشل إضافة SL تلقائي", f"{symbol}: راجع Logs", "⚠️")
+                    tg_log(
+                        "🚨 فشل SL — تفعيل الحماية اليدوية",
+                        f"💠 <b>العملة:</b> {symbol}\n"
+                        f"🛑 <b>الوقف المقصود:</b> {auto_sl}\n"
+                        f"✅ <b>البوت سيراقب وينفّذ يدوياً عند لمس هذا السعر</b>",
+                        "🚨"
+                    )
 
         if not imported:
             log.info("🔎 لا توجد صفقات يدوية")
@@ -812,9 +899,97 @@ def monitor_positions():
                 if current_price <= 0:
                     continue
 
+                # === 1. Update trailing stop ===
                 update_trailing_stop(symbol, info, current_price)
 
-                # Only check if price moved 0.1% or more
+                # === 2. Fallback SL/TP execution ===
+                if FALLBACK_ENABLED:
+                    side = info["side"]
+                    current_sl = info.get("current_sl")
+                    tp1_price = info.get("tp1_price")
+                    tp2_price = info.get("tp2_price")
+
+                    # (A) SL Fallback
+                    if not info.get("sl_on_exchange") and current_sl:
+                        sl_hit = (
+                            (side == "LONG"  and current_price <= current_sl) or
+                            (side == "SHORT" and current_price >= current_sl)
+                        )
+                        if sl_hit:
+                            tg_log(
+                                "🚨 تنفيذ SL احتياطي",
+                                f"💠 <b>العملة:</b> {symbol}\n"
+                                f"📊 <b>الاتجاه:</b> {side}\n"
+                                f"💰 <b>السعر الحالي:</b> {current_price}\n"
+                                f"🛑 <b>الوقف:</b> {current_sl}\n"
+                                f"📦 <b>الكمية:</b> {info['qty']}\n"
+                                f"📝 <b>السبب:</b> أمر الوقف لم يوضع على Binance",
+                                "🚨"
+                            )
+                            order = close_position_market(symbol, side, info["qty"], "SL")
+                            if order:
+                                with lock:
+                                    # mark as executed to avoid repeat
+                                    info["current_sl"] = current_price
+                            continue
+
+                    # (B) TP1 Fallback (نصف الكمية)
+                    if (not info.get("tp1_on_exchange")
+                            and tp1_price
+                            and not info.get("tp1_executed")):
+                        tp1_hit = (
+                            (side == "LONG"  and current_price >= tp1_price) or
+                            (side == "SHORT" and current_price <= tp1_price)
+                        )
+                        if tp1_hit:
+                            half_qty = round_step(symbol, info["qty"] / 2)
+                            if half_qty > 0:
+                                tg_log(
+                                    "🎯 تنفيذ TP1 احتياطي",
+                                    f"💠 <b>العملة:</b> {symbol}\n"
+                                    f"📊 <b>الاتجاه:</b> {side}\n"
+                                    f"💰 <b>السعر الحالي:</b> {current_price}\n"
+                                    f"🎯 <b>الهدف 1:</b> {tp1_price}\n"
+                                    f"📦 <b>الكمية المُغلقة:</b> {half_qty} (50%)\n"
+                                    f"📝 <b>السبب:</b> أمر TP1 لم يوضع على Binance",
+                                    "🎯"
+                                )
+                                order = close_position_market(symbol, side, half_qty, "TP1")
+                                if order:
+                                    with lock:
+                                        info["tp1_executed"] = True
+
+                    # (C) TP2 Fallback (الباقي)
+                    if (not info.get("tp2_on_exchange")
+                            and tp2_price
+                            and not info.get("tp2_executed")):
+                        tp2_hit = (
+                            (side == "LONG"  and current_price >= tp2_price) or
+                            (side == "SHORT" and current_price <= tp2_price)
+                        )
+                        if tp2_hit:
+                            remaining = (
+                                round_step(symbol, info["qty"] / 2)
+                                if info.get("tp1_executed")
+                                else info["qty"]
+                            )
+                            if remaining > 0:
+                                tg_log(
+                                    "🎯 تنفيذ TP2 احتياطي",
+                                    f"💠 <b>العملة:</b> {symbol}\n"
+                                    f"📊 <b>الاتجاه:</b> {side}\n"
+                                    f"💰 <b>السعر الحالي:</b> {current_price}\n"
+                                    f"🎯 <b>الهدف 2:</b> {tp2_price}\n"
+                                    f"📦 <b>الكمية المُغلقة:</b> {remaining}\n"
+                                    f"📝 <b>السبب:</b> أمر TP2 لم يوضع على Binance",
+                                    "🎯"
+                                )
+                                order = close_position_market(symbol, side, remaining, "TP2")
+                                if order:
+                                    with lock:
+                                        info["tp2_executed"] = True
+
+                # === 3. Check if position was closed ===
                 last_p = last_prices.get(symbol, 0)
                 moved = last_p == 0 or abs(current_price - last_p) / current_price > 0.001
                 last_prices[symbol] = current_price
@@ -878,13 +1053,11 @@ def heartbeat_loop():
 
 # ==================== SCANNER ====================
 def wait_for_candle_close(interval_minutes):
-    """⏰ Wait until next candle close (correct calculation)."""
     now = datetime.now(timezone.utc)
     minutes_to_next = interval_minutes - (now.minute % interval_minutes)
     next_close = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_next)
     wait_sec = (next_close - now).total_seconds() + 5
     log.info(f"⏳ انتظار إغلاق الشمعة: {wait_sec:.0f} ثانية ({wait_sec/60:.1f} دقيقة) | التالي: {syr_str(next_close)}")
-    # Sleep in 30s chunks (interruptible + logs)
     remaining = wait_sec
     while remaining > 0:
         chunk = min(remaining, 30)
@@ -896,7 +1069,6 @@ _last_session_state = None
 def scan_once():
     global _last_session_state
 
-    # Session check
     now_in = in_trading_session()
     if _last_session_state is not None and _last_session_state != now_in:
         tg_log(
@@ -915,7 +1087,6 @@ def scan_once():
         log.info(f"⛔ الحد الأقصى ({active_count}/{MAX_CONCURRENT_TRADES})")
         return
 
-    # Scan summary notification
     if NOTIFY_SCAN:
         bal = get_balance_usdt()
         tg_log(
@@ -963,7 +1134,7 @@ def main_loop():
     bal = get_balance_usdt()
     tg_log(
         "🤖 بدء تشغيل البوت",
-        f"📊 <b>الاستراتيجية:</b> Early Momentum Catch v3.0\n"
+        f"📊 <b>الاستراتيجية:</b> Early Momentum Catch v3.1\n"
         f"⏱️ <b>الفريم:</b> {TIMEFRAME}\n"
         f"💼 <b>حجم الصفقة:</b> {POSITION_SIZE_USDT} USDT\n"
         f"💰 <b>الهامش المتوقع:</b> {POSITION_SIZE_USDT/LEVERAGE:.2f} USDT\n"
@@ -973,6 +1144,7 @@ def main_loop():
         f"🎯 <b>أدنى نقاط:</b> {MIN_SCORE}/10\n"
         f"🔄 <b>الوقف المتحرك:</b> {'مُفعّل' if TRAILING_ENABLED else 'معطّل'}\n"
         f"🛡️ <b>SL تلقائي:</b> {'مُفعّل' if AUTO_SL_MANUAL else 'معطّل'}\n"
+        f"🎯 <b>الحماية الاحتياطية (Fallback):</b> {'مُفعّلة' if FALLBACK_ENABLED else 'معطّلة'}\n"
         f"🌐 <b>الوضع:</b> {'TESTNET' if TESTNET else 'LIVE'}\n\n"
         f"💰 <b>الرصيد:</b> {bal['balance']:.2f} USDT\n"
         f"💵 <b>المتاح:</b> {bal['available']:.2f} USDT\n"
