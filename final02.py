@@ -1,14 +1,16 @@
 """
-Unified Trading Bot v2.5 — Supabase-First Dashboard
-======================================================
-v2.5 changes (vs v2.4):
-  1. Dashboard reads EVERYTHING from Supabase during ban
-  2. Stats/winrate computed from full trade history, not in-memory
-  3. Data-source indicator in UI (Live / Supabase / Local)
-  4. sb_error surface: silent failures replaced with visible errors
-  5. Supabase cache 30s (was 5s) — reduces DB load
-  6. Balance cache holds last-known value during ban (not zero)
-  7. All v2.4 ban-proof features preserved
+Unified Trading Bot v2.5.1 — Final Clean Edition
+==================================================
+Complete feature set:
+  ✅ SafeClient (no ping on init)
+  ✅ Persistent ban state (file + Supabase)
+  ✅ Startup kill-switch (no API calls during ban)
+  ✅ Fixed get_exchange_info (uses safe_api_call)
+  ✅ Balance cache + Dashboard cache
+  ✅ Supabase-first dashboard (works during ban)
+  ✅ Duplicate import guard (v2.5.1)
+  ✅ Refresh restored positions from Binance after ban (v2.5.1)
+  ✅ Professional dashboard UI with data-source indicator
 """
 import os, re, json, time, logging, threading, requests
 from datetime import datetime, timezone, timedelta
@@ -89,7 +91,6 @@ HISTORY_FILE       = os.getenv("HISTORY_FILE", "/tmp/trade_history.json")
 BAN_STATE_FILE     = os.getenv("BAN_STATE_FILE", "/tmp/ban_state.json")
 BALANCE_CACHE_SEC  = int(os.getenv("BALANCE_CACHE_SEC", 30))
 DASHBOARD_CACHE_SEC = int(os.getenv("DASHBOARD_CACHE_SEC", 5))
-SUPABASE_CACHE_SEC = int(os.getenv("SUPABASE_CACHE_SEC", 30))
 
 # ============================================================
 # TIMEZONE
@@ -258,7 +259,7 @@ client = _create_client()
 # SUPABASE
 # ============================================================
 _supabase = None
-_supabase_status = {"ok": False, "error": None, "last_check": 0}
+_supabase_status = {"ok": False, "error": None}
 try:
     from supabase import create_client
     if SUPABASE_URL and SUPABASE_KEY:
@@ -291,7 +292,6 @@ def sb_update_trade(trade_id, data):
         return False
 
 def sb_fetch_trades(limit=100, status=None, strategy=None):
-    """Raises on error so we can distinguish empty from failure."""
     if not _supabase:
         raise RuntimeError("Supabase not configured")
     q = _supabase.table("trades").select("*").order("opened_at", desc=True).limit(limit)
@@ -310,34 +310,12 @@ def sb_log_event(event_type, message, data=None):
         log.debug(f"sb_log_event: {e}")
 
 def sb_get_stats():
-    """Try strategy_stats view; return [] if missing (not an error)."""
     if not _supabase: return []
     try:
         r = _supabase.table("strategy_stats").select("*").execute()
         return r.data or []
     except Exception as e:
         log.debug(f"sb_get_stats (view may not exist): {e}")
-        return []
-
-def sb_get_equity_curve(days=30):
-    if not _supabase: return []
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        r = (_supabase.table("trades")
-             .select("closed_at,pnl")
-             .eq("status", "CLOSED")
-             .gte("closed_at", since)
-             .order("closed_at")
-             .execute())
-        trades = r.data or []
-        cumulative = 0.0
-        curve = []
-        for t in trades:
-            cumulative += float(t.get("pnl") or 0)
-            curve.append({"date": t["closed_at"], "cumulative": round(cumulative, 2)})
-        return curve
-    except Exception as e:
-        log.debug(f"sb_get_equity_curve: {e}")
         return []
 
 # ============================================================
@@ -386,10 +364,6 @@ _balance_lock = threading.Lock()
 
 _dashboard_cache = {"data": None, "ts": 0}
 _dashboard_lock = threading.Lock()
-
-# v2.5: Supabase-backed dashboard cache
-_supabase_dash_cache = {"data": None, "ts": 0}
-_supabase_dash_lock = threading.Lock()
 
 # ============================================================
 # COOLDOWN / PAUSE / STATS
@@ -499,33 +473,25 @@ def get_exchange_info():
         if is_banned() or client is None:
             return None
         try:
-            _exchange_info = safe_api_call(
-                client.futures_exchange_info, weight=1
-            )
+            _exchange_info = safe_api_call(client.futures_exchange_info, weight=1)
             return _exchange_info
         except Exception as e:
             log.error(f"get_exchange_info: {e}")
             return None
 
 # ============================================================
-# BALANCE — v2.5 keeps last-known value during ban
+# BALANCE
 # ============================================================
 def get_balance(use_cache=True):
-    """
-    v2.5: during ban, returns last cached balance (not zero),
-    so dashboard doesn't look dead.
-    """
     with _balance_lock:
         if use_cache and _balance_cache["data"] and \
            (time.time() - _balance_cache["ts"]) < BALANCE_CACHE_SEC:
             return _balance_cache["data"]
 
-    # During ban: return stale cache if available, else zeros (marked as stale)
     if is_banned() or client is None:
         if _balance_cache["data"]:
             return _balance_cache["data"]
-        return {"balance": 0.0, "available": 0.0, "pnl": 0.0,
-                "stale": True}
+        return {"balance": 0.0, "available": 0.0, "pnl": 0.0, "stale": True}
 
     try:
         bals = safe_api_call(client.futures_account_balance, weight=5)
@@ -588,9 +554,6 @@ def clear_all_caches():
     with _dashboard_lock:
         _dashboard_cache["data"] = None
         _dashboard_cache["ts"] = 0
-    with _supabase_dash_lock:
-        _supabase_dash_cache["data"] = None
-        _supabase_dash_cache["ts"] = 0
     _symbol_cooldown.clear()
     global _global_pause_until
     _global_pause_until = 0.0
@@ -600,7 +563,8 @@ def clear_all_caches():
 # ============================================================
 def get_price(symbol):
     try:
-        t = safe_api_call(client.futures_symbol_ticker, symbol=symbol, weight=1, cooldown_symbol=symbol)
+        t = safe_api_call(client.futures_symbol_ticker, symbol=symbol,
+                          weight=1, cooldown_symbol=symbol)
         return float(t["price"]) if t else 0.0
     except Exception:
         return 0.0
@@ -1159,26 +1123,18 @@ def update_trailing(symbol, info, price):
            "🔄")
 
 # ============================================================
-# MANUAL IMPORT
-# ============================================================
-# ============================================================
-# MANUAL IMPORT — v2.5.1 (with Supabase duplicate guard)
+# MANUAL IMPORT — v2.5.1 with duplicate guard
 # ============================================================
 def import_manual():
     """
-    v2.5.1 improvements:
-      1. Pre-check Supabase for existing OPEN trades — skip import if found
-         (prevents duplicate rows on every restart)
-      2. Per-symbol Supabase check — skip symbols already tracked
-      3. Better logging so you can see exactly what happened
+    v2.5.1: pre-check Supabase for OPEN trades to prevent duplicates.
+    If found, restore them into memory instead of re-importing.
     """
     if is_banned() or client is None:
         log.warning("import_manual: محظور — تخطي")
         return
 
-    # ────────────────────────────────────────────────────────
-    # v2.5.1 STEP 1: Global guard — are there OPEN trades in Supabase?
-    # ────────────────────────────────────────────────────────
+    # STEP 1: Global guard
     if _supabase:
         try:
             existing = (_supabase.table("trades")
@@ -1187,14 +1143,14 @@ def import_manual():
                         .execute())
             existing_count = existing.count or 0
             if existing_count > 0:
-                log.info(f"import_manual: يوجد {existing_count} صفقة OPEN في Supabase — "
-                         f"تخطي الاستيراد لمنع التكرار")
-                # Load the symbols from Supabase so we still know what's tracked
+                log.info(f"import_manual: يوجد {existing_count} صفقة OPEN في Supabase — تخطي")
                 try:
                     rows = (_supabase.table("trades")
-                            .select("symbol,strategy,side,entry_price,qty,sl_price,tp1_price,tp2_price,opened_at,source")
+                            .select("id,symbol,strategy,side,entry_price,qty,"
+                                    "sl_price,tp1_price,tp2_price,opened_at,source")
                             .eq("status", "OPEN")
                             .execute())
+                    restored = 0
                     for r in (rows.data or []):
                         sym = r.get("symbol")
                         if not sym or sym in open_positions:
@@ -1207,13 +1163,12 @@ def import_manual():
                         except Exception:
                             opened_at = datetime.now(timezone.utc)
 
-                        # Rebuild in-memory state from Supabase
                         with state_lock:
                             open_positions[sym] = {
                                 "side": r.get("side", "LONG"),
                                 "entry": float(r.get("entry_price") or 0),
                                 "qty": float(r.get("qty") or 0),
-                                "atr": 0.0,                      # unknown from SB
+                                "atr": 0.0,
                                 "current_sl": (float(r["sl_price"])
                                                if r.get("sl_price") else None),
                                 "sl_order_id": None,
@@ -1232,50 +1187,45 @@ def import_manual():
                                 "opened_at": opened_at,
                                 "strategy": r.get("strategy", "MANUAL"),
                                 "source": r.get("source", "MANUAL"),
-                                "notional": float(r.get("qty") or 0) * float(r.get("entry_price") or 0),
+                                "notional": (float(r.get("qty") or 0)
+                                             * float(r.get("entry_price") or 0)),
                                 "in_watchlist": sym in SYMBOLS,
                                 "sb_id": r.get("id"),
                                 "restored_from_sb": True,
                             }
-                    log.info(f"import_manual: استعيدت {len(open_positions)} صفقة من Supabase إلى الذاكرة")
+                        restored += 1
+                    log.info(f"import_manual: استعيدت {restored} صفقة من Supabase")
                 except Exception as e:
-                    log.warning(f"import_manual: فشل استعادة التفاصيل من Supabase: {e}")
+                    log.warning(f"import_manual restore: {e}")
                 return
         except Exception as e:
-            log.debug(f"import_manual Supabase pre-check: {e}")
+            log.debug(f"import_manual pre-check: {e}")
 
-    # ────────────────────────────────────────────────────────
-    # v2.5.1 STEP 2: No OPEN trades in Supabase → proceed with Binance
-    # ────────────────────────────────────────────────────────
+    # STEP 2: Fetch positions from Binance
     try:
         positions = safe_api_call(client.futures_position_information, weight=5)
         if not positions:
-            log.info("import_manual: لا توجد positions أو الطلب فشل")
+            log.info("import_manual: لا توجد positions")
             return
 
         imported_count = 0
         skipped_existing = 0
         for p in positions:
             if is_banned():
-                log.warning("import_manual: تم اكتشاف حظر أثناء الاستيراد — إيقاف")
+                log.warning("import_manual: حظر أثناء الاستيراد — إيقاف")
                 break
 
             symbol = p["symbol"]
             amt = float(p["positionAmt"])
-
             if amt == 0:
                 continue
 
-            # Skip if already in memory
             with state_lock:
                 if symbol in open_positions:
                     skipped_existing += 1
                     continue
 
-            # ────────────────────────────────────────────────────
-            # v2.5.1 STEP 3: Per-symbol Supabase check
-            # (in case some symbols are already tracked but global check missed)
-            # ────────────────────────────────────────────────────
+            # STEP 3: per-symbol Supabase check
             if _supabase:
                 try:
                     sym_row = (_supabase.table("trades")
@@ -1289,7 +1239,7 @@ def import_manual():
                         skipped_existing += 1
                         continue
                 except Exception as e:
-                    log.debug(f"import_manual per-symbol check {symbol}: {e}")
+                    log.debug(f"per-symbol check {symbol}: {e}")
 
             entry = float(p["entryPrice"])
             side = "LONG" if amt > 0 else "SHORT"
@@ -1297,7 +1247,6 @@ def import_manual():
             notional = entry * qty
             unrl = float(p.get("unRealizedProfit", 0))
 
-            # ATR for auto-SL
             try:
                 df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
                 if df is not None and len(df) > 20:
@@ -1308,34 +1257,26 @@ def import_manual():
             except Exception:
                 atr = entry * 0.01
 
-            # Existing SL/TP orders on Binance
-            sl = None
-            sl_id = None
-            tp_orders = []
+            sl = None; sl_id = None; tp_orders = []
             try:
                 orders = safe_api_call(client.futures_get_open_orders,
                                        symbol=symbol, weight=5)
                 for o in orders or []:
                     otype = o["type"]
                     if otype in ("STOP_MARKET", "STOP"):
-                        sl = float(o["stopPrice"])
-                        sl_id = o["orderId"]
+                        sl = float(o["stopPrice"]); sl_id = o["orderId"]
                     elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
-                        tp_orders.append({
-                            "id": o["orderId"],
-                            "price": float(o["stopPrice"]),
-                        })
+                        tp_orders.append({"id": o["orderId"],
+                                          "price": float(o["stopPrice"])})
             except Exception:
                 pass
 
             opened_at = datetime.now(timezone.utc)
-
             tp1_price = tp_orders[0]["price"] if len(tp_orders) > 0 else None
             tp2_price = tp_orders[1]["price"] if len(tp_orders) > 1 else None
             tp1_id    = tp_orders[0]["id"]    if len(tp_orders) > 0 else None
             tp2_id    = tp_orders[1]["id"]    if len(tp_orders) > 1 else None
 
-            # Register in memory
             with state_lock:
                 open_positions[symbol] = {
                     "side": side, "entry": entry, "qty": qty, "atr": atr,
@@ -1353,7 +1294,6 @@ def import_manual():
                     "in_watchlist": symbol in SYMBOLS,
                 }
 
-            # Insert into Supabase
             sb_id = sb_insert_trade({
                 "symbol": symbol, "strategy": "MANUAL", "side": side,
                 "entry_price": entry, "qty": qty, "notional": notional,
@@ -1368,7 +1308,6 @@ def import_manual():
                     open_positions[symbol]["sb_id"] = sb_id
 
             imported_count += 1
-
             wl = "✅ في القائمة" if symbol in SYMBOLS else "⚠️ خارج القائمة"
             tg_log("📥 استيراد صفقة يدوية",
                    f"💠 <b>{symbol}</b> ({wl})\n"
@@ -1378,12 +1317,9 @@ def import_manual():
                    f"🎯 TP: {tp1_price or '—'} / {tp2_price or '—'}",
                    "📥")
 
-            # Auto-SL if manual position has none
             if sl is None and AUTO_SL_MANUAL and not is_banned():
-                auto_sl = round_price(
-                    symbol,
-                    entry - 1.5*atr if side == "LONG" else entry + 1.5*atr
-                )
+                auto_sl = round_price(symbol,
+                                     entry - 1.5*atr if side == "LONG" else entry + 1.5*atr)
                 opp = "SELL" if side == "LONG" else "BUY"
                 sl_order = place_stop_loss(symbol, opp, auto_sl, qty)
                 with state_lock:
@@ -1395,12 +1331,86 @@ def import_manual():
                     tg_log("🛡️ SL تلقائي", f"{symbol}: {auto_sl}", "🛡️")
                     sb_update_trade(sb_id, {"sl_price": auto_sl})
 
-        log.info(f"import_manual: استُوردت {imported_count} صفقة جديدة، "
-                 f"تم تخطي {skipped_existing} موجودة")
+        log.info(f"import_manual: استُوردت {imported_count}، تم تخطي {skipped_existing}")
 
     except Exception as e:
         log.exception(f"import_manual: {e}")
         tg_log("⚠️ خطأ في استيراد الصفقات", str(e), "⚠️")
+
+# ============================================================
+# REFRESH RESTORED POSITIONS (v2.5.1)
+# ============================================================
+def refresh_restored_positions():
+    """
+    After ban ends, refresh positions that were restored from Supabase
+    with real Binance data (SL/TP order IDs, ATR).
+    """
+    if is_banned() or client is None:
+        return
+    with state_lock:
+        restored = [s for s, p in open_positions.items()
+                    if p.get("restored_from_sb")]
+    if not restored:
+        return
+
+    log.info(f"refresh_restored_positions: تحديث {len(restored)} صفقة")
+    updated_count = 0
+    for symbol in restored:
+        if is_banned():
+            return
+        with state_lock:
+            info = open_positions.get(symbol)
+        if not info:
+            continue
+
+        try:
+            orders = safe_api_call(client.futures_get_open_orders,
+                                   symbol=symbol, weight=5)
+        except Exception:
+            continue
+
+        sl = sl_id = None
+        tp_orders = []
+        for o in orders or []:
+            otype = o["type"]
+            if otype in ("STOP_MARKET", "STOP"):
+                sl = float(o["stopPrice"]); sl_id = o["orderId"]
+            elif otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                tp_orders.append({"id": o["orderId"],
+                                  "price": float(o["stopPrice"])})
+
+        try:
+            df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
+            if df is not None and len(df) > 20:
+                df = add_indicators(df)
+                atr = float(df.iloc[-1]["atr"])
+            else:
+                atr = info["entry"] * 0.01
+        except Exception:
+            atr = info["entry"] * 0.01
+
+        with state_lock:
+            if sl_id:
+                info["current_sl"] = sl
+                info["sl_order_id"] = sl_id
+                info["sl_on_exchange"] = True
+            if tp_orders:
+                info["tp1_price"] = tp_orders[0]["price"]
+                info["tp1_order_id"] = tp_orders[0]["id"]
+                info["tp1_on_exchange"] = True
+            if len(tp_orders) > 1:
+                info["tp2_price"] = tp_orders[1]["price"]
+                info["tp2_order_id"] = tp_orders[1]["id"]
+                info["tp2_on_exchange"] = True
+            info["atr"] = atr
+            info["restored_from_sb"] = False
+
+        updated_count += 1
+        log.info(f"refresh_restored_positions: ✅ {symbol} محدّثة")
+
+    if updated_count:
+        tg_log("🔄 تحديث المواقع المستعادة",
+               f"تم تحديث {updated_count} صفقة ببيانات Binance", "🔄")
 
 # ============================================================
 # MONITOR
@@ -1580,7 +1590,7 @@ def record_trade(symbol, info):
            "✅")
 
 # ============================================================
-# FLASK — PROFESSIONAL DASHBOARD (v2.5 UI)
+# FLASK — DASHBOARD
 # ============================================================
 app = Flask(__name__)
 
@@ -1596,40 +1606,34 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#080b14; --bg-2:#0d1220; --panel:#111827cc; --panel-solid:#111827;
+  --bg:#080b14; --panel:#111827cc;
   --border:#1f2937; --border-2:#2d3748;
   --text:#e5e7eb; --text-dim:#94a3b8; --text-mute:#64748b;
   --brand:#3b82f6; --brand-2:#60a5fa;
   --green:#10b981; --green-bg:#10b98122;
   --red:#ef4444; --red-bg:#ef444422;
   --yellow:#f59e0b; --yellow-bg:#f59e0b22;
-  --purple:#a855f7; --purple-bg:#a855f722;
-  --cyan:#06b6d4;
+  --purple:#a855f7;
   --shadow:0 4px 24px rgba(0,0,0,.4);
   --radius:14px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
 body{
   font-family:'Inter','Segoe UI',system-ui,sans-serif;
   background:
     radial-gradient(1200px 600px at 90% -10%, #1e3a8a33, transparent 60%),
     radial-gradient(900px 500px at -10% 100%, #7c3aed22, transparent 60%),
     var(--bg);
-  color:var(--text);
-  min-height:100vh;
+  color:var(--text); min-height:100vh;
   -webkit-font-smoothing:antialiased;
   padding-bottom:60px;
 }
 .mono{font-family:'JetBrains Mono',monospace}
-
 .header{
   position:sticky;top:0;z-index:50;
-  backdrop-filter:blur(14px);
-  background:rgba(8,11,20,.75);
+  backdrop-filter:blur(14px); background:rgba(8,11,20,.75);
   border-bottom:1px solid var(--border);
-  padding:14px 24px;
-  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+  padding:14px 24px; display:flex; align-items:center; gap:16px; flex-wrap:wrap;
 }
 .brand{display:flex;align-items:center;gap:12px;font-weight:800;font-size:18px}
 .brand .logo{
@@ -1650,10 +1654,7 @@ body{
 .pill.off .dot{background:var(--red);box-shadow:0 0 0 4px #ef444422}
 .pill.warn{color:var(--yellow);border-color:#f59e0b55;background:var(--yellow-bg)}
 .pill.warn .dot{background:var(--yellow);box-shadow:0 0 0 4px #f59e0b22;animation:pulse 1.6s infinite}
-.pill.info{color:var(--brand-2);border-color:#3b82f655;background:#3b82f61a}
-.pill.info .dot{background:var(--brand-2);box-shadow:0 0 0 4px #3b82f622}
 @keyframes pulse{50%{opacity:.4}}
-
 .clock{font-size:12px;color:var(--text-dim);font-weight:600}
 
 .tabs{
@@ -1678,12 +1679,10 @@ body{
 .cols-1-1{grid-template-columns:1fr 1fr}
 @media (max-width:900px){.cols-2,.cols-1-1{grid-template-columns:1fr}}
 
-/* ---- Alert banner ---- */
 .alert{
   display:flex;align-items:center;gap:12px;
   padding:14px 18px;margin-bottom:18px;border-radius:12px;
-  font-size:13px;font-weight:500;
-  border:1px solid;
+  font-size:13px;font-weight:500;border:1px solid;
 }
 .alert.info{background:#3b82f61a;border-color:#3b82f655;color:var(--brand-2)}
 .alert.warn{background:var(--yellow-bg);border-color:#f59e0b55;color:var(--yellow)}
@@ -1695,8 +1694,7 @@ body{
   background:var(--panel);border:1px solid var(--border);
   border-radius:var(--radius);padding:18px 18px 16px;
   position:relative;overflow:hidden;
-  backdrop-filter:blur(10px);
-  transition:.25s;
+  backdrop-filter:blur(10px);transition:.25s;
 }
 .kpi:hover{transform:translateY(-2px);border-color:var(--border-2);box-shadow:var(--shadow)}
 .kpi::before{
@@ -1706,14 +1704,14 @@ body{
 }
 .kpi .label{
   font-size:11px;color:var(--text-mute);font-weight:600;
-  text-transform:uppercase;letter-spacing:.8px;display:flex;align-items:center;gap:6px;
+  text-transform:uppercase;letter-spacing:.8px;
 }
 .kpi .value{
   font-size:26px;font-weight:800;margin-top:8px;
   font-family:'JetBrains Mono',monospace;letter-spacing:-.5px;
 }
 .kpi .value .unit{font-size:13px;font-weight:600;color:var(--text-dim);margin-right:4px}
-.kpi .delta{font-size:12px;font-weight:600;margin-top:6px;display:flex;gap:6px;align-items:center;color:var(--text-dim)}
+.kpi .delta{font-size:12px;font-weight:600;margin-top:6px;color:var(--text-dim)}
 .kpi.green .value{color:var(--green)}
 .kpi.red .value{color:var(--red)}
 .kpi.blue .value{color:var(--brand-2)}
@@ -1733,7 +1731,7 @@ body{
 }
 .panel h2{
   font-size:15px;font-weight:700;margin-bottom:16px;
-  display:flex;align-items:center;gap:10px;color:var(--text);
+  display:flex;align-items:center;gap:10px;
 }
 .panel h2 .icon{
   width:28px;height:28px;border-radius:8px;display:grid;place-items:center;
@@ -1762,33 +1760,26 @@ tbody tr:last-child td{border-bottom:none}
 .tag{
   display:inline-flex;align-items:center;gap:5px;
   padding:3px 9px;border-radius:6px;font-size:11px;font-weight:700;
-  letter-spacing:.3px;border:1px solid transparent;
+  border:1px solid transparent;
 }
-.tag.momentum{background:var(--brand)1a;color:var(--brand-2);border-color:#3b82f644}
-.tag.ema{background:var(--purple)1a;color:#c084fc;border-color:#a855f744}
-.tag.manual{background:var(--yellow)1a;color:#fbbf24;border-color:#f59e0b44}
+.tag.momentum{background:#3b82f61a;color:var(--brand-2);border-color:#3b82f644}
+.tag.ema{background:#a855f71a;color:#c084fc;border-color:#a855f744}
+.tag.manual{background:#f59e0b1a;color:#fbbf24;border-color:#f59e0b44}
 .tag.long{background:var(--green-bg);color:var(--green);border-color:#10b98144}
 .tag.short{background:var(--red-bg);color:var(--red);border-color:#ef444444}
 
-.empty{
-  text-align:center;padding:48px 20px;color:var(--text-mute);
-}
+.empty{text-align:center;padding:48px 20px;color:var(--text-mute)}
 .empty .icon{font-size:36px;opacity:.4;margin-bottom:10px}
 .empty p{font-size:13px}
 
-.bar{
-  height:6px;background:#1e293b;border-radius:999px;overflow:hidden;margin-top:10px;
-}
-.bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#a855f7);border-radius:999px;transition:width .5s}
+.bar{height:6px;background:#1e293b;border-radius:999px;overflow:hidden;margin-top:10px}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b82f6,#a855f7);
+  border-radius:999px;transition:width .5s}
 
 .section-title{
   font-size:12px;font-weight:700;color:var(--text-mute);
   text-transform:uppercase;letter-spacing:1px;margin:24px 0 12px;
 }
-
-@keyframes flash{0%{background:#3b82f622}100%{background:transparent}}
-.flash{animation:flash 1s}
-
 .hidden{display:none !important}
 </style>
 </head>
@@ -1799,7 +1790,7 @@ tbody tr:last-child td{border-bottom:none}
     <div class="logo">⚡</div>
     <div>
       <div>Trading Bot</div>
-      <div class="sub">UNIFIED v2.5 · SUPABASE-FIRST</div>
+      <div class="sub">v2.5.1 · SUPABASE-FIRST</div>
     </div>
   </div>
   <div class="pills">
@@ -1820,11 +1811,10 @@ tbody tr:last-child td{border-bottom:none}
 </div>
 
 <div class="container">
-
   <div id="banner-container"></div>
 
   <div id="tab-overview">
-    <div class="grid kpis" id="kpis">
+    <div class="grid kpis">
       <div class="kpi blue" id="kpi-balance-card">
         <div class="label">💰 الرصيد الكلي</div>
         <div class="value" id="kpi-balance">— <span class="unit">USDT</span></div>
@@ -1872,13 +1862,11 @@ tbody tr:last-child td{border-bottom:none}
       <h2><span class="icon">💼</span> الصفقات النشطة <span class="badge" id="pos-count">0</span></h2>
       <div class="table-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>العملة</th><th>الاستراتيجية</th><th>الاتجاه</th>
-              <th>الدخول</th><th>الكمية</th><th>الاسمي</th>
-              <th>SL الحالي</th><th>المرحلة</th>
-            </tr>
-          </thead>
+          <thead><tr>
+            <th>العملة</th><th>الاستراتيجية</th><th>الاتجاه</th>
+            <th>الدخول</th><th>الكمية</th><th>الاسمي</th>
+            <th>SL الحالي</th><th>المرحلة</th>
+          </tr></thead>
           <tbody id="positions-body">
             <tr><td colspan="8" class="empty"><div class="icon">💼</div><p>لا صفقات نشطة</p></td></tr>
           </tbody>
@@ -1889,15 +1877,13 @@ tbody tr:last-child td{border-bottom:none}
 
   <div id="tab-history" class="hidden">
     <div class="panel">
-      <h2><span class="icon">📜</span> آخر الصفقات المغلقة <span class="badge" id="history-badge">50</span></h2>
+      <h2><span class="icon">📜</span> آخر الصفقات المغلقة <span class="badge" id="history-badge">—</span></h2>
       <div class="table-wrap">
         <table>
-          <thead>
-            <tr>
-              <th>الوقت</th><th>العملة</th><th>الاستراتيجية</th><th>الاتجاه</th>
-              <th>الدخول</th><th>P&L</th><th>المدة</th>
-            </tr>
-          </thead>
+          <thead><tr>
+            <th>الوقت</th><th>العملة</th><th>الاستراتيجية</th><th>الاتجاه</th>
+            <th>الدخول</th><th>P&L</th><th>المدة</th>
+          </tr></thead>
           <tbody id="history-body">
             <tr><td colspan="7" class="empty"><div class="icon">📜</div><p>لا تاريخ بعد</p></td></tr>
           </tbody>
@@ -1912,9 +1898,9 @@ tbody tr:last-child td{border-bottom:none}
         <h2><span class="icon">🎯</span> إحصائيات الاستراتيجيات</h2>
         <div class="table-wrap">
           <table>
-            <thead>
-              <tr><th>الاستراتيجية</th><th>مفتوحة</th><th>مغلقة</th><th>P&L</th><th>Win Rate</th></tr>
-            </thead>
+            <thead><tr>
+              <th>الاستراتيجية</th><th>مفتوحة</th><th>مغلقة</th><th>P&L</th><th>Win Rate</th>
+            </tr></thead>
             <tbody id="strategy-body">
               <tr><td colspan="5" class="empty"><div class="icon">📈</div><p>لا إحصائيات</p></td></tr>
             </tbody>
@@ -1932,7 +1918,6 @@ tbody tr:last-child td{border-bottom:none}
       </div>
     </div>
   </div>
-
 </div>
 
 <script>
@@ -1941,8 +1926,7 @@ const fmt = (n,d=2)=>Number(n||0).toLocaleString('en-US',{minimumFractionDigits:
 const fmtSigned = (n,d=2)=>{const v=Number(n||0);return (v>=0?'+':'')+fmt(v,d);};
 
 function tickClock(){
-  const d=new Date();
-  const s=d.toLocaleTimeString('en-GB',{hour12:false,timeZone:'Asia/Damascus'});
+  const s=new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'Asia/Damascus'});
   $('clock').textContent = s + ' (دمشق)';
 }
 setInterval(tickClock,1000); tickClock();
@@ -1976,12 +1960,12 @@ function renderCharts(){
               const g=ctx.chart.ctx.createLinearGradient(0,0,0,300);
               g.addColorStop(0,'#3b82f666');g.addColorStop(1,'#3b82f600');return g;
             },
-            borderWidth:2.5, fill:true, tension:.35,
-            pointRadius:0, pointHoverRadius:5, pointHoverBackgroundColor:'#60a5fa',
+            borderWidth:2.5,fill:true,tension:.35,
+            pointRadius:0,pointHoverRadius:5,pointHoverBackgroundColor:'#60a5fa',
           }]
         },
         options:{
-          responsive:true, maintainAspectRatio:false,
+          responsive:true,maintainAspectRatio:false,
           interaction:{mode:'index',intersect:false},
           plugins:{
             legend:{display:false},
@@ -1991,9 +1975,9 @@ function renderCharts(){
           },
           scales:{
             x:{ticks:{color:'#64748b',maxRotation:0,autoSkip:true,maxTicksLimit:8,font:{size:11}},
-              grid:{color:'#1f293766',drawBorder:false}},
+              grid:{color:'#1f293766'}},
             y:{ticks:{color:'#64748b',font:{size:11},callback:v=>fmtSigned(v,0)},
-              grid:{color:'#1f293766',drawBorder:false}}
+              grid:{color:'#1f293766'}}
           }
         }
       });
@@ -2016,7 +2000,8 @@ function renderCharts(){
       options:{
         responsive:true,maintainAspectRatio:false,cutout:'65%',
         plugins:{
-          legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:12},padding:14,boxWidth:12,boxHeight:12,usePointStyle:true}},
+          legend:{position:'bottom',labels:{color:'#94a3b8',font:{size:12},padding:14,
+            boxWidth:12,boxHeight:12,usePointStyle:true}},
           tooltip:{backgroundColor:'#111827',borderColor:'#1f2937',borderWidth:1,
             titleColor:'#e5e7eb',bodyColor:'#94a3b8',padding:10,
             callbacks:{label:(c)=>' '+c.label+': '+c.parsed+' صفقة'}}
@@ -2034,7 +2019,7 @@ function renderBanners(d){
       <span class="ic">🚫</span>
       <div>
         <b>البوت محظور مؤقتاً من Binance API</b> — باقي ${d.ban_remaining_min} دقيقة.<br>
-        <span style="opacity:.8">الواجهة تعمل من ${d.data_source_label}. لن يتم أي اتصال بـ Binance حتى انتهاء الحظر.</span>
+        <span style="opacity:.8">الواجهة تعمل من ${d.data_source_label}. لن يتم أي اتصال حتى انتهاء الحظر.</span>
       </div>
     </div>`);
   }
@@ -2050,9 +2035,7 @@ function renderBanners(d){
   if(!d.supabase_available){
     banners.push(`<div class="alert info">
       <span class="ic">ℹ️</span>
-      <div>
-        <b>Supabase غير مهيأ</b> — البيانات معروضة من الذاكرة المحلية فقط.
-      </div>
+      <div><b>Supabase غير مهيأ</b> — البيانات من الذاكرة المحلية فقط.</div>
     </div>`);
   }
   c.innerHTML = banners.join('');
@@ -2147,11 +2130,10 @@ function renderStrategyStats(stats){
 }
 
 function renderBotStatus(d){
-  const srcLabel = d.data_source_label || '—';
   const rows = [
     ['🔌 Binance Client', d.client_ok?'✅ متصل':'❌ خطأ'],
     ['🗄️ Supabase', d.supabase_available?'✅ متصل':'❌ غير مهيأ'],
-    ['📡 مصدر البيانات', srcLabel],
+    ['📡 مصدر البيانات', d.data_source_label || '—'],
     ['🚫 حالة الحظر', d.banned?('محظور — باقي '+d.ban_remaining_min+' دقيقة'):'✅ غير محظور'],
     ['📅 داخل الجلسة', d.in_session?'✅ نعم':'⏸️ لا'],
     ['⚡ صفقات Momentum', d.stats.momentum_trades],
@@ -2192,7 +2174,7 @@ setInterval(refresh,10000);
 </html>"""
 
 # ============================================================
-# API + ROUTES — v2.5 SUPABASE-FIRST
+# API ROUTES
 # ============================================================
 def _strategy_class(name):
     if "MOMENTUM" in name: return "momentum"
@@ -2200,52 +2182,38 @@ def _strategy_class(name):
     return "manual"
 
 def _fetch_supabase_dashboard_data():
-    """
-    v2.5: Returns a dict with trades/history/stats/equity_curve
-    from Supabase, plus a possible error message.
-    Raises nothing — always returns a dict with 'error' set if failed.
-    """
     result = {
-        "closed_trades": [],
-        "open_trades": [],
-        "equity_curve": [],
-        "strategy_stats": [],
-        "error": None,
+        "closed_trades": [], "open_trades": [],
+        "equity_curve": [], "strategy_stats": [], "error": None,
     }
-
     if not _supabase:
         result["error"] = "Supabase not configured"
         return result
 
-    # Fetch CLOSED trades (for history + stats + equity curve)
     try:
-        closed = sb_fetch_trades(limit=500, status="CLOSED")
-        result["closed_trades"] = closed
+        result["closed_trades"] = sb_fetch_trades(limit=500, status="CLOSED")
     except Exception as e:
         result["error"] = f"trades query failed: {e}"
         log.error(f"sb dashboard trades: {e}")
         return result
 
-    # Fetch OPEN trades (for positions fallback if memory empty)
     try:
-        open_t = sb_fetch_trades(limit=100, status="OPEN")
-        result["open_trades"] = open_t
+        result["open_trades"] = sb_fetch_trades(limit=100, status="OPEN")
     except Exception as e:
         log.debug(f"sb open trades: {e}")
 
-    # Try strategy_stats view (optional)
     try:
         result["strategy_stats"] = sb_get_stats()
     except Exception:
         result["strategy_stats"] = []
 
-    # Build equity curve from closed trades (server-side, no extra query)
     try:
         now = datetime.now(timezone.utc)
         since = now - timedelta(days=30)
         cumulative = 0.0
         curve = []
-        for t in sorted(closed, key=lambda x: x.get("closed_at") or ""):
+        for t in sorted(result["closed_trades"],
+                        key=lambda x: x.get("closed_at") or ""):
             closed_at = t.get("closed_at")
             if not closed_at: continue
             try:
@@ -2262,7 +2230,6 @@ def _fetch_supabase_dashboard_data():
     return result
 
 def _build_strategy_stats_from_trades(trades):
-    """Build strategy stats from a list of closed trades."""
     agg = {}
     for t in trades:
         s = t.get("strategy") or "?"
@@ -2272,20 +2239,15 @@ def _build_strategy_stats_from_trades(trades):
         closed = len(pnls)
         wins = sum(1 for p in pnls if p > 0)
         stats.append({
-            "name": s,
-            "class": _strategy_class(s),
-            "opened": 0,
-            "closed": closed,
-            "pnl": sum(pnls),
+            "name": s, "class": _strategy_class(s), "opened": 0,
+            "closed": closed, "pnl": sum(pnls),
             "winrate": round(wins / closed * 100, 1) if closed else 0,
         })
     return stats
 
 def _build_dashboard_data():
-    """v2.5: Supabase-first, falls back to memory only if SB fails."""
     bal = get_balance(use_cache=True)
 
-    # Live positions (from memory — the source of truth for what's open NOW)
     with state_lock:
         pos = []
         for s, p in open_positions.items():
@@ -2298,7 +2260,6 @@ def _build_dashboard_data():
             })
         ac = len(open_positions)
 
-    # Initialize
     history = []
     strategy_stats = []
     equity_curve = []
@@ -2308,7 +2269,7 @@ def _build_dashboard_data():
     sb_error = None
     data_source = "memory"
 
-    # ---------- Try Supabase FIRST ----------
+    # Try Supabase FIRST
     sb_data = None
     if _supabase:
         try:
@@ -2322,7 +2283,6 @@ def _build_dashboard_data():
             sb_data = None
 
     if sb_data:
-        # History from Supabase closed trades
         for t in sb_data["closed_trades"][:100]:
             strat = t.get("strategy") or "?"
             history.append({
@@ -2335,26 +2295,20 @@ def _build_dashboard_data():
                 "opened_at": str(t.get("opened_at", ""))[:16].replace("T", " "),
             })
 
-        # Stats from view, or computed from trades
         if sb_data["strategy_stats"]:
             for s in sb_data["strategy_stats"]:
                 name = s.get("strategy") or "?"
                 strategy_stats.append({
-                    "name": name,
-                    "class": _strategy_class(name),
+                    "name": name, "class": _strategy_class(name),
                     "opened": int(s.get("open_trades", 0) or 0),
                     "closed": int(s.get("closed_trades", 0) or 0),
                     "pnl": float(s.get("total_pnl") or 0),
                     "winrate": float(s.get("winrate") or 0),
                 })
         else:
-            # Compute from closed trades (much more reliable)
             strategy_stats = _build_strategy_stats_from_trades(sb_data["closed_trades"])
 
-        # Equity curve from Supabase
         equity_curve = sb_data["equity_curve"]
-
-        # Totals — from ALL Supabase closed trades, not just the 100 shown
         all_closed = sb_data["closed_trades"]
         total_pnl = sum(float(t.get("pnl") or 0) for t in all_closed)
         total_trades = len(all_closed)
@@ -2362,7 +2316,6 @@ def _build_dashboard_data():
         winrate = round(wins / total_trades * 100, 1) if total_trades else None
         data_source = "supabase"
 
-    # ---------- Fallback to local JSON if Supabase unavailable ----------
     if data_source != "supabase":
         for t in reversed(trade_history[-100:]):
             strat = t.get("strategy") or "?"
@@ -2380,7 +2333,6 @@ def _build_dashboard_data():
         total_trades = len(trade_history)
         wins = sum(1 for t in trade_history if float(t.get("pnl") or 0) > 0)
         winrate = round(wins / total_trades * 100, 1) if total_trades else None
-        # Build equity curve locally
         cumulative = 0.0
         for t in trade_history[-200:]:
             cumulative += float(t.get("pnl") or 0)
@@ -2390,34 +2342,25 @@ def _build_dashboard_data():
             })
         data_source = "local"
 
-    # Data source label
     if data_source == "supabase":
         data_source_label = "🗄️ Supabase (كامل)"
     elif data_source == "local":
         data_source_label = "📁 JSON محلي"
     else:
         data_source_label = "🧠 الذاكرة الحية"
-
-    # If banned, note it in the label
     if is_banned():
-        data_source_label += " · 🚫 حظر نشط"
+        data_source_label += " · 🚫 حظر"
 
     return {
-        "balance": bal,
-        "active_count": ac,
-        "max_concurrent": MAX_CONCURRENT,
-        "positions": pos,
-        "history": history,
-        "strategy_stats": strategy_stats,
+        "balance": bal, "active_count": ac,
+        "max_concurrent": MAX_CONCURRENT, "positions": pos,
+        "history": history, "strategy_stats": strategy_stats,
         "equity_curve": equity_curve,
-        "total_pnl": total_pnl,
-        "total_trades": total_trades,
-        "winrate": winrate,
-        "stats": dict(_stats),
+        "total_pnl": total_pnl, "total_trades": total_trades,
+        "winrate": winrate, "stats": dict(_stats),
         "supabase": _supabase is not None,
         "supabase_available": _supabase is not None,
-        "sb_error": sb_error,
-        "client_ok": client is not None,
+        "sb_error": sb_error, "client_ok": client is not None,
         "banned": is_banned(),
         "ban_remaining_min": int(ban_remaining() / 60) if is_banned() else 0,
         "in_session": SESSION_START <= datetime.now(timezone.utc).hour < SESSION_END,
@@ -2440,33 +2383,15 @@ def dashboard():
 
 @app.route("/api/dashboard")
 def api_dashboard():
-    # v2.5: cache dashboard payload 5s, but Supabase data itself cached 30s
     with _dashboard_lock:
         if _dashboard_cache["data"] and \
            (time.time() - _dashboard_cache["ts"]) < DASHBOARD_CACHE_SEC:
             return jsonify(_dashboard_cache["data"])
-
     data = _build_dashboard_data()
-
     with _dashboard_lock:
         _dashboard_cache["data"] = data
         _dashboard_cache["ts"] = time.time()
     return jsonify(data)
-
-@app.route("/api/stats")
-def api_stats():
-    with state_lock:
-        pos = {s: {k: str(v) if isinstance(v, datetime) else v
-                   for k, v in p.items() if not k.endswith("_id")}
-               for s, p in open_positions.items()}
-    return jsonify({
-        "balance": get_balance(use_cache=True),
-        "active": pos,
-        "stats": _stats,
-        "supabase": _supabase is not None,
-        "banned": is_banned(),
-        "ban_remaining_min": int(ban_remaining() / 60) if is_banned() else 0,
-    })
 
 @app.route("/health")
 def health():
@@ -2481,7 +2406,8 @@ def run_flask():
     port = int(os.getenv("PORT", 10000))
     log.info(f"🌐 بدء Flask على المنفذ {port}")
     try:
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+        app.run(host="0.0.0.0", port=port, debug=False,
+                use_reloader=False, threaded=True)
     except Exception as e:
         log.error(f"❌ Flask فشل: {e}")
 
@@ -2498,10 +2424,9 @@ def handle_command(text, chat_id):
         ban_line = ""
         if is_banned():
             ban_line = f"🚫 <b>محظور:</b> باقي {ban_remaining()/60:.1f} دقيقة\n\n"
-        msg = (
-            f"🤖 <b>حالة البوت v2.5</b>\n"
-            f"🕐 {syr_str()}\n\n"
-            f"{ban_line}"
+        tg_send(
+            f"🤖 <b>حالة البوت v2.5.1</b>\n"
+            f"🕐 {syr_str()}\n\n{ban_line}"
             f"🔌 Client: {'✅' if client else '❌'}\n"
             f"🗄️ Supabase: {'✅' if _supabase else '❌'}\n"
             f"💰 الرصيد: {bal['balance']:.2f}\n"
@@ -2509,15 +2434,13 @@ def handle_command(text, chat_id):
             f"📈 غير محقق: {bal['pnl']:+.2f}\n\n"
             f"📊 صفقات نشطة: {len(active)}/{MAX_CONCURRENT}\n"
             f"• {', '.join(active) if active else 'لا يوجد'}\n\n"
-            f"📈 إحصائيات (هذه الجلسة):\n"
+            f"📈 هذه الجلسة:\n"
             f"• فتحت: {stats['trades_opened']}\n"
             f"• أغلقت: {stats['trades_closed']}\n"
             f"• Momentum: {stats['momentum_trades']}\n"
-            f"• EMA Cross: {stats['ema_trades']}\n"
-            f"• Rate Limit: {stats['rate_limit_hits']}\n"
+            f"• EMA: {stats['ema_trades']}\n"
             f"• Bans: {stats.get('bans', 0)}"
         )
-        tg_send(msg)
     elif text == "/positions":
         with state_lock:
             if not open_positions:
@@ -2527,46 +2450,32 @@ def handle_command(text, chat_id):
                 lines.append(
                     f"💠 <b>{s}</b> [{p.get('strategy','?')}]\n"
                     f"   {p['side']} @ {p['entry']}\n"
-                    f"   SL: {p.get('current_sl')} | Stage: {p.get('trailing_stage',0)}\n"
-                )
+                    f"   SL: {p.get('current_sl')} | Stage: {p.get('trailing_stage',0)}\n")
             tg_send("\n".join(lines))
     elif text == "/clearcache":
         clear_all_caches()
-        tg_send("✅ تم تفريغ الكاش (بدون حظر)")
+        tg_send("✅ تم تفريغ الكاش")
     elif text == "/clearban":
         clear_ban()
-        tg_send("✅ تم مسح الحظر المحفوظ")
+        tg_send("✅ تم مسح الحظر")
     elif text == "/baninfo":
         if is_banned():
             tg_send(f"🚫 محظور — باقي {ban_remaining()/60:.1f} دقيقة")
         else:
-            tg_send("✅ لا يوجد حظر حالياً")
+            tg_send("✅ لا يوجد حظر")
     elif text == "/balance":
         bal = get_balance(use_cache=False)
-        stale = " (آخر قراءة — البوت محظور)" if bal.get("stale") else ""
-        tg_send(f"💰 الرصيد: {bal['balance']:.2f}{stale}\n"
-                f"💵 المتاح: {bal['available']:.2f}\n"
-                f"📈 غير محقق: {bal['pnl']:+.2f}")
-    elif text == "/stats":
-        s = dict(_stats)
-        total_pnl = sum(t.get("pnl", 0) for t in trade_history)
-        msg = f"📊 <b>إحصائيات شاملة</b>\n\n"
-        msg += f"💰 P&L تراكمي (محلي): {total_pnl:+.2f} USDT\n"
-        msg += f"📈 فتحت (هذه الجلسة): {s['trades_opened']} | أغلقت: {s['trades_closed']}\n"
-        msg += f"• Momentum: {s['momentum_trades']}\n"
-        msg += f"• EMA: {s['ema_trades']}\n"
-        msg += f"⚠️ Rate limits: {s['rate_limit_hits']} | Bans: {s.get('bans', 0)}"
-        tg_send(msg)
+        stale = " (آخر قراءة)" if bal.get("stale") else ""
+        tg_send(f"💰 {bal['balance']:.2f}{stale}\n"
+                f"💵 متاح: {bal['available']:.2f}\n"
+                f"📈 {bal['pnl']:+.2f}")
     elif text == "/help":
         tg_send("📖 <b>الأوامر:</b>\n"
-                "/status - حالة البوت\n"
-                "/positions - الصفقات النشطة\n"
-                "/balance - الرصيد\n"
-                "/stats - إحصائيات عامة\n"
+                "/status /positions /balance\n"
                 "/baninfo - حالة الحظر\n"
-                "/clearban - مسح الحظر المحفوظ\n"
+                "/clearban - مسح الحظر\n"
                 "/clearcache - تفريغ الكاش\n"
-                "/help - هذه القائمة")
+                "/help")
 
 def tg_polling_loop():
     last_id = 0
@@ -2602,7 +2511,7 @@ def heartbeat_loop():
         time.sleep(HEARTBEAT_HOURS * 3600)
         if is_banned():
             tg_log("💓 Heartbeat (محظور)",
-                   f"🚫 البوت محظور — باقي {ban_remaining()/60:.1f} دقيقة\n"
+                   f"🚫 باقي {ban_remaining()/60:.1f} دقيقة\n"
                    f"<i>الواجهة تعمل من Supabase</i>", "💓")
             continue
         bal = get_balance(use_cache=False)
@@ -2611,11 +2520,9 @@ def heartbeat_loop():
         s = dict(_stats)
         tg_log("💓 Heartbeat",
                f"📊 {len(active)}/{MAX_CONCURRENT} صفقات\n"
-               f"💰 {bal['balance']:.2f} USDT (متاح: {bal['available']:.2f})\n"
+               f"💰 {bal['balance']:.2f} USDT\n"
                f"📈 P&L: {bal['pnl']:+.2f}\n"
-               f"📊 مفتوحة: {s['trades_opened']} | مغلقة: {s['trades_closed']}\n"
-               f"⚠️ Rate limits: {s['rate_limit_hits']} | Bans: {s.get('bans', 0)}",
-               "💓")
+               f"⚠️ Bans: {s.get('bans', 0)}", "💓")
 
 # ============================================================
 # MAIN LOOPS
@@ -2625,7 +2532,7 @@ def wait_for_candle_close(interval_min):
     mins_to = interval_min - (now.minute % interval_min)
     nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=mins_to)
     wait_s = (nxt - now).total_seconds() + 5
-    log.info(f"⏳ انتظار إغلاق ({interval_min}m): {wait_s:.0f}s | {syr_str(nxt)}")
+    log.info(f"⏳ انتظار إغلاق ({interval_min}m): {wait_s:.0f}s")
     while wait_s > 0:
         if is_banned():
             return
@@ -2647,8 +2554,6 @@ def momentum_loop():
             if is_banned(): continue
             if in_session():
                 momentum_scan()
-            else:
-                log.info("⏸️ خارج الجلسة — Momentum")
         except Exception as e:
             log.error(f"momentum_loop: {e}")
             time.sleep(60)
@@ -2663,8 +2568,6 @@ def ema_loop():
             if is_banned(): continue
             if in_session():
                 ema_cross_scan()
-            else:
-                log.info("⏸️ خارج الجلسة — EMA")
         except Exception as e:
             log.error(f"ema_loop: {e}")
             time.sleep(60)
@@ -2677,7 +2580,7 @@ def wait_for_ban_to_end():
         if sb_until > 0 and sb_until > time.time():
             ban_dt = datetime.fromtimestamp(sb_until, tz=timezone.utc)
             set_ban(ban_dt)
-            log.warning(f"🚫 حظر مستعاد من Supabase — حتى {syr_str(ban_dt)}")
+            log.warning(f"🚫 حظر مستعاد من Supabase حتى {syr_str(ban_dt)}")
     except Exception:
         pass
 
@@ -2685,64 +2588,62 @@ def wait_for_ban_to_end():
         return
 
     remaining = ban_remaining()
-    log.warning(f"🚫⏸️  البوت في وضع الانتظار — حظر نشط، باقي {remaining/60:.1f} دقيقة")
+    log.warning(f"🚫⏸️ حظر نشط، باقي {remaining/60:.1f} دقيقة")
     tg_log("🚫⏸️ وضع انتظار الحظر",
            f"البوت لن يتصل بـ Binance حتى انتهاء الحظر\n"
            f"المتبقي: {remaining/60:.1f} دقيقة\n"
-           f"<i>الواجهة تعمل بشكل كامل من Supabase</i>",
-           "⏸️")
+           f"<i>الواجهة تعمل من Supabase</i>", "⏸️")
 
     while is_banned():
         wait = min(ban_remaining(), 300)
-        if wait <= 0:
-            break
-        log.info(f"⏸️ نائم {wait:.0f}s — باقي {ban_remaining()/60:.1f} دقيقة للحظر")
+        if wait <= 0: break
+        log.info(f"⏸️ نائم {wait:.0f}s — باقي {ban_remaining()/60:.1f} دقيقة")
         time.sleep(wait + 5)
 
-    log.info("✅ انتهى الحظر — البوت جاهز للعمل")
+    log.info("✅ انتهى الحظر")
     tg_log("✅ انتهى الحظر", "البوت يستأنف العمل الآن", "✅")
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    log.info("🚀 بدء البوت الموحّد v2.5 (Supabase-First Dashboard)")
-
+    log.info("🚀 بدء البوت الموحّد v2.5.1 (Final Clean Edition)")
     _load_ban_state()
-    log.info(f"📋 SYMBOLS (مطبّعة): {SYMBOLS}")
+    log.info(f"📋 SYMBOLS: {SYMBOLS}")
     log.info(f"🔌 Client: {'✅ OK' if client else '❌ فشل'}")
 
-    # Flask FIRST — dashboard works even during ban
+    # Flask FIRST — dashboard works during ban
     threading.Thread(target=run_flask, daemon=True).start()
-    log.info("✅ Flask يعمل — المنفذ مفتوح (Dashboard يعمل من Supabase)")
+    log.info("✅ Flask يعمل — Dashboard من Supabase")
 
     load_history()
 
+    # KILL-SWITCH
     wait_for_ban_to_end()
 
     bal = get_balance(use_cache=False)
     sb_status = "✅ متصل" if _supabase else "❌ غير متصل"
 
-    tg_log("🤖 بدء البوت الموحّد v2.5",
-           f"📊 <b>الاستراتيجية:</b> Momentum + EMA Cross\n"
-           f"⏱️ Momentum: {MOMENTUM_TF} | EMA: {','.join(EMA_TFS)}\n"
-           f"💼 حجم: {POSITION_SIZE_USDT} USDT | رافعة: {LEVERAGE}x\n"
+    tg_log("🤖 بدء البوت v2.5.1",
+           f"📊 Momentum + EMA Cross\n"
+           f"⏱️ {MOMENTUM_TF} | EMA: {','.join(EMA_TFS)}\n"
+           f"💼 {POSITION_SIZE_USDT} USDT × {LEVERAGE}x\n"
            f"🔢 حد الصفقات: {MAX_CONCURRENT}\n"
            f"📋 العملات ({len(SYMBOLS)}): {', '.join(SYMBOLS)}\n"
-           f"🌐 الوضع: {'TESTNET' if TESTNET else 'LIVE'}\n"
+           f"🌐 {'TESTNET' if TESTNET else 'LIVE'}\n"
            f"🔌 SafeClient: {'✅' if client else '❌'}\n"
-           f"🗄️ <b>Supabase:</b> {sb_status}\n"
+           f"🗄️ Supabase: {sb_status}\n"
            f"💰 الرصيد: {bal['balance']:.2f} USDT\n"
            f"💵 المتاح: {bal['available']:.2f} USDT\n"
-           f"🛡️ <b>Ban-Proof + Supabase-First:</b> ✅",
+           f"🛡️ Ban-Proof + Duplicate-Guard: ✅",
            "🤖")
 
     if _supabase:
-        sb_log_event("bot_started", "Bot started v2.5 Supabase-First",
-                     {"symbols": SYMBOLS, "leverage": LEVERAGE, "mode": "LIVE"})
+        sb_log_event("bot_started", "Bot started v2.5.1",
+                     {"symbols": SYMBOLS, "leverage": LEVERAGE})
 
     if client:
-        import_manual()
+        import_manual()  # With duplicate guard
 
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
@@ -2758,11 +2659,12 @@ def main():
             time.sleep(30)
             now_banned = is_banned()
             if was_banned and not now_banned:
-                tg_log("✅ الحظر انتهى",
-                       f"البوت استأنف العمل\n🕐 {syr_str()}", "✅")
+                tg_log("✅ انتهى الحظر",
+                       f"استئناف العمل\n🕐 {syr_str()}", "✅")
                 time.sleep(60)
                 if not is_banned() and client:
-                    import_manual()
+                    import_manual()              # Skip if SB has OPEN
+                    refresh_restored_positions() # Fix restored from SB
             was_banned = now_banned
 
     threading.Thread(target=ban_watcher, daemon=True).start()
