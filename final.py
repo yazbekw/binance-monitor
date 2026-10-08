@@ -1,15 +1,10 @@
 """
-Unified Trading Bot v2.1 — with Global Ban Lock + Symbol Normalization
-=======================================================================
-Strategies (parallel):
-  A) Momentum (15m) - EMA/MACD/VWAP scoring
-  B) EMA Cross (5m/15m/1h) - EMA crossover detection
-
-Critical fixes in v2.1:
-  - GLOBAL BAN LOCK: all threads stop immediately when IP is banned
-  - SYMBOL NORMALIZATION: accepts any format (BTC/USDT, BTCUSDT, BTC/USDT:USDT)
-  - MANUAL IMPORT: imports ALL open positions, not just SYMBOLS
-  - SINGLE BAN NOTIFICATION: one message per ban (not per thread)
+Unified Trading Bot v2.2 — SafeClient + Global Ban Lock
+========================================================
+v2.2 fixes:
+  - SafeClient: prevents the automatic ping() on Client.__init__
+    which was the ROOT CAUSE of repeated bans (each restart = ping = new violation)
+  - All v2.1 features preserved (ban lock, symbol normalization, etc.)
 """
 import os, re, json, time, logging, threading, requests
 from datetime import datetime, timezone, timedelta
@@ -35,9 +30,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 SUPABASE_URL       = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY       = os.getenv("SUPABASE_KEY", "").strip()
 
-# ─── SYMBOL NORMALIZATION ────────────────────────────────
 def normalize_binance_symbol(s):
-    """Convert any symbol format to Binance Futures format: BTCUSDT"""
     s = s.strip().upper()
     s = s.replace("/", "").replace(":USDT", "").replace("-", "").replace("_", "")
     return s
@@ -117,14 +110,13 @@ _symbol_locks = defaultdict(threading.Lock)
 trade_history = []
 
 # ============================================================
-# GLOBAL BAN LOCK (Critical fix)
+# GLOBAL BAN LOCK
 # ============================================================
 _ban_lock = threading.Lock()
 _ban_until_ts = 0.0
 _notified_ban_ts = 0.0
 
 def is_banned():
-    """Check if IP is globally banned. Resets notification flag when ban expires."""
     global _notified_ban_ts
     with _ban_lock:
         if time.time() >= _ban_until_ts:
@@ -134,21 +126,16 @@ def is_banned():
         return True
 
 def ban_remaining():
-    """Seconds remaining in ban."""
     with _ban_lock:
         return max(0.0, _ban_until_ts - time.time())
 
 def set_ban(ban_until_dt):
-    """
-    Register a ban. Returns True if this is a new/extended ban that should be notified.
-    """
     global _ban_until_ts, _notified_ban_ts
     ban_ts = ban_until_dt.timestamp()
     with _ban_lock:
         extended = ban_ts > _ban_until_ts
         if extended:
             _ban_until_ts = ban_ts
-        # Notify if this ban is longer than the last one we notified about
         should_notify = ban_ts > _notified_ban_ts
         if should_notify:
             _notified_ban_ts = ban_ts
@@ -159,6 +146,59 @@ def clear_ban():
     with _ban_lock:
         _ban_until_ts = 0.0
         _notified_ban_ts = 0.0
+
+# ============================================================
+# TELEGRAM (moved up — needed by SafeClient logging)
+# ============================================================
+TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
+
+def tg_send(text):
+    if not TG_BASE or not TELEGRAM_CHAT_ID: return
+    try:
+        r = requests.post(
+            f"{TG_BASE}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log.error(f"TG error: {r.text[:200]}")
+    except Exception as e:
+        log.error(f"TG exception: {e}")
+
+def tg_log(title, body, emoji="ℹ️"):
+    msg = f"{emoji} <b>{title}</b>\n\n🕐 <b>دمشق:</b> {syr_str()}\n\n{body}"
+    tg_send(msg)
+    log.info(f"{title} | {body.replace(chr(10), ' | ')[:200]}")
+
+# ============================================================
+# BINANCE CLIENT — SafeClient (KEY FIX in v2.2)
+# ============================================================
+class SafeClient(Client):
+    """
+    Client that does NOT ping on initialization.
+    Root cause of previous bans: Client.__init__ called self.ping()
+    which made a network request on every bot restart — even when
+    IP was already banned. This caused each restart to be a new
+    violation and extended the ban exponentially.
+    """
+    def ping(self):
+        # Return a fake response without making a network request
+        return {"serverTime": int(time.time() * 1000)}
+
+
+def _create_client():
+    """Safely create the Binance client without triggering a network call."""
+    try:
+        c = SafeClient(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=TESTNET)
+        log.info("✅ Binance SafeClient initialized (no ping)")
+        return c
+    except Exception as e:
+        log.error(f"❌ SafeClient init failed: {e}")
+        return None
+
+
+client = _create_client()
 
 # ============================================================
 # SUPABASE
@@ -287,12 +327,11 @@ _exchange_info = None
 _exchange_info_lock = threading.Lock()
 
 def get_exchange_info():
-    """Fetch exchange info (cached). Returns None if banned or on error."""
     global _exchange_info
     with _exchange_info_lock:
         if _exchange_info is not None:
             return _exchange_info
-        if is_banned():
+        if is_banned() or client is None:
             return None
         try:
             rate_limiter.add(1)
@@ -323,62 +362,30 @@ def bump_stat(key, amount=1):
         _stats[key] = _stats.get(key, 0) + amount
 
 # ============================================================
-# TELEGRAM
+# SAFE API CALL
 # ============================================================
-TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
-
-def tg_send(text):
-    if not TG_BASE or not TELEGRAM_CHAT_ID: return
-    try:
-        r = requests.post(
-            f"{TG_BASE}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            log.error(f"TG error: {r.text[:200]}")
-    except Exception as e:
-        log.error(f"TG exception: {e}")
-
-def tg_log(title, body, emoji="ℹ️"):
-    msg = f"{emoji} <b>{title}</b>\n\n🕐 <b>دمشق:</b> {syr_str()}\n\n{body}"
-    tg_send(msg)
-    log.info(f"{title} | {body.replace(chr(10), ' | ')[:200]}")
-
-# ============================================================
-# BINANCE
-# ============================================================
-client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY, testnet=TESTNET)
-
 def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, cooldown_symbol=None, **kwargs):
-    """
-    Wrapper with GLOBAL ban lock + rate limit + cooldown + backoff.
-    
-    - Returns None immediately if banned globally (no request sent).
-    - Returns None immediately if in cooldown.
-    - Returns None immediately if in global pause.
-    - Handles -1003 by registering the ban and returning None.
-    """
     global _global_pause_until
-    
-    # ── Priority 1: Global ban lock ──
+
+    # Check banned BEFORE any work
     if is_banned():
         log.debug(f"⛔ محظور — رفض الطلب (باقي {ban_remaining()/60:.1f} د)")
         return None
-    
-    # ── Priority 2: Global pause ──
+
     now = time.time()
     if now < _global_pause_until:
         log.debug(f"⏸️ إيقاف عالمي — رفض الطلب")
         return None
-    
-    # ── Priority 3: Symbol cooldown ──
+
     if cooldown_symbol:
         if now < _symbol_cooldown.get(cooldown_symbol, 0):
             log.debug(f"⏸️ {cooldown_symbol} في كولداون")
             return None
-    
+
+    if client is None:
+        log.error("safe_api_call: client is None (failed init)")
+        return None
+
     for attempt in range(retries):
         try:
             rate_limiter.throttle()
@@ -387,12 +394,11 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, cooldown_symbol=No
             if cooldown_symbol:
                 _symbol_cooldown.pop(cooldown_symbol, None)
             return result
-        
+
         except AttributeError:
             raise
-        
+
         except BinanceAPIException as e:
-            # ── Handle IP ban (-1003) ──
             if e.code == -1003:
                 bump_stat("rate_limit_hits")
                 msg = str(e.message)
@@ -410,33 +416,26 @@ def safe_api_call(func, *args, weight=1, retries=MAX_RETRIES, cooldown_symbol=No
                                f"<i>البوت سيتوقف تلقائياً حتى انتهاء الحظر</i>",
                                "🚫")
                         sb_log_event("rate_limit", "IP banned", {"until": ban_until.isoformat()})
-                    # Return None immediately — caller will handle it
                     return None
                 else:
-                    # No ban time found — use backoff
                     wait = BACKOFF_BASE * (2 ** attempt)
                     log.warning(f"⚠️ Rate limit — انتظار {wait}s")
                     time.sleep(wait)
                     continue
-            
-            # ── Handle timestamp drift ──
+
             elif e.code == -1021:
                 time.sleep(1)
                 continue
-            
-            # ── Order format errors — don't retry ──
             elif e.code in (-4120, -1102, -1111, -2021):
                 raise
-            
-            # ── Other API errors ──
             else:
                 raise
-        
+
         except BinanceRequestException:
             wait = BACKOFF_BASE * (2 ** attempt)
             log.warning(f"🌐 Network error — انتظار {wait}s")
             time.sleep(wait)
-    
+
     raise Exception(f"فشل بعد {retries} محاولات")
 
 # ============================================================
@@ -588,7 +587,7 @@ def add_indicators(df):
     return df
 
 # ============================================================
-# MOMENTUM STRATEGY
+# MOMENTUM
 # ============================================================
 def evaluate_momentum(df, direction):
     last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
@@ -639,7 +638,7 @@ def evaluate_momentum(df, direction):
     }
 
 def momentum_scan():
-    if is_banned():
+    if is_banned() or client is None:
         log.info("⛔ محظور — تخطي مسح Momentum")
         return
     log.info(f"🔍 [Momentum] مسح {len(SYMBOLS)} عملات")
@@ -671,7 +670,7 @@ def momentum_scan():
             log.error(f"[M] {symbol}: {e}")
 
 # ============================================================
-# EMA CROSS STRATEGY
+# EMA CROSS
 # ============================================================
 _last_cross_candle = {}
 
@@ -785,7 +784,7 @@ def detect_ema_cross(symbol, tf):
     return signal
 
 def ema_cross_scan():
-    if is_banned():
+    if is_banned() or client is None:
         log.info("⛔ محظور — تخطي مسح EMA Cross")
         return
     log.info(f"🔍 [EMA Cross] مسح {len(SYMBOLS)} × {len(EMA_TFS)}")
@@ -865,7 +864,7 @@ def close_position_market(symbol, side, qty):
 # OPEN TRADE
 # ============================================================
 def open_trade(symbol, direction, signal, strategy):
-    if is_banned():
+    if is_banned() or client is None:
         return
     with _symbol_locks[symbol]:
         if has_open_position(symbol):
@@ -1007,7 +1006,7 @@ def open_trade(symbol, direction, signal, strategy):
 def update_trailing(symbol, info, price):
     if not TRAILING_ENABLED or not info.get("current_sl"):
         return
-    if is_banned():
+    if is_banned() or client is None:
         return
     side = info["side"]
     entry = info["entry"]
@@ -1065,7 +1064,7 @@ def update_trailing(symbol, info, price):
 # MANUAL IMPORT
 # ============================================================
 def import_manual():
-    if is_banned():
+    if is_banned() or client is None:
         log.warning("import_manual: محظور — تخطي")
         return
     try:
@@ -1093,7 +1092,6 @@ def import_manual():
             unrl = float(p.get("unRealizedProfit", 0))
             mark = float(p.get("markPrice", entry))
 
-            # ATR (fallback to 1% if fails)
             try:
                 df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
                 if df is not None and len(df) > 20:
@@ -1104,7 +1102,6 @@ def import_manual():
             except Exception:
                 atr = entry * 0.01
 
-            # Existing SL/TP orders
             sl = None
             sl_id = None
             tp_orders = []
@@ -1171,7 +1168,6 @@ def import_manual():
                    f"🎯 TP: {tp1_price or '—'} / {tp2_price or '—'}",
                    "📥")
 
-            # Auto SL if missing
             if sl is None and AUTO_SL_MANUAL:
                 auto_sl = round_price(symbol,
                                      entry - 1.5*atr if side == "LONG" else entry + 1.5*atr)
@@ -1199,8 +1195,7 @@ def monitor_loop():
     last_prices = {}
     while True:
         try:
-            # Skip API calls when banned
-            if is_banned():
+            if is_banned() or client is None:
                 time.sleep(30)
                 continue
 
@@ -1371,7 +1366,7 @@ def record_trade(symbol, info):
            "✅")
 
 # ============================================================
-# FLASK DASHBOARD
+# FLASK
 # ============================================================
 app = Flask(__name__)
 
@@ -1630,7 +1625,8 @@ def health():
     return {"status": "alive", "time": syr_str(),
             "active": get_active_count(),
             "supabase": _supabase is not None,
-            "banned": is_banned()}
+            "banned": is_banned(),
+            "client_ok": client is not None}
 
 def run_flask():
     port = int(os.getenv("PORT", 10000))
@@ -1654,9 +1650,10 @@ def handle_command(text, chat_id):
         if is_banned():
             ban_line = f"🚫 <b>محظور:</b> باقي {ban_remaining()/60:.1f} دقيقة\n\n"
         msg = (
-            f"🤖 <b>حالة البوت v2.1</b>\n"
+            f"🤖 <b>حالة البوت v2.2</b>\n"
             f"🕐 {syr_str()}\n\n"
             f"{ban_line}"
+            f"🔌 Client: {'✅' if client else '❌'}\n"
             f"🗄️ Supabase: {'✅' if _supabase else '❌'}\n"
             f"💰 الرصيد: {bal['balance']:.2f}\n"
             f"💵 المتاح: {bal['available']:.2f}\n"
@@ -1669,11 +1666,7 @@ def handle_command(text, chat_id):
             f"• Momentum: {stats['momentum_trades']}\n"
             f"• EMA Cross: {stats['ema_trades']}\n"
             f"• Rate Limit: {stats['rate_limit_hits']}\n"
-            f"• Bans: {stats.get('bans', 0)}\n\n"
-            f"🔍 فلاتر:\n"
-            f"• حجم: {stats['filtered_vol']} | ADX: {stats['filtered_adx']}\n"
-            f"• ATR: {stats['filtered_atr']} | Score: {stats['filtered_score']}\n"
-            f"• HTF: {stats['filtered_htf']}"
+            f"• Bans: {stats.get('bans', 0)}"
         )
         tg_send(msg)
     elif text == "/positions":
@@ -1912,36 +1905,34 @@ def ema_loop():
 # MAIN
 # ============================================================
 def main():
-    log.info("🚀 بدء البوت الموحّد v2.1")
+    log.info("🚀 بدء البوت الموحّد v2.2 (SafeClient)")
     log.info(f"📋 SYMBOLS (مطبّعة): {SYMBOLS}")
+    log.info(f"🔌 Client: {'✅ OK' if client else '❌ فشل'}")
 
-    # ── 1. Flask FIRST (critical for Render) ──
+    # Flask FIRST
     threading.Thread(target=run_flask, daemon=True).start()
     log.info("✅ Flask يعمل — المنفذ مفتوح")
 
-    # ── 2. Load local history ──
     load_history()
 
-    # ── 3. Check ban status ──
     if is_banned():
         log.warning(f"🚫 البوت محظور — باقي {ban_remaining()/60:.1f} دقيقة")
 
-    # ── 4. Get balance (may fail if banned) ──
     bal = get_balance()
     sb_status = "✅ متصل" if _supabase else "❌ غير متصل"
 
-    # ── 5. Notify startup ──
     ban_note = ""
     if is_banned():
         ban_note = f"\n🚫 <b>محظور حالياً</b> — باقي {ban_remaining()/60:.1f} دقيقة"
 
-    tg_log("🤖 بدء البوت الموحّد v2.1",
+    tg_log("🤖 بدء البوت الموحّد v2.2",
            f"📊 <b>الاستراتيجية:</b> Momentum + EMA Cross\n"
            f"⏱️ Momentum: {MOMENTUM_TF} | EMA: {','.join(EMA_TFS)}\n"
            f"💼 حجم: {POSITION_SIZE_USDT} USDT | رافعة: {LEVERAGE}x\n"
            f"🔢 حد الصفقات: {MAX_CONCURRENT}\n"
            f"📋 العملات ({len(SYMBOLS)}): {', '.join(SYMBOLS)}\n"
            f"🌐 الوضع: {'TESTNET' if TESTNET else 'LIVE'}\n"
+           f"🔌 SafeClient: {'✅' if client else '❌'}\n"
            f"🗄️ <b>Supabase:</b> {sb_status}\n"
            f"💰 الرصيد: {bal['balance']:.2f} USDT\n"
            f"💵 المتاح: {bal['available']:.2f} USDT"
@@ -1949,14 +1940,12 @@ def main():
            "🤖")
 
     if _supabase:
-        sb_log_event("bot_started", "Bot started v2.1",
+        sb_log_event("bot_started", "Bot started v2.2",
                      {"symbols": SYMBOLS, "leverage": LEVERAGE, "mode": "LIVE"})
 
-    # ── 6. Import manual positions (after ban check) ──
-    if not is_banned():
+    if not is_banned() and client:
         import_manual()
 
-    # ── 7. Start all loops ──
     threading.Thread(target=monitor_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=tg_polling_loop, daemon=True).start()
@@ -1966,7 +1955,6 @@ def main():
 
     log.info("✅ جميع المكونات تعمل")
 
-    # ── 8. If banned, add a ban monitor that notifies when expired ──
     def ban_watcher():
         was_banned = is_banned()
         while True:
@@ -1974,10 +1962,8 @@ def main():
             now_banned = is_banned()
             if was_banned and not now_banned:
                 tg_log("✅ الحظر انتهى",
-                       f"البوت استأنف العمل\n"
-                       f"🕐 {syr_str()}",
+                       f"البوت استأنف العمل\n🕐 {syr_str()}",
                        "✅")
-                # Re-import manual positions after ban ends
                 import_manual()
             was_banned = now_banned
 
