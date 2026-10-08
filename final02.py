@@ -1161,10 +1161,92 @@ def update_trailing(symbol, info, price):
 # ============================================================
 # MANUAL IMPORT
 # ============================================================
+# ============================================================
+# MANUAL IMPORT — v2.5.1 (with Supabase duplicate guard)
+# ============================================================
 def import_manual():
+    """
+    v2.5.1 improvements:
+      1. Pre-check Supabase for existing OPEN trades — skip import if found
+         (prevents duplicate rows on every restart)
+      2. Per-symbol Supabase check — skip symbols already tracked
+      3. Better logging so you can see exactly what happened
+    """
     if is_banned() or client is None:
         log.warning("import_manual: محظور — تخطي")
         return
+
+    # ────────────────────────────────────────────────────────
+    # v2.5.1 STEP 1: Global guard — are there OPEN trades in Supabase?
+    # ────────────────────────────────────────────────────────
+    if _supabase:
+        try:
+            existing = (_supabase.table("trades")
+                        .select("id", count="exact")
+                        .eq("status", "OPEN")
+                        .execute())
+            existing_count = existing.count or 0
+            if existing_count > 0:
+                log.info(f"import_manual: يوجد {existing_count} صفقة OPEN في Supabase — "
+                         f"تخطي الاستيراد لمنع التكرار")
+                # Load the symbols from Supabase so we still know what's tracked
+                try:
+                    rows = (_supabase.table("trades")
+                            .select("symbol,strategy,side,entry_price,qty,sl_price,tp1_price,tp2_price,opened_at,source")
+                            .eq("status", "OPEN")
+                            .execute())
+                    for r in (rows.data or []):
+                        sym = r.get("symbol")
+                        if not sym or sym in open_positions:
+                            continue
+                        opened_at_str = r.get("opened_at")
+                        try:
+                            opened_at = (datetime.fromisoformat(
+                                str(opened_at_str).replace("Z", "+00:00"))
+                                if opened_at_str else datetime.now(timezone.utc))
+                        except Exception:
+                            opened_at = datetime.now(timezone.utc)
+
+                        # Rebuild in-memory state from Supabase
+                        with state_lock:
+                            open_positions[sym] = {
+                                "side": r.get("side", "LONG"),
+                                "entry": float(r.get("entry_price") or 0),
+                                "qty": float(r.get("qty") or 0),
+                                "atr": 0.0,                      # unknown from SB
+                                "current_sl": (float(r["sl_price"])
+                                               if r.get("sl_price") else None),
+                                "sl_order_id": None,
+                                "tp1_order_id": None,
+                                "tp2_order_id": None,
+                                "tp1_price": (float(r["tp1_price"])
+                                              if r.get("tp1_price") else None),
+                                "tp2_price": (float(r["tp2_price"])
+                                              if r.get("tp2_price") else None),
+                                "sl_on_exchange": False,
+                                "tp1_on_exchange": False,
+                                "tp2_on_exchange": False,
+                                "tp1_executed": False,
+                                "tp2_executed": False,
+                                "trailing_stage": 0,
+                                "opened_at": opened_at,
+                                "strategy": r.get("strategy", "MANUAL"),
+                                "source": r.get("source", "MANUAL"),
+                                "notional": float(r.get("qty") or 0) * float(r.get("entry_price") or 0),
+                                "in_watchlist": sym in SYMBOLS,
+                                "sb_id": r.get("id"),
+                                "restored_from_sb": True,
+                            }
+                    log.info(f"import_manual: استعيدت {len(open_positions)} صفقة من Supabase إلى الذاكرة")
+                except Exception as e:
+                    log.warning(f"import_manual: فشل استعادة التفاصيل من Supabase: {e}")
+                return
+        except Exception as e:
+            log.debug(f"import_manual Supabase pre-check: {e}")
+
+    # ────────────────────────────────────────────────────────
+    # v2.5.1 STEP 2: No OPEN trades in Supabase → proceed with Binance
+    # ────────────────────────────────────────────────────────
     try:
         positions = safe_api_call(client.futures_position_information, weight=5)
         if not positions:
@@ -1172,6 +1254,7 @@ def import_manual():
             return
 
         imported_count = 0
+        skipped_existing = 0
         for p in positions:
             if is_banned():
                 log.warning("import_manual: تم اكتشاف حظر أثناء الاستيراد — إيقاف")
@@ -1183,9 +1266,30 @@ def import_manual():
             if amt == 0:
                 continue
 
+            # Skip if already in memory
             with state_lock:
                 if symbol in open_positions:
+                    skipped_existing += 1
                     continue
+
+            # ────────────────────────────────────────────────────
+            # v2.5.1 STEP 3: Per-symbol Supabase check
+            # (in case some symbols are already tracked but global check missed)
+            # ────────────────────────────────────────────────────
+            if _supabase:
+                try:
+                    sym_row = (_supabase.table("trades")
+                               .select("id")
+                               .eq("symbol", symbol)
+                               .eq("status", "OPEN")
+                               .limit(1)
+                               .execute())
+                    if sym_row.data and len(sym_row.data) > 0:
+                        log.info(f"import_manual: {symbol} موجود في Supabase — تخطي")
+                        skipped_existing += 1
+                        continue
+                except Exception as e:
+                    log.debug(f"import_manual per-symbol check {symbol}: {e}")
 
             entry = float(p["entryPrice"])
             side = "LONG" if amt > 0 else "SHORT"
@@ -1193,6 +1297,7 @@ def import_manual():
             notional = entry * qty
             unrl = float(p.get("unRealizedProfit", 0))
 
+            # ATR for auto-SL
             try:
                 df = fetch_ohlcv_cached(symbol, MOMENTUM_TF, 100)
                 if df is not None and len(df) > 20:
@@ -1203,11 +1308,13 @@ def import_manual():
             except Exception:
                 atr = entry * 0.01
 
+            # Existing SL/TP orders on Binance
             sl = None
             sl_id = None
             tp_orders = []
             try:
-                orders = safe_api_call(client.futures_get_open_orders, symbol=symbol, weight=5)
+                orders = safe_api_call(client.futures_get_open_orders,
+                                       symbol=symbol, weight=5)
                 for o in orders or []:
                     otype = o["type"]
                     if otype in ("STOP_MARKET", "STOP"):
@@ -1225,9 +1332,10 @@ def import_manual():
 
             tp1_price = tp_orders[0]["price"] if len(tp_orders) > 0 else None
             tp2_price = tp_orders[1]["price"] if len(tp_orders) > 1 else None
-            tp1_id = tp_orders[0]["id"] if len(tp_orders) > 0 else None
-            tp2_id = tp_orders[1]["id"] if len(tp_orders) > 1 else None
+            tp1_id    = tp_orders[0]["id"]    if len(tp_orders) > 0 else None
+            tp2_id    = tp_orders[1]["id"]    if len(tp_orders) > 1 else None
 
+            # Register in memory
             with state_lock:
                 open_positions[symbol] = {
                     "side": side, "entry": entry, "qty": qty, "atr": atr,
@@ -1245,6 +1353,7 @@ def import_manual():
                     "in_watchlist": symbol in SYMBOLS,
                 }
 
+            # Insert into Supabase
             sb_id = sb_insert_trade({
                 "symbol": symbol, "strategy": "MANUAL", "side": side,
                 "entry_price": entry, "qty": qty, "notional": notional,
@@ -1269,9 +1378,12 @@ def import_manual():
                    f"🎯 TP: {tp1_price or '—'} / {tp2_price or '—'}",
                    "📥")
 
+            # Auto-SL if manual position has none
             if sl is None and AUTO_SL_MANUAL and not is_banned():
-                auto_sl = round_price(symbol,
-                                     entry - 1.5*atr if side == "LONG" else entry + 1.5*atr)
+                auto_sl = round_price(
+                    symbol,
+                    entry - 1.5*atr if side == "LONG" else entry + 1.5*atr
+                )
                 opp = "SELL" if side == "LONG" else "BUY"
                 sl_order = place_stop_loss(symbol, opp, auto_sl, qty)
                 with state_lock:
@@ -1283,7 +1395,8 @@ def import_manual():
                     tg_log("🛡️ SL تلقائي", f"{symbol}: {auto_sl}", "🛡️")
                     sb_update_trade(sb_id, {"sl_price": auto_sl})
 
-        log.info(f"import_manual: استُوردت {imported_count} صفقة")
+        log.info(f"import_manual: استُوردت {imported_count} صفقة جديدة، "
+                 f"تم تخطي {skipped_existing} موجودة")
 
     except Exception as e:
         log.exception(f"import_manual: {e}")
