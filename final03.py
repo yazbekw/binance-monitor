@@ -543,6 +543,47 @@ def get_balance(use_cache=True):
         return _balance_cache["data"]
     return {"balance": 0.0, "available": 0.0, "pnl": 0.0, "stale": True}
 
+def handle_command(text, chat_id):
+    ...
+    elif text.startswith("/import "):
+        symbol = text.split()[1].upper()
+        if is_banned():
+            tg_send(f"🚫 البوت محظور — لا يمكن الاستيراد الآن\n"
+                    f"باقي: {ban_remaining()/60:.1f} دقيقة")
+            return
+        if symbol in open_positions:
+            tg_send(f"⚠️ {symbol} موجودة بالفعل")
+            return
+        try:
+            positions = safe_api_call(client.futures_position_information, weight=5)
+            for p in positions or []:
+                if p["symbol"] == symbol and float(p["positionAmt"]) != 0:
+                    amt = float(p["positionAmt"])
+                    entry = float(p["entryPrice"])
+                    side = "LONG" if amt > 0 else "SHORT"
+                    qty = abs(amt)
+                    atr = entry * 0.01
+                    with state_lock:
+                        open_positions[symbol] = {
+                            "side": side, "entry": entry, "qty": qty,
+                            "atr": atr, "current_sl": None,
+                            "sl_order_id": None, "tp1_order_id": None,
+                            "tp2_order_id": None, "tp1_price": None,
+                            "tp2_price": None, "sl_on_exchange": False,
+                            "tp1_on_exchange": False, "tp2_on_exchange": False,
+                            "tp1_executed": False, "tp2_executed": False,
+                            "trailing_stage": 0,
+                            "opened_at": datetime.now(timezone.utc),
+                            "strategy": "MANUAL", "source": "MANUAL",
+                            "notional": entry * qty,
+                            "in_watchlist": symbol in SYMBOLS,
+                        }
+                    tg_send(f"✅ تم استيراد {symbol}\n"
+                            f"📊 {side} @ {entry}\n📦 {qty}")
+                    return
+            tg_send(f"❌ {symbol} غير موجودة في Binance")
+        except Exception as e:
+            tg_send(f"❌ خطأ: {e}")
 # ============================================================
 # FETCH
 # ============================================================
