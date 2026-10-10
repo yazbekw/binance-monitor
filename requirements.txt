@@ -2,7 +2,7 @@
 # Unified Smart Bot v3.2 — Render Ready
 # ═══════════════════════════════════════════════════════════
 python-telegram-bot>=21.0.1
-ccxt>=4.3.0
+ccxt>=4.4.0
 pandas>=2.1.4
 numpy>=1.26.0
 python-dotenv>=1.0.1
