@@ -1,13 +1,20 @@
 """
-Unified Smart Bot v3.1 — No-Binance Edition
-============================================
+Unified Smart Bot v3.2 — No-Binance Edition + Range Breakout Alerts
+====================================================================
   ✓ لا يستخدم Binance إطلاقاً
   ✓ منصات متعددة: Bybit / OKX / KuCoin / Bitget / MEXC / Gate / HTX / Kraken
-  ✓ وضع auto ذكي حقيقي (تكيفي بثلاث طبقات)
+  ✓ وضع auto ذكي تكيفي بثلاث طبقات
   ✓ قوائم رموز منفصلة (إشارات / نطاق / مفاجئ)
   ✓ متغيّران فقط للتحكم: STRICTNESS + STRICTNESS_OVERRIDE
+  ✓ RANGE_WIDTH_MULTIPLIER لتضييق/توسيع النطاق
+  ✓ إشعارات فورية عند خروج السعر عن نطاق آخر تقرير
 """
-import os, re, asyncio, logging, threading, time as _time
+import os
+import re
+import asyncio
+import logging
+import threading
+import time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -34,6 +41,7 @@ def _get_float(n, d):
     m = re.search(r"-?\d+(\.\d+)?", str(raw))
     return float(m.group(0)) if m else float(d)
 
+
 def _get_int(n, d):   return int(_get_float(n, d))
 def _get_bool(n, d):  return os.getenv(n, str(d)).strip().lower() in ("true", "1", "yes", "on")
 
@@ -51,7 +59,6 @@ MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
 if MARKET_TYPE not in ("spot", "swap", "future"):
     MARKET_TYPE = "swap"
 
-# ⚠️ binance غير مدرج قصداً
 _EXCHANGE_CLASSES = {
     "bybit":   ccxt.bybit,
     "okx":     ccxt.okx,
@@ -209,6 +216,7 @@ PRICE_CHANGE_THRESHOLDS = {
     "XRP/USDT:USDT": _get_float("THRESHOLD_XRP", 1.5),
 }
 
+# ─── التقرير الصباحي ───
 MORNING_REPORT_ENABLED = _get_bool("MORNING_REPORT_ENABLED", True)
 MORNING_REPORT_HOUR = _get_int("MORNING_REPORT_HOUR", 9)
 MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
@@ -216,6 +224,17 @@ MORNING_REPORT_MIN_GRIDS = _get_int("MORNING_REPORT_MIN_GRIDS", 15)
 MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
 MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
 MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
+
+# ─── 🆕 التحكم في عرض النطاق ───
+# 1.0 = افتراضي | 0.5 = أضيق (نصف العرض) | 2.0 = أوسع (ضعف العرض)
+RANGE_WIDTH_MULTIPLIER = _get_float("RANGE_WIDTH_MULTIPLIER", 1.0)
+RANGE_WIDTH_MULTIPLIER = max(0.2, min(3.0, RANGE_WIDTH_MULTIPLIER))
+
+# ─── 🆕 إشعارات خروج السعر عن النطاق ───
+RANGE_BREAKOUT_ENABLED = _get_bool("RANGE_BREAKOUT_ENABLED", True)
+RANGE_BREAKOUT_INTERVAL_MIN = _get_int("RANGE_BREAKOUT_INTERVAL_MIN", 5)
+RANGE_BREAKOUT_COOLDOWN_MIN = _get_int("RANGE_BREAKOUT_COOLDOWN_MIN", 60)
+RANGE_MAX_AGE_HOURS = _get_int("RANGE_MAX_AGE_HOURS", 24)
 
 SYMBOL_DELAY_MS = _get_int("SYMBOL_DELAY_MS", 200)
 
@@ -232,13 +251,11 @@ log = logging.getLogger("unified")
 
 
 # ═══════════════════════════════════════════════════════════
-# 6) 🧠 محرك التشدد الذكي — Auto التكيفي
+# 6) 🧠 محرك التشدد الذكي
 # ═══════════════════════════════════════════════════════════
 STRICTNESS = os.getenv("STRICTNESS", "balanced").strip().lower()
 STRICTNESS_OVERRIDE: dict = {}
 
-
-# ── A) Profiles ثابتة ────────────────────────────────────
 STATIC_PROFILES = {
     "relaxed": {
         "min_score": 45, "min_vol_ratio": 0.80, "min_adx": 14.0,
@@ -271,7 +288,6 @@ STATIC_PROFILES = {
 }
 
 
-# ── B) محرك Auto التكيفي ─────────────────────────────────
 class SmartStrictness:
     """
     محرك تشدد ذكي بثلاث طبقات:
@@ -281,20 +297,18 @@ class SmartStrictness:
     """
 
     def __init__(self):
-        self.history = deque(maxlen=200)     # (passed: bool, score: int, ts: float)
+        self.history = deque(maxlen=200)
         self._lock = threading.Lock()
         self._cached_profile = None
         self._cached_ts = 0.0
-        self._cache_ttl = 60.0               # ثانية
-        self._window = 50                    # حجم نافذة التغذية الراجعة
+        self._cache_ttl = 60.0
+        self._window = 50
         self._min_samples = 20
 
-    # تسجيل نتيجة فلترة
     def record(self, passed: bool, score: int):
         with self._lock:
             self.history.append((passed, score, _time.time()))
 
-    # حساب نسبة القبول
     def _feedback(self):
         with self._lock:
             recent = list(self.history)[-self._window:]
@@ -310,13 +324,11 @@ class SmartStrictness:
         else:              delta = 0
         return delta, ratio, n
 
-    # حساب البروفايل الكامل
     def compute(self, atr_pct=None, adx=None) -> dict:
         now = _time.time()
         if self._cached_profile and (now - self._cached_ts) < self._cache_ttl:
             return self._cached_profile
 
-        # ── 1) tier ATR ──
         if atr_pct is None or atr_pct <= 0:
             atr_pct = 0.5
         if atr_pct < 0.15:    base, regime = 50, "هادئ"
@@ -325,7 +337,6 @@ class SmartStrictness:
         elif atr_pct < 1.00:  base, regime = 70, "مرتفع"
         else:                 base, regime = 78, "متطرف"
 
-        # ── 2) تعديل ADX ──
         adx_delta = 0
         if adx is not None:
             if adx > 35:     adx_delta = -3
@@ -333,12 +344,9 @@ class SmartStrictness:
             elif adx < 18:   adx_delta = +5
             elif adx < 22:   adx_delta = +2
 
-        # ── 3) Feedback loop ──
         fb_delta, pass_ratio, sample_n = self._feedback()
-
         final_score = max(40, min(90, base + adx_delta + fb_delta))
 
-        # اشتقاق باقي العتبات من score النهائي
         profile = {
             "min_score": final_score,
             "min_vol_ratio": round(max(0.7, (final_score - 30) / 30), 2),
@@ -382,13 +390,7 @@ class SmartStrictness:
 _smart = SmartStrictness()
 
 
-# ── C) الدالة الموحّدة ───────────────────────────────────
 def get_thresholds(atr_pct: float = None, adx: float = None) -> dict:
-    """
-    ⚡ نقطة التحكم الوحيدة في تشدد البوت.
-    - "relaxed" | "balanced" | "strict" | "elite"  → ثابتة
-    - "auto"                                        → ذكية تكيفية
-    """
     if STRICTNESS == "auto":
         prof = dict(_smart.compute(atr_pct=atr_pct, adx=adx))
     else:
@@ -488,12 +490,14 @@ _ohlcv_cache: dict = {}
 _crossover_cache: dict = {}
 _price_state: dict = {}
 _recent_signals: dict = {}
+_last_range: dict = {}   # symbol -> range info for breakout alerts
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0,
     "filtered_adx": 0, "filtered_atr": 0, "filtered_htf": 0,
     "filtered_vwap": 0, "filtered_conflict": 0,
     "filtered_15m": 0, "filtered_other": 0,
+    "range_breakouts": 0,
 }
 
 
@@ -708,7 +712,6 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
     if tf == "15m":
         min_score = max(min_score, th.get("score_15m_override", min_score))
 
-    # تسجيل للـ feedback loop (يُسجّل مرة واحدة فقط)
     passed = True
     reason = ""
     category = ""
@@ -738,7 +741,6 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
         if has_conflicting_signal(cross["symbol"], cross["direction"]):
             passed, reason, category = False, "تعارض", "conflict"
 
-    # ✅ تسجيل النتيجة للـ auto
     if STRICTNESS == "auto":
         _smart.record(passed, score)
 
@@ -913,13 +915,30 @@ async def detect_sudden_change(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) تحليل النطاق
+# 16) تحليل النطاق + تخزينه للمراقبة
 # ═══════════════════════════════════════════════════════════
+def _store_range(symbol: str, rng: dict):
+    _last_range[symbol] = {
+        "lower": float(rng["suggested_lower"]),
+        "upper": float(rng["suggested_upper"]),
+        "computed_at": _time.time(),
+        "state": "inside",
+        "last_alert_at": 0.0,
+        "range_pct": rng.get("range_pct", 0),
+        "grids": rng.get("grids", 0),
+    }
+    log.info(
+        f"📌 Range stored: {symbol} "
+        f"[{rng['suggested_lower']:.6f} – {rng['suggested_upper']:.6f}]"
+    )
+
+
 async def analyze_range(symbol):
     data, _ = await _exchange.fetch_ohlcv(
         symbol, "1d", MORNING_REPORT_LOOKBACK_DAYS + 20
     )
-    if not data or len(data) < 10: return None
+    if not data or len(data) < 10:
+        return None
     df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
     cur = float(df["c"].iloc[-1])
     if cur == 0: return None
@@ -932,34 +951,131 @@ async def analyze_range(symbol):
     atr_pct = (atr / cur) * 100
     recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
     highest = float(recent["h"].max()); lowest = float(recent["l"].min())
-    span = atr * MORNING_REPORT_ATR_MULTIPLIER
+
+    # ─── تطبيق كلا المضاعفين ───
+    span = atr * MORNING_REPORT_ATR_MULTIPLIER * RANGE_WIDTH_MULTIPLIER
     if span <= 0: return None
+
     lower = cur - span / 2; upper = cur + span / 2
     rng_pct = ((upper - lower) / cur) * 100
+
     if rng_pct > MORNING_REPORT_MAX_RANGE_PCT:
         span = cur * (MORNING_REPORT_MAX_RANGE_PCT / 100)
         lower = cur - span / 2; upper = cur + span / 2
         rng_pct = MORNING_REPORT_MAX_RANGE_PCT
     if rng_pct <= 0: return None
+
     ideal = int(rng_pct / 0.10)
     grids = max(MORNING_REPORT_MIN_GRIDS, min(MORNING_REPORT_MAX_GRIDS, ideal))
     step = (upper - lower) / grids
     step_pct = (step / cur) * 100 if cur else 0
-    return {
+
+    result = {
         "symbol": symbol, "current": cur,
         "highest": highest, "lowest": lowest,
         "suggested_lower": lower, "suggested_upper": upper,
         "range_pct": round(rng_pct, 2), "atr_pct": round(atr_pct, 2),
         "atr_multiplier": MORNING_REPORT_ATR_MULTIPLIER,
+        "width_multiplier": RANGE_WIDTH_MULTIPLIER,
         "max_range_pct": MORNING_REPORT_MAX_RANGE_PCT,
         "grids": grids, "grid_step": step,
         "grid_step_pct": round(step_pct, 3),
         "lookback": MORNING_REPORT_LOOKBACK_DAYS,
     }
+    _store_range(symbol, result)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
-# 17) بناء الرسائل
+# 17) 🆕 مراقبة خروج السعر عن النطاق
+# ═══════════════════════════════════════════════════════════
+async def _get_current_price(symbol: str) -> float:
+    data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 2)
+    if not data:
+        return 0.0
+    return float(data[-1][4])
+
+
+def _range_is_fresh(r: dict) -> bool:
+    return (_time.time() - r["computed_at"]) < RANGE_MAX_AGE_HOURS * 3600
+
+
+async def check_range_breakout(symbol: str):
+    if not RANGE_BREAKOUT_ENABLED:
+        return None
+    r = _last_range.get(symbol)
+    if not r or not _range_is_fresh(r):
+        return None
+
+    price = await _get_current_price(symbol)
+    if price <= 0:
+        return None
+
+    now = _time.time()
+    cooldown_sec = RANGE_BREAKOUT_COOLDOWN_MIN * 60
+
+    # داخل النطاق → إعادة تصفير الحالة
+    if r["lower"] <= price <= r["upper"]:
+        r["state"] = "inside"
+        return None
+
+    # اختراق علوي
+    if price > r["upper"]:
+        if r["state"] == "above":
+            return None
+        if now - r["last_alert_at"] < cooldown_sec:
+            return None
+        r["state"] = "above"
+        r["last_alert_at"] = now
+        return {
+            "symbol": symbol, "direction": "above",
+            "price": price, "boundary": r["upper"],
+            "lower": r["lower"], "upper": r["upper"],
+            "deviation_pct": ((price - r["upper"]) / r["upper"]) * 100,
+            "age_min": int((now - r["computed_at"]) / 60),
+        }
+
+    # اختراق سفلي
+    if price < r["lower"]:
+        if r["state"] == "below":
+            return None
+        if now - r["last_alert_at"] < cooldown_sec:
+            return None
+        r["state"] = "below"
+        r["last_alert_at"] = now
+        return {
+            "symbol": symbol, "direction": "below",
+            "price": price, "boundary": r["lower"],
+            "lower": r["lower"], "upper": r["upper"],
+            "deviation_pct": ((r["lower"] - price) / r["lower"]) * 100,
+            "age_min": int((now - r["computed_at"]) / 60),
+        }
+    return None
+
+
+def build_range_breakout_msg(b: dict) -> str:
+    up = b["direction"] == "above"
+    emoji = "🚨" if up else "⚠️"
+    title = "اختراق صعودي — فوق النطاق 🟢" if up else "اختراق هبوطي — تحت النطاق 🔴"
+    arrow = "⬆️" if up else "⬇️"
+    return (
+        f"{emoji} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
+        f"🇸🇾 <b>{syria_now_str()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>{title}</b>\n"
+        f"{arrow} السعر الحالي: <b>{fmt_price(b['price'])}</b>\n"
+        f"🎯 الحد المخترق: <b>{fmt_price(b['boundary'])}</b>\n"
+        f"📏 الانحراف: <b>{b['deviation_pct']:.3f}%</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• النطاق المحدد: <b>{fmt_price(b['lower'])} – {fmt_price(b['upper'])}</b>\n"
+        f"• عُمر النطاق: <b>{b['age_min']} دقيقة</b>\n"
+        f"• المصدر: {_exchange.primary_name}\n\n"
+        f"💡 <i>قد يكون بداية اتجاه جديد — راقب الزخم.</i>"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# 18) بناء رسائل الإشارات
 # ═══════════════════════════════════════════════════════════
 def build_signal_message(cross):
     sym = cross["symbol"]; tf = cross["timeframe"]
@@ -1043,8 +1159,10 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
         f"{title} — <b>النطاقات المقترحة</b>\n"
         f"🇸🇾 {syria_now_str()}\n"
         f"📅 آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام\n"
-        f"📐 ATR× <b>{MORNING_REPORT_ATR_MULTIPLIER}</b> | سقف: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
+        f"📐 ATR× <b>{MORNING_REPORT_ATR_MULTIPLIER}</b> × "
+        f"<b>{RANGE_WIDTH_MULTIPLIER}</b> | سقف: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
         f"🔌 المصدر: <b>{_exchange.primary_name}</b>\n"
+        f"🚨 المراقبة: {'✅ مفعلة' if RANGE_BREAKOUT_ENABLED else '❌ معطلة'}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
     )
     body = ""
@@ -1055,26 +1173,31 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
             f"  📈 أعلى: {fmt_price(a['highest'])}\n"
             f"  🎯 النطاق: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>\n"
             f"  📊 العرض: {a['range_pct']}% | ATR: {a['atr_pct']}%\n"
-            f"  🔢 شبكات: <b>{a['grids']}</b> | خطوة: {fmt_price(a['grid_step'])} ({a['grid_step_pct']}%)\n"
+            f"  🔢 شبكات: <b>{a['grids']}</b> | خطوة: {fmt_price(a['grid_step'])} "
+            f"({a['grid_step_pct']}%)\n"
             f"  ──────────────────\n"
         )
-    footer = "\n💡 <i>الخطوة ≥ 0.10% لتغطية الرسوم.</i>"
+    footer = "\n💡 <i>الخطوة ≥ 0.10% لتغطية الرسوم. سيتم إشعارك عند خروج السعر عن أي نطاق.</i>"
     return header + body + footer
 
 
 # ═══════════════════════════════════════════════════════════
-# 18) الأوامر
+# 19) الأوامر
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds()
     overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v3.1</b> — بدون Binance\n"
+        f"🔀 <b>Unified Smart Bot v3.2</b> — بدون Binance\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 الأساسية: <b>{_exchange.primary_name}</b> ({MARKET_TYPE})\n"
         f"🔁 البدائل: {', '.join(_exchange.chain_names[1:]) or '—'}\n\n"
-        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n{', '.join(short(s) for s in SIG_SYMBOLS)}\n\n"
-        f"<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n{', '.join(short(s) for s in RNG_SYMBOLS)}\n\n"
+        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n"
+        f"{', '.join(short(s) for s in SIG_SYMBOLS)}\n\n"
+        f"<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n"
+        f"{', '.join(short(s) for s in RNG_SYMBOLS)}\n\n"
+        f"<b>⚡ مفاجئ ({len(SC_SYMBOLS)}):</b>\n"
+        f"{', '.join(short(s) for s in SC_SYMBOLS)}\n\n"
         f"<b>🎯 STRICTNESS:</b> <b>{STRICTNESS.upper()}</b>\n"
         f"• Score ≥ {th['min_score']}\n"
         f"• Volume ≥ {th['min_vol_ratio']}×\n"
@@ -1082,10 +1205,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"• VWAP slope ≥ {th['vwap_slope_pct']}%\n"
         f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n\n"
+        f"<b>📐 عرض النطاق:</b> <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
+        f"<b>🚨 مراقبة الاختراق:</b> "
+        f"{'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌'}\n\n"
         f"<b>التجاوزات اليدوية:</b>\n{overrides}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross /cross5 /cross15 /cross1h\n"
         f"/checkprice /report /range\n"
+        f"/ranges /clearranges\n"
         f"/symbols /status /strict /clearcache",
         parse_mode="HTML",
     )
@@ -1113,7 +1240,7 @@ async def _run_cross(update, tfs=None):
                 cross = await det(sym, tf)
                 if not cross: continue
                 htf = await get_htf_trend(sym)
-                passed, reason, _cat = await passes_filter(cross, htf)
+                passed, _r, _c = await passes_filter(cross, htf)
                 if not passed:
                     filtered += 1; continue
                 try:
@@ -1181,6 +1308,35 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error(f"report: {e}")
 
 
+async def cmd_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعرض كل النطاقات المحفوظة حالياً"""
+    if not _last_range:
+        await update.message.reply_text(
+            "📭 لا نطاقات محفوظة.\nاستخدم /report أو انتظر التقرير الصباحي."
+        )
+        return
+    lines = ["<b>📊 النطاقات المراقبة:</b>\n"]
+    now = _time.time()
+    for sym, r in _last_range.items():
+        age = int((now - r["computed_at"]) / 60)
+        state_icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
+        fresh_icon = "" if _range_is_fresh(r) else " ⏰"
+        lines.append(
+            f"{state_icon} <b>{short(sym)}</b> "
+            f"[{fmt_price(r['lower'])} – {fmt_price(r['upper'])}] "
+            f"<i>({age} د){fresh_icon}</i>"
+        )
+    lines.append(f"\n🚨 الإشعارات: "
+                 f"{'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌ معطلة'}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_clearranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = len(_last_range)
+    _last_range.clear()
+    await update.message.reply_text(f"✅ تم مسح {n} نطاق محفوظ.")
+
+
 async def cmd_symbols(update, context):
     await update.message.reply_text(
         f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n"
@@ -1226,6 +1382,7 @@ async def cmd_strict(update, context):
         f"• RSI SHORT: {th['rsi_short']}\n"
         f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n"
         f"{debug_block}\n"
+        f"<b>📐 عرض النطاق:</b> <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
         f"<b>التجاوزات اليدوية:</b>\n{overrides}",
         parse_mode="HTML",
     )
@@ -1239,18 +1396,21 @@ async def cmd_clearcache(update, context):
         "• كاش الشموع\n"
         "• كاش التقاطعات\n"
         "• إشارات التعارض\n"
-        "• سجل التغذية الراجعة (Auto)"
+        "• سجل التغذية الراجعة (Auto)\n"
+        "⚠️ النطاقات المحفوظة لم تُمس (استخدم /clearranges)."
     )
 
 
 async def cmd_status(update, context):
-    total_filtered = sum(_filter_stats.values()) - _filter_stats["sent"]
+    total_filtered = sum(_filter_stats.values()) - _filter_stats["sent"] - _filter_stats["range_breakouts"]
     await update.message.reply_text(
         f"🤖 <b>الحالة</b>\n"
         f"🔌 {_exchange.primary_name} | بدائل: {len(_exchange.chain_names)-1}\n"
         f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
+        f"📐 Width Multiplier: <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 مُرسَل: <b>{_filter_stats['sent']}</b>\n"
+        f"🚨 اختراق نطاق: <b>{_filter_stats['range_breakouts']}</b>\n"
         f"🚫 محجوب:\n"
         f"  • Score: {_filter_stats['filtered_score']}\n"
         f"  • Volume: {_filter_stats['filtered_vol']}\n"
@@ -1263,6 +1423,7 @@ async def cmd_status(update, context):
         f"الإجمالي: {total_filtered}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💾 كاش: {len(_ohlcv_cache)} OHLCV\n"
+        f"📌 نطاقات: {len(_last_range)}\n"
         f"🧠 سجل Auto: {len(_smart.history)} عينة",
         parse_mode="HTML",
     )
@@ -1276,7 +1437,7 @@ async def error_handler(update, context):
 
 
 # ═══════════════════════════════════════════════════════════
-# 19) Jobs
+# 20) Jobs
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok(): return
@@ -1318,7 +1479,7 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
                     log.exception(f"job {sym} {tf}: {e}")
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if total:
-        log.info(f"📤 {total} إشارة مُرسَلة (STRICTNESS={STRICTNESS})")
+        log.info(f"📤 {total} إشارة (STRICTNESS={STRICTNESS})")
 
 
 async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1340,6 +1501,31 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if total:
         log.info(f"📤 {total} تغير مفاجئ")
+
+
+async def range_breakout_job(context: ContextTypes.DEFAULT_TYPE):
+    if not RANGE_BREAKOUT_ENABLED or not _exchange.ok(): return
+    if not _last_range: return
+
+    total = 0
+    for symbol in list(_last_range.keys()):
+        try:
+            b = await check_range_breakout(symbol)
+            if b and CHAT_ID:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=build_range_breakout_msg(b),
+                    parse_mode="HTML",
+                )
+                total += 1
+                _filter_stats["range_breakouts"] += 1
+                log.info(f"🚨 Breakout: {symbol} {b['direction']} "
+                         f"{b['deviation_pct']:.3f}%")
+        except Exception as e:
+            log.exception(f"range_breakout {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if total:
+        log.info(f"📤 {total} اختراق نطاق")
 
 
 async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1364,16 +1550,18 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
-# 20) Health
+# 21) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v3.1 (No Binance)")
+        self.wfile.write(b"OK - Unified Smart Bot v3.2 (No Binance)")
+
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
+
     def log_message(self, *a): pass
 
 
@@ -1383,7 +1571,7 @@ def run_health():
 
 
 # ═══════════════════════════════════════════════════════════
-# 21) Main
+# 22) Main
 # ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -1393,15 +1581,18 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
 
     th = get_thresholds()
-    print(f"🔀 Unified Smart Bot v3.1 (No Binance)")
+    print("🔀 Unified Smart Bot v3.2 (No Binance)")
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 إشارات: {len(SIG_SYMBOLS)} | نطاق: {len(RNG_SYMBOLS)} | مفاجئ: {len(SC_SYMBOLS)}")
     print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | فريمات: {TIMEFRAMES}")
     print(f"🎯 STRICTNESS = {STRICTNESS}")
     print(f"   • Score ≥ {th['min_score']} | Vol ≥ {th['min_vol_ratio']}× | "
           f"ADX ≥ {th['min_adx']} | ATR ≤ {th['max_atr_pct']}%")
+    print(f"📐 Range Width Multiplier = {RANGE_WIDTH_MULTIPLIER}")
+    print(f"🚨 Range Breakout: {'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
@@ -1410,6 +1601,8 @@ def main():
     app.add_handler(CommandHandler("checkprice", cmd_checkprice))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("range", cmd_report))
+    app.add_handler(CommandHandler("ranges", cmd_ranges))
+    app.add_handler(CommandHandler("clearranges", cmd_clearranges))
     app.add_handler(CommandHandler("symbols", cmd_symbols))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("strict", cmd_strict))
@@ -1423,6 +1616,15 @@ def main():
         app.job_queue.run_repeating(
             price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price",
         )
+        if RANGE_BREAKOUT_ENABLED:
+            app.job_queue.run_repeating(
+                range_breakout_job,
+                interval=RANGE_BREAKOUT_INTERVAL_MIN * 60,
+                first=30,
+                name="range_breakout",
+            )
+            print(f"🚨 Range breakout: كل {RANGE_BREAKOUT_INTERVAL_MIN} دقيقة")
+
         if MORNING_REPORT_ENABLED:
             from datetime import time as dt_time
             now_syr = datetime.now(SYRIA_TZ)
