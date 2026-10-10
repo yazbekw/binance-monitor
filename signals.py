@@ -1,36 +1,17 @@
 """
-Unified Smart Bot v3.0 — Combined Edition
-==========================================
-يجمع:
-  ✓ بوت إشعارات EMA (3 فريمات + كشف مبكر + Score)
-  ✓ بوت التنبيهات المفاجئة
-  ✓ التقرير الصباحي (ATR Range) + /report عند الطلب
-  ✓ فلترة HTF/VWAP/Mandatory من البوت v2.6.0
-
-ميزات جديدة:
-  ⚡ دعم منصات متعددة (Bybit / OKX / Binance / KuCoin / ...)
-  ⚡ فصل قائمة الإشارات عن قائمة النطاق
-  ⚡ تحكم بالتشدد عبر متغيرين فقط:
-       1) STRICTNESS          = "relaxed" | "balanced" | "strict" | "elite" | "auto"
-       2) STRICTNESS_OVERRIDE = { ... }   (تجاوزات دقيقة اختيارية)
-  ⚡ وضع "auto" يتكيّف تلقائياً مع تقلب السوق (ATR)
-
-الأوامر:
-  /start /status /symbols /clearcache
-  /cross /cross5 /cross15 /cross1h
-  /checkprice
-  /report  /range
-  /strict  ← عرض التشدد الحالي
+Unified Smart Bot v3.1 — No-Binance Edition
+============================================
+  ✓ لا يستخدم Binance إطلاقاً
+  ✓ منصات متعددة: Bybit / OKX / KuCoin / Bitget / MEXC / Gate / HTX / Kraken
+  ✓ وضع auto ذكي حقيقي (تكيفي بثلاث طبقات)
+  ✓ قوائم رموز منفصلة (إشارات / نطاق / مفاجئ)
+  ✓ متغيّران فقط للتحكم: STRICTNESS + STRICTNESS_OVERRIDE
 """
-import os
-import re
-import asyncio
-import logging
-import threading
-import time as _time
+import os, re, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from collections import deque
 
 import ccxt
 import pandas as pd
@@ -53,46 +34,50 @@ def _get_float(n, d):
     m = re.search(r"-?\d+(\.\d+)?", str(raw))
     return float(m.group(0)) if m else float(d)
 
-
 def _get_int(n, d):   return int(_get_float(n, d))
 def _get_bool(n, d):  return os.getenv(n, str(d)).strip().lower() in ("true", "1", "yes", "on")
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) المنصات المتعددة (Primary + Fallbacks)
+# 2) المنصات — بدون Binance نهائياً
 # ═══════════════════════════════════════════════════════════
 PRIMARY_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "bybit").strip().lower()
 FALLBACK_EXCHANGES = [
     x.strip().lower() for x in
-    os.getenv("FALLBACK_EXCHANGES", "okx,binance,kucoin,bitget").split(",") if x.strip()
+    os.getenv("FALLBACK_EXCHANGES", "okx,kucoin,bitget,mexc,gate").split(",")
+    if x.strip() and x.strip().lower() != "binance"
 ]
 MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
 if MARKET_TYPE not in ("spot", "swap", "future"):
     MARKET_TYPE = "swap"
 
+# ⚠️ binance غير مدرج قصداً
 _EXCHANGE_CLASSES = {
-    "bybit": ccxt.bybit, "okx": ccxt.okx, "binance": ccxt.binance,
-    "kucoin": ccxt.kucoin, "kraken": ccxt.kraken, "coinbase": ccxt.coinbase,
-    "gate": ccxt.gate, "bitget": ccxt.bitget, "mexc": ccxt.mexc,
-    "htx": ccxt.htx, "bitmart": ccxt.bitmart,
+    "bybit":   ccxt.bybit,
+    "okx":     ccxt.okx,
+    "kucoin":  ccxt.kucoin,
+    "kraken":  ccxt.kraken,
+    "gate":    ccxt.gate,
+    "bitget":  ccxt.bitget,
+    "mexc":    ccxt.mexc,
+    "htx":     ccxt.htx,
+    "bitmart": ccxt.bitmart,
+    "coinex":  ccxt.coinex,
 }
 
 
 class MultiExchange:
-    """
-    طبقة موحّدة فوق ccxt:
-    - تحاول المنصة الأساسية أولاً
-    - عند الفشل: تجرب البدائل بالترتيب
-    - تُدير الكاش و Rate Limit على مستوى كل منصة
-    """
+    """طبقة موحّدة: تجرب الأساسية ثم البدائل بالترتيب"""
 
     def __init__(self):
         self.primary = None
         self.fallbacks = []
-        self.name = PRIMARY_EXCHANGE
         self._init_all()
 
     def _make(self, name):
+        if name == "binance":
+            log.warning("🚫 Binance محجوب في هذا البوت")
+            return None
         if name not in _EXCHANGE_CLASSES:
             log.warning(f"⚠️ منصة غير مدعومة: {name}")
             return None
@@ -133,13 +118,10 @@ class MultiExchange:
         return out
 
     async def fetch_ohlcv(self, symbol, tf, limit=200):
-        """يرجع (data, exchange_name) أو (None, None)"""
         last_err = None
         for ex in self._chain():
             try:
-                data = await asyncio.to_thread(
-                    ex.fetch_ohlcv, symbol, tf, None, limit
-                )
+                data = await asyncio.to_thread(ex.fetch_ohlcv, symbol, tf, None, limit)
                 if data and len(data) > 0:
                     return data, ex.id
             except ccxt.BadSymbol:
@@ -171,9 +153,8 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 3) قوائم الرموز — منفصلة!
+# 3) قوائم الرموز — منفصلة
 # ═══════════════════════════════════════════════════════════
-# رموز الإشارات (EMA crossover + التنبيه المفاجئ)
 _SIG_DEFAULT = "BTC/USDT:USDT,XRP/USDT:USDT,XAU/USDT:USDT"
 SIG_SYMBOLS = [
     s.strip().upper() for s in
@@ -181,7 +162,6 @@ SIG_SYMBOLS = [
     if s.strip()
 ]
 
-# رموز النطاق (التقرير الصباحي + /report)
 _RNG_DEFAULT = "BTC/USDT:USDT,XAU/USDT:USDT,XAG/USDT:USDT"
 RNG_SYMBOLS = [
     s.strip().upper() for s in
@@ -189,17 +169,15 @@ RNG_SYMBOLS = [
     if s.strip()
 ]
 
-# رموز التنبيه المفاجئ (اختياري — افتراضي = كل قائمة الإشارات)
-_SC_DEFAULT = ",".join(SIG_SYMBOLS)
 SC_SYMBOLS = [
     s.strip().upper() for s in
-    (os.getenv("SYMBOLS_SUDDEN", "").strip() or _SC_DEFAULT).split(",")
+    (os.getenv("SYMBOLS_SUDDEN", "").strip() or ",".join(SIG_SYMBOLS)).split(",")
     if s.strip()
 ]
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) الفريمات والإعدادات العامة
+# 4) إعدادات عامة
 # ═══════════════════════════════════════════════════════════
 TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", "5m,15m,1h").split(",") if t.strip()]
 EMA_FAST = _get_int("EMA_FAST", 7)
@@ -216,15 +194,11 @@ PRE_CROSS_COOLDOWN = _get_int("PRE_CROSS_COOLDOWN", 3)
 OHLCV_CACHE_SECONDS = _get_int("OHLCV_CACHE_SECONDS", 90)
 CONFLICT_WINDOW_SEC = _get_int("CONFLICT_WINDOW_SEC", 300)
 
-# HTF
 HTF_ENABLED = _get_bool("HTF_TREND_ENABLED", True)
 HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "1h")
 HTF_BLOCK_OPPOSITE = _get_bool("HTF_BLOCK_OPPOSITE", True)
-
-# VWAP slope
 VWAP_SLOPE_LOOKBACK = _get_int("VWAP_SLOPE_LOOKBACK", 5)
 
-# التنبيهات المفاجئة
 PRICE_ALERT_INTERVAL_MIN = _get_int("PRICE_ALERT_INTERVAL_MIN", 1)
 MAX_PRICE_ALERTS = _get_int("MAX_PRICE_ALERTS", 3)
 DEFAULT_THRESHOLD = _get_float("DEFAULT_THRESHOLD", 1.0)
@@ -235,7 +209,6 @@ PRICE_CHANGE_THRESHOLDS = {
     "XRP/USDT:USDT": _get_float("THRESHOLD_XRP", 1.5),
 }
 
-# التقرير الصباحي
 MORNING_REPORT_ENABLED = _get_bool("MORNING_REPORT_ENABLED", True)
 MORNING_REPORT_HOUR = _get_int("MORNING_REPORT_HOUR", 9)
 MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
@@ -244,120 +217,185 @@ MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
 MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
 MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
 
-# Rate limit
 SYMBOL_DELAY_MS = _get_int("SYMBOL_DELAY_MS", 200)
-SYMBOL_COOLDOWN_SEC = _get_int("SYMBOL_COOLDOWN_SEC", 90)
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
 
 # ═══════════════════════════════════════════════════════════
-# 5) 🎯 محرك التشدد الذكي — متغيّران فقط!
+# 5) Logging
 # ═══════════════════════════════════════════════════════════
-STRICTNESS = os.getenv("STRICTNESS", "balanced").strip().lower()
-# القيم: "relaxed" | "balanced" | "strict" | "elite" | "auto"
-
-# تجاوزات دقيقة (اختياري — اتركها فارغة لاستخدام الافتراضي)
-STRICTNESS_OVERRIDE: dict = {}
-
-STRICTNESS_PROFILES = {
-    "relaxed": {
-        "min_score":            45,
-        "min_vol_ratio":        0.80,
-        "min_adx":              14.0,
-        "max_atr_pct":          0.95,
-        "rsi_long":             (32, 80),
-        "rsi_short":            (20, 68),
-        "vwap_slope_pct":       0.03,
-        "min_ema_gap":          0.03,
-        "block_against_htf":    False,
-        "score_15m_override":   55,
-    },
-    "balanced": {
-        "min_score":            60,
-        "min_vol_ratio":        1.00,
-        "min_adx":              18.0,
-        "max_atr_pct":          0.70,
-        "rsi_long":             (35, 75),
-        "rsi_short":            (25, 65),
-        "vwap_slope_pct":       0.05,
-        "min_ema_gap":          0.05,
-        "block_against_htf":    True,
-        "score_15m_override":   65,
-    },
-    "strict": {
-        "min_score":            70,
-        "min_vol_ratio":        1.30,
-        "min_adx":              22.0,
-        "max_atr_pct":          0.60,
-        "rsi_long":             (40, 72),
-        "rsi_short":            (28, 60),
-        "vwap_slope_pct":       0.07,
-        "min_ema_gap":          0.08,
-        "block_against_htf":    True,
-        "score_15m_override":   75,
-    },
-    "elite": {
-        "min_score":            82,
-        "min_vol_ratio":        1.80,
-        "min_adx":              28.0,
-        "max_atr_pct":          0.50,
-        "rsi_long":             (45, 68),
-        "rsi_short":            (32, 55),
-        "vwap_slope_pct":       0.10,
-        "min_ema_gap":          0.12,
-        "block_against_htf":    True,
-        "score_15m_override":   85,
-    },
-}
-
-# ── الوضع التلقائي: يعدّل العتبات حسب تقلب السوق (ATR%) ──
-def _auto_profile(atr_pct: float) -> dict:
-    """
-    منطق ذكي:
-      - تقلب منخفض (< 0.2%)  → تشدد متوسط، لأن الفرص قليلة
-      - تقلب عادي (0.2-0.6%) → balanced
-      - تقلب عالي (> 0.6%)   → strict (لأن الإشارات الكاذبة تكثر)
-      - تقلب متطرف (> 1%)    → elite
-    """
-    if atr_pct is None or atr_pct <= 0:
-        base = "balanced"
-    elif atr_pct < 0.20:
-        base = "balanced"
-    elif atr_pct < 0.60:
-        base = "strict"
-    elif atr_pct < 1.00:
-        base = "strict"
-    else:
-        base = "elite"
-    return dict(STRICTNESS_PROFILES[base])
-
-
-def get_thresholds(atr_pct: float = None) -> dict:
-    """
-    ⚡ نقطة التحكم الوحيدة في تشدد البوت.
-    تُرجع قاموساً بكل العتبات المطلوبة لفلترة الإشارات.
-    """
-    if STRICTNESS == "auto":
-        prof = _auto_profile(atr_pct)
-    else:
-        prof = dict(STRICTNESS_PROFILES.get(STRICTNESS, STRICTNESS_PROFILES["balanced"]))
-
-    # تطبيق التجاوزات إن وُجدت
-    prof.update(STRICTNESS_OVERRIDE)
-    return prof
-
-
-# ═══════════════════════════════════════════════════════════
-# 6) Logging
-# ═══════════════════════════════════════════════════════════
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 for name in ("httpx", "telegram", "telegram.ext", "ccxt"):
     logging.getLogger(name).setLevel(logging.WARNING)
 log = logging.getLogger("unified")
+
+
+# ═══════════════════════════════════════════════════════════
+# 6) 🧠 محرك التشدد الذكي — Auto التكيفي
+# ═══════════════════════════════════════════════════════════
+STRICTNESS = os.getenv("STRICTNESS", "balanced").strip().lower()
+STRICTNESS_OVERRIDE: dict = {}
+
+
+# ── A) Profiles ثابتة ────────────────────────────────────
+STATIC_PROFILES = {
+    "relaxed": {
+        "min_score": 45, "min_vol_ratio": 0.80, "min_adx": 14.0,
+        "max_atr_pct": 0.95,
+        "rsi_long": (32, 80), "rsi_short": (20, 68),
+        "vwap_slope_pct": 0.03, "min_ema_gap": 0.03,
+        "block_against_htf": False, "score_15m_override": 55,
+    },
+    "balanced": {
+        "min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
+        "max_atr_pct": 0.70,
+        "rsi_long": (35, 75), "rsi_short": (25, 65),
+        "vwap_slope_pct": 0.05, "min_ema_gap": 0.05,
+        "block_against_htf": True, "score_15m_override": 65,
+    },
+    "strict": {
+        "min_score": 70, "min_vol_ratio": 1.30, "min_adx": 22.0,
+        "max_atr_pct": 0.60,
+        "rsi_long": (40, 72), "rsi_short": (28, 60),
+        "vwap_slope_pct": 0.07, "min_ema_gap": 0.08,
+        "block_against_htf": True, "score_15m_override": 75,
+    },
+    "elite": {
+        "min_score": 82, "min_vol_ratio": 1.80, "min_adx": 28.0,
+        "max_atr_pct": 0.50,
+        "rsi_long": (45, 68), "rsi_short": (32, 55),
+        "vwap_slope_pct": 0.10, "min_ema_gap": 0.12,
+        "block_against_htf": True, "score_15m_override": 85,
+    },
+}
+
+
+# ── B) محرك Auto التكيفي ─────────────────────────────────
+class SmartStrictness:
+    """
+    محرك تشدد ذكي بثلاث طبقات:
+      1) تقلب ATR% → score أساسي
+      2) ADX → تعديل (اتجاه قوي = تخفيف، عرضي = تشديد)
+      3) Feedback loop → نسبة القبول في آخر N إشارة تعدّل score
+    """
+
+    def __init__(self):
+        self.history = deque(maxlen=200)     # (passed: bool, score: int, ts: float)
+        self._lock = threading.Lock()
+        self._cached_profile = None
+        self._cached_ts = 0.0
+        self._cache_ttl = 60.0               # ثانية
+        self._window = 50                    # حجم نافذة التغذية الراجعة
+        self._min_samples = 20
+
+    # تسجيل نتيجة فلترة
+    def record(self, passed: bool, score: int):
+        with self._lock:
+            self.history.append((passed, score, _time.time()))
+
+    # حساب نسبة القبول
+    def _feedback(self):
+        with self._lock:
+            recent = list(self.history)[-self._window:]
+        n = len(recent)
+        if n < self._min_samples:
+            return 0, None, n
+        passed = sum(1 for p, _, _ in recent if p)
+        ratio = passed / n
+        if ratio > 0.60:   delta = +8
+        elif ratio > 0.40: delta = +3
+        elif ratio < 0.10: delta = -12
+        elif ratio < 0.20: delta = -6
+        else:              delta = 0
+        return delta, ratio, n
+
+    # حساب البروفايل الكامل
+    def compute(self, atr_pct=None, adx=None) -> dict:
+        now = _time.time()
+        if self._cached_profile and (now - self._cached_ts) < self._cache_ttl:
+            return self._cached_profile
+
+        # ── 1) tier ATR ──
+        if atr_pct is None or atr_pct <= 0:
+            atr_pct = 0.5
+        if atr_pct < 0.15:    base, regime = 50, "هادئ"
+        elif atr_pct < 0.30:  base, regime = 55, "منخفض"
+        elif atr_pct < 0.60:  base, regime = 62, "عادي"
+        elif atr_pct < 1.00:  base, regime = 70, "مرتفع"
+        else:                 base, regime = 78, "متطرف"
+
+        # ── 2) تعديل ADX ──
+        adx_delta = 0
+        if adx is not None:
+            if adx > 35:     adx_delta = -3
+            elif adx > 25:   adx_delta = -1
+            elif adx < 18:   adx_delta = +5
+            elif adx < 22:   adx_delta = +2
+
+        # ── 3) Feedback loop ──
+        fb_delta, pass_ratio, sample_n = self._feedback()
+
+        final_score = max(40, min(90, base + adx_delta + fb_delta))
+
+        # اشتقاق باقي العتبات من score النهائي
+        profile = {
+            "min_score": final_score,
+            "min_vol_ratio": round(max(0.7, (final_score - 30) / 30), 2),
+            "min_adx": round(max(12, final_score * 0.28), 1),
+            "max_atr_pct": round(max(0.35, 1.2 - final_score / 100), 2),
+            "rsi_long": (
+                min(50, 30 + max(0, final_score - 50) // 4),
+                max(70, 82 - max(0, final_score - 50) // 5),
+            ),
+            "rsi_short": (
+                min(40, 18 + max(0, final_score - 50) // 4),
+                max(55, 68 - max(0, final_score - 50) // 6),
+            ),
+            "vwap_slope_pct": round(0.02 + final_score / 1000, 3),
+            "min_ema_gap": round(final_score / 800, 3),
+            "block_against_htf": final_score >= 55,
+            "score_15m_override": min(90, final_score + 10),
+            "_debug": {
+                "mode": "auto",
+                "base_score": base,
+                "adx_delta": adx_delta,
+                "feedback_delta": fb_delta,
+                "pass_ratio": round(pass_ratio, 2) if pass_ratio is not None else None,
+                "sample_n": sample_n,
+                "regime": regime,
+                "atr_pct": atr_pct,
+                "adx": adx,
+            },
+        }
+        self._cached_profile = profile
+        self._cached_ts = now
+        return profile
+
+    def reset_feedback(self):
+        with self._lock:
+            self.history.clear()
+        self._cached_profile = None
+        self._cached_ts = 0.0
+
+
+_smart = SmartStrictness()
+
+
+# ── C) الدالة الموحّدة ───────────────────────────────────
+def get_thresholds(atr_pct: float = None, adx: float = None) -> dict:
+    """
+    ⚡ نقطة التحكم الوحيدة في تشدد البوت.
+    - "relaxed" | "balanced" | "strict" | "elite"  → ثابتة
+    - "auto"                                        → ذكية تكيفية
+    """
+    if STRICTNESS == "auto":
+        prof = dict(_smart.compute(atr_pct=atr_pct, adx=adx))
+    else:
+        prof = dict(STATIC_PROFILES.get(STRICTNESS, STATIC_PROFILES["balanced"]))
+        prof["_debug"] = {"mode": STRICTNESS}
+    prof.update(STRICTNESS_OVERRIDE)
+    return prof
 
 
 # ═══════════════════════════════════════════════════════════
@@ -396,11 +434,12 @@ def fmt_price(v: float) -> str:
 # ═══════════════════════════════════════════════════════════
 # 8) المؤشرات
 # ═══════════════════════════════════════════════════════════
-def calc_ema(s, p):     return s.ewm(span=p, adjust=False).mean()
+def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
+
+
 def calc_rsi(s, p=14):
     d = s.diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
+    g = d.clip(lower=0); l = -d.clip(upper=0)
     ag = g.ewm(alpha=1/p, adjust=False).mean()
     al = l.ewm(alpha=1/p, adjust=False).mean()
     rs = ag / al.replace(0, 1e-9)
@@ -418,8 +457,7 @@ def calc_atr(df, p=14):
 
 def calc_adx(df, p=14):
     h, l, c = df["h"], df["l"], df["c"]
-    pdm = h.diff()
-    ndm = -l.diff()
+    pdm = h.diff(); ndm = -l.diff()
     pdm = pdm.where((pdm > ndm) & (pdm > 0), 0)
     ndm = ndm.where((ndm > pdm) & (ndm > 0), 0)
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
@@ -443,19 +481,13 @@ def calc_vwap(df):
     return (tp * df["v"]).cumsum() / df["v"].cumsum()
 
 
-def calc_bb(s, p=20, k=2):
-    ma = s.rolling(p).mean()
-    sd = s.rolling(p).std()
-    return ma + k*sd, ma - k*sd
-
-
 # ═══════════════════════════════════════════════════════════
 # 9) كاشات وحالات
 # ═══════════════════════════════════════════════════════════
 _ohlcv_cache: dict = {}
 _crossover_cache: dict = {}
 _price_state: dict = {}
-_recent_signals: dict = {}   # للتعارض
+_recent_signals: dict = {}
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0,
@@ -466,7 +498,7 @@ _filter_stats = {
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) جلب الشموع مع كاش
+# 10) جلب الشموع
 # ═══════════════════════════════════════════════════════════
 async def fetch_ohlcv_cached(symbol, tf, limit=150):
     key = (symbol, tf, limit)
@@ -480,35 +512,32 @@ async def fetch_ohlcv_cached(symbol, tf, limit=150):
     return data
 
 
-def clear_ohlcv_cache():
+def clear_caches():
     _ohlcv_cache.clear()
     _crossover_cache.clear()
     _recent_signals.clear()
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) HTF Trend + VWAP Slope + Conflict
+# 11) HTF / VWAP / Conflict
 # ═══════════════════════════════════════════════════════════
 async def get_htf_trend(symbol):
-    """يرجع 'UP' أو 'DOWN' أو 'NEUTRAL'"""
     if not HTF_ENABLED:
         return "NEUTRAL"
     data = await fetch_ohlcv_cached(symbol, HTF_TIMEFRAME, 250)
     if not data or len(data) < 200:
         return "NEUTRAL"
     df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-    ema50 = calc_ema(df["c"], 50)
-    ema200 = calc_ema(df["c"], 200)
+    e50 = calc_ema(df["c"], 50)
+    e200 = calc_ema(df["c"], 200)
     price = float(df["c"].iloc[-1])
-    e50 = float(ema50.iloc[-1])
-    e200 = float(ema200.iloc[-1])
-    if price > e50 > e200: return "UP"
-    if price < e50 < e200: return "DOWN"
+    a = float(e50.iloc[-1]); b = float(e200.iloc[-1])
+    if price > a > b: return "UP"
+    if price < a < b: return "DOWN"
     return "NEUTRAL"
 
 
 def check_vwap_slope(df, direction, thresholds):
-    """يرجع (ok, slope_pct). nمنع الدخول ضد ميل VWAP"""
     min_pct = thresholds.get("vwap_slope_pct", 0.05)
     if len(df) < VWAP_SLOPE_LOOKBACK + 1:
         return True, 0.0
@@ -540,7 +569,7 @@ def record_signal(symbol, direction):
 
 
 # ═══════════════════════════════════════════════════════════
-# 12) حساب الـ Score (مشترك)
+# 12) حساب الـ Score
 # ═══════════════════════════════════════════════════════════
 def _stars(pts, mx):
     if mx == 0: return ""
@@ -552,14 +581,12 @@ def _stars(pts, mx):
 
 
 def compute_score(df, direction, curr_idx=-2):
-    close = df["c"]
-    vol = df["v"]
+    close = df["c"]; vol = df["v"]
     price = float(close.iloc[curr_idx])
 
     # Volume
     try:
-        s = max(0, len(df) + curr_idx - 20)
-        e = len(df) + curr_idx
+        s = max(0, len(df) + curr_idx - 20); e = len(df) + curr_idx
         vma = float(vol.iloc[s:e].mean())
         vr = float(vol.iloc[curr_idx]) / vma if vma > 0 else 0
     except Exception:
@@ -598,13 +625,12 @@ def compute_score(df, direction, curr_idx=-2):
     # MACD
     try:
         _, _, hist = calc_macd(close)
-        hn = float(hist.iloc[curr_idx])
-        hp = float(hist.iloc[curr_idx - 1])
+        hn = float(hist.iloc[curr_idx]); hp = float(hist.iloc[curr_idx - 1])
         rising = hn > hp
-        if hn > 0 and rising:     m_pts, m_lbl = 10, "يتسارع صعوداً ↗"
-        elif hn > 0:              m_pts, m_lbl = 5,  "يتباطأ صعوداً ↘"
-        elif hn < 0 and rising:   m_pts, m_lbl = 7,  "يتباطأ هبوطاً ↗"
-        else:                     m_pts, m_lbl = 5,  "يتسارع هبوطاً ↘"
+        if hn > 0 and rising:    m_pts, m_lbl = 10, "يتسارع صعوداً ↗"
+        elif hn > 0:             m_pts, m_lbl = 5,  "يتباطأ صعوداً ↘"
+        elif hn < 0 and rising:  m_pts, m_lbl = 7,  "يتباطأ هبوطاً ↗"
+        else:                    m_pts, m_lbl = 5,  "يتسارع هبوطاً ↘"
     except Exception:
         m_pts, m_lbl = 0, "غير محدد"
 
@@ -613,15 +639,15 @@ def compute_score(df, direction, curr_idx=-2):
     except Exception: rsi = 50
     if direction == "bullish":
         if 55 <= rsi <= 70:   r_pts, r_lbl = 10, "زخم صاعد صحي ⭐"
-        elif rsi > 70:        r_pts, r_lbl = 5,  "تشبع شرائي (قد ينعكس)"
+        elif rsi > 70:        r_pts, r_lbl = 5,  "تشبع شرائي"
         elif rsi >= 45:       r_pts, r_lbl = 7,  "محايد"
-        elif rsi >= 30:       r_pts, r_lbl = 3,  "زخم هابط (ضد الإشارة)"
+        elif rsi >= 30:       r_pts, r_lbl = 3,  "زخم هابط (ضد)"
         else:                 r_pts, r_lbl = 0,  "تشبع بيعي"
     else:
         if 30 <= rsi <= 45:   r_pts, r_lbl = 10, "زخم هابط صحي ⭐"
-        elif rsi < 30:        r_pts, r_lbl = 5,  "تشبع بيعي (قد ينعكس)"
+        elif rsi < 30:        r_pts, r_lbl = 5,  "تشبع بيعي"
         elif rsi <= 55:       r_pts, r_lbl = 7,  "محايد"
-        elif rsi <= 70:       r_pts, r_lbl = 3,  "زخم صاعد (ضد الإشارة)"
+        elif rsi <= 70:       r_pts, r_lbl = 3,  "زخم صاعد (ضد)"
         else:                 r_pts, r_lbl = 0,  "تشبع شرائي"
 
     # EMA50 alignment
@@ -630,9 +656,9 @@ def compute_score(df, direction, curr_idx=-2):
     except Exception:
         e50 = price
     above = price > e50
-    if direction == "bullish" and above:   h_pts, h_lbl = 10, "مع الاتجاه الأكبر ✅"
-    elif direction == "bearish" and not above: h_pts, h_lbl = 10, "مع الاتجاه الأكبر ✅"
-    else:                                  h_pts, h_lbl = 0,  "ضد الاتجاه الأكبر ⚠️"
+    if direction == "bullish" and above:          h_pts, h_lbl = 10, "مع الاتجاه ✅"
+    elif direction == "bearish" and not above:    h_pts, h_lbl = 10, "مع الاتجاه ✅"
+    else:                                          h_pts, h_lbl = 0,  "ضد الاتجاه ⚠️"
 
     # ATR
     try:
@@ -640,9 +666,9 @@ def compute_score(df, direction, curr_idx=-2):
         atr_pct = (atr / price) * 100 if price > 0 else 0
     except Exception:
         atr_pct = 0
-    if atr_pct >= 0.30: t_pts, t_lbl = 5, "نشاط جيد"
+    if atr_pct >= 0.30:   t_pts, t_lbl = 5, "نشاط جيد"
     elif atr_pct >= 0.15: t_pts, t_lbl = 3, "طبيعي"
-    else: t_pts, t_lbl = 1, "خمول"
+    else:                 t_pts, t_lbl = 1, "خمول"
 
     total = v_pts + a_pts + g_pts + m_pts + r_pts + h_pts + t_pts
     if total >= 80:   grade = "🌟 ذهبية"
@@ -664,13 +690,9 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 13) فلتر موحّد يعتمد على STRICTNESS فقط
+# 13) الفلتر الموحّد
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
-    """
-    يرجع (passed: bool, reason: str, category: str)
-    يستخدم STRICTNESS/STRICTNESS_OVERRIDE كلياً
-    """
     s = cross.get("support", {})
     if not s:
         return False, "لا مؤشرات", "other"
@@ -681,49 +703,46 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
     atr = s.get("atr_pct", 0)
     score = s.get("score", 0)
 
-    th = get_thresholds(atr_pct=atr)
-
-    # 1) Score
+    th = get_thresholds(atr_pct=atr, adx=adx)
     min_score = th["min_score"]
     if tf == "15m":
         min_score = max(min_score, th.get("score_15m_override", min_score))
+
+    # تسجيل للـ feedback loop (يُسجّل مرة واحدة فقط)
+    passed = True
+    reason = ""
+    category = ""
+
     if score < min_score:
-        return False, f"Score {score} < {min_score}", "score"
+        passed, reason, category = False, f"Score {score} < {min_score}", "score"
+    elif vol < th["min_vol_ratio"]:
+        passed, reason, category = False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
+    elif adx < th["min_adx"]:
+        passed, reason, category = False, f"ADX {adx} < {th['min_adx']}", "adx"
+    elif atr > th["max_atr_pct"]:
+        passed, reason, category = False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
+    elif th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
+        direction = cross["direction"]
+        if direction == "bullish" and htf_trend == "DOWN":
+            passed, reason, category = False, "HTF=DOWN ضد LONG", "htf"
+        elif direction == "bearish" and htf_trend == "UP":
+            passed, reason, category = False, "HTF=UP ضد SHORT", "htf"
 
-    # 2) Volume
-    if vol < th["min_vol_ratio"]:
-        return False, f"Volume {vol}× < {th['min_vol_ratio']}×", "vol"
-
-    # 3) ADX
-    if adx < th["min_adx"]:
-        return False, f"ADX {adx} < {th['min_adx']}", "adx"
-
-    # 4) ATR (مرتفع)
-    if atr > th["max_atr_pct"]:
-        return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
-
-    # 5) HTF trend (لا يُطبّق على pre-cross)
-    if th["block_against_htf"] and cross.get("alert_type") != "pre":
-        if htf_trend and htf_trend != "NEUTRAL":
-            direction = cross["direction"]
-            if direction == "bullish" and htf_trend == "DOWN":
-                return False, "HTF=DOWN ضد LONG", "htf"
-            if direction == "bearish" and htf_trend == "UP":
-                return False, "HTF=UP ضد SHORT", "htf"
-
-    # 6) VWAP slope
     df = cross.get("_df")
-    if df is not None:
+    if passed and df is not None:
         ok, slope = check_vwap_slope(df, cross["direction"], th)
         if not ok:
-            return False, f"VWAP slope {slope:+.2f}% ضد الاتجاه", "vwap"
+            passed, reason, category = False, f"VWAP {slope:+.2f}% ضد", "vwap"
 
-    # 7) Conflict
-    if cross.get("alert_type") == "confirmed":
+    if passed and cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], cross["direction"]):
-            return False, "تعارض مع إشارة حديثة", "conflict"
+            passed, reason, category = False, "تعارض", "conflict"
 
-    return True, "", ""
+    # ✅ تسجيل النتيجة للـ auto
+    if STRICTNESS == "auto":
+        _smart.record(passed, score)
+
+    return passed, reason, category
 
 
 # ═══════════════════════════════════════════════════════════
@@ -736,12 +755,24 @@ async def _df_for(symbol, tf, extra=60):
     return pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
 
 
+def _classify_strength(tf, gap):
+    if tf == "1h":
+        if gap >= 0.30: return "🔥 قوية جداً"
+        if gap >= 0.10: return "🟢 قوية"
+        return "🟡 متوسطة"
+    if tf == "15m":
+        if gap >= 0.20: return "🟢 قوية"
+        if gap >= 0.10: return "🟡 متوسطة"
+        return "⚪ ضعيفة"
+    if gap >= 0.25: return "🟢 قوية"
+    if gap >= 0.10: return "🟡 متوسطة"
+    return "⚪ ضعيفة"
+
+
 async def detect_crossover(symbol, tf):
-    if not ENABLE_CONFIRMED:
-        return None
+    if not ENABLE_CONFIRMED: return None
     df = await _df_for(symbol, tf)
-    if df is None:
-        return None
+    if df is None: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST)
     df["es"] = calc_ema(df["c"], EMA_SLOW)
     curr, prev = -2, -3
@@ -749,8 +780,7 @@ async def detect_crossover(symbol, tf):
     pf, ps = float(df["ef"].iloc[prev]), float(df["es"].iloc[prev])
     bull = (cf > cs) and (pf <= ps)
     bear = (cf < cs) and (pf >= ps)
-    if not (bull or bear):
-        return None
+    if not (bull or bear): return None
     direction = "bullish" if bull else "bearish"
     cts = int(df["ts"].iloc[curr])
     key = (symbol, tf)
@@ -772,11 +802,9 @@ async def detect_crossover(symbol, tf):
 
 
 async def detect_live_crossover(symbol, tf):
-    if not ENABLE_LIVE_CROSS:
-        return None
+    if not ENABLE_LIVE_CROSS: return None
     df = await _df_for(symbol, tf)
-    if df is None:
-        return None
+    if df is None: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST)
     df["es"] = calc_ema(df["c"], EMA_SLOW)
     curr, prev = -1, -2
@@ -784,14 +812,12 @@ async def detect_live_crossover(symbol, tf):
     pf, ps = float(df["ef"].iloc[prev]), float(df["es"].iloc[prev])
     bull = (cf > cs) and (pf <= ps)
     bear = (cf < cs) and (pf >= ps)
-    if not (bull or bear):
-        return None
+    if not (bull or bear): return None
     direction = "bullish" if bull else "bearish"
     cts = int(df["ts"].iloc[curr])
     key = (symbol, tf, "live")
     last = _crossover_cache.get(key)
-    if last and last.get("candle_ts") == cts:
-        return None
+    if last and last.get("candle_ts") == cts: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": direction}
     support = compute_score(df, direction, curr)
     return {
@@ -800,7 +826,7 @@ async def detect_live_crossover(symbol, tf):
         "price": round(float(df["c"].iloc[curr]), 8),
         "candle_ts": cts,
         "gap_pct": round(abs(cf - cs) / cs * 100, 3),
-        "strength": "⚡ مبدئي (قابل للتغير)",
+        "strength": "⚡ مبدئي",
         "alert_type": "live", "support": support, "_df": df,
         "exchange": _exchange.primary_name,
     }
@@ -814,29 +840,24 @@ _TF_MS = {
 
 
 async def detect_pre_crossover(symbol, tf):
-    if not ENABLE_PRE_CROSS:
-        return None
+    if not ENABLE_PRE_CROSS: return None
     df = await _df_for(symbol, tf, extra=10)
-    if df is None:
-        return None
+    if df is None: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST)
     df["es"] = calc_ema(df["c"], EMA_SLOW)
     curr = -2
     cf, cs = float(df["ef"].iloc[curr]), float(df["es"].iloc[curr])
     gap = abs(cf - cs) / cs * 100
-    if gap >= PRE_CROSS_GAP:
-        return None
+    if gap >= PRE_CROSS_GAP: return None
     gaps = []
     for i in range(PRE_CROSS_LOOKBACK):
         idx = curr - i
-        f = float(df["ef"].iloc[idx])
-        s = float(df["es"].iloc[idx])
+        f = float(df["ef"].iloc[idx]); s = float(df["es"].iloc[idx])
         gaps.append(abs(f - s) / s * 100)
     gaps_ch = list(reversed(gaps))
     if not all(gaps_ch[i] >= gaps_ch[i+1] for i in range(len(gaps_ch)-1)):
         return None
-    if abs(cf - cs) < 1e-9:
-        return None
+    if abs(cf - cs) < 1e-9: return None
     direction = "bullish" if cf < cs else "bearish"
     cts = int(df["ts"].iloc[curr])
     key = (symbol, tf, "pre")
@@ -858,43 +879,23 @@ async def detect_pre_crossover(symbol, tf):
     }
 
 
-def _classify_strength(tf, gap_pct):
-    if tf == "1h":
-        if gap_pct >= 0.30: return "🔥 قوية جداً"
-        if gap_pct >= 0.10: return "🟢 قوية"
-        return "🟡 متوسطة"
-    if tf == "15m":
-        if gap_pct >= 0.20: return "🟢 قوية"
-        if gap_pct >= 0.10: return "🟡 متوسطة"
-        return "⚪ ضعيفة"
-    if gap_pct >= 0.25: return "🟢 قوية"
-    if gap_pct >= 0.10: return "🟡 متوسطة"
-    return "⚪ ضعيفة"
-
-
 # ═══════════════════════════════════════════════════════════
 # 15) تنبيه التغير المفاجئ
 # ═══════════════════════════════════════════════════════════
 async def detect_sudden_change(symbol):
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 3)
-    if not data or len(data) < 2:
-        return None
-    prev = float(data[-2][4])
-    cur = float(data[-1][4])
-    if prev == 0:
-        return None
+    if not data or len(data) < 2: return None
+    prev = float(data[-2][4]); cur = float(data[-1][4])
+    if prev == 0: return None
     pct = ((cur - prev) / prev) * 100
     th = PRICE_CHANGE_THRESHOLDS.get(symbol, DEFAULT_THRESHOLD)
     st = _price_state.setdefault(symbol, {"direction": None, "count": 0, "alerting": False})
     if abs(pct) >= th:
         d = "up" if pct > 0 else "down"
         if st["direction"] != d:
-            st["direction"] = d
-            st["count"] = 0
-            st["alerting"] = False
+            st["direction"] = d; st["count"] = 0; st["alerting"] = False
         if not st["alerting"]:
-            st["alerting"] = True
-            st["count"] = 1
+            st["alerting"] = True; st["count"] = 1
         elif st["count"] < MAX_PRICE_ALERTS:
             st["count"] += 1
         else:
@@ -902,31 +903,26 @@ async def detect_sudden_change(symbol):
         return {
             "symbol": symbol, "direction": d,
             "change_pct": round(pct, 2),
-            "current_price": round(cur, 8),
-            "prev_price": round(prev, 8),
+            "current_price": round(cur, 8), "prev_price": round(prev, 8),
             "threshold": th, "alert_count": st["count"],
             "max_alerts": MAX_PRICE_ALERTS,
         }
     else:
-        st["direction"] = None
-        st["count"] = 0
-        st["alerting"] = False
+        st["direction"] = None; st["count"] = 0; st["alerting"] = False
     return None
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) تحليل النطاق (التقرير الصباحي)
+# 16) تحليل النطاق
 # ═══════════════════════════════════════════════════════════
 async def analyze_range(symbol):
     data, _ = await _exchange.fetch_ohlcv(
         symbol, "1d", MORNING_REPORT_LOOKBACK_DAYS + 20
     )
-    if not data or len(data) < 10:
-        return None
+    if not data or len(data) < 10: return None
     df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
     cur = float(df["c"].iloc[-1])
-    if cur == 0:
-        return None
+    if cur == 0: return None
     df["tr"] = pd.concat([
         df["h"] - df["l"],
         (df["h"] - df["c"].shift()).abs(),
@@ -935,22 +931,16 @@ async def analyze_range(symbol):
     atr = float(df["tr"].tail(14).mean())
     atr_pct = (atr / cur) * 100
     recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
-    highest = float(recent["h"].max())
-    lowest = float(recent["l"].min())
-
+    highest = float(recent["h"].max()); lowest = float(recent["l"].min())
     span = atr * MORNING_REPORT_ATR_MULTIPLIER
-    if span <= 0:
-        return None
-    lower = cur - span / 2
-    upper = cur + span / 2
+    if span <= 0: return None
+    lower = cur - span / 2; upper = cur + span / 2
     rng_pct = ((upper - lower) / cur) * 100
     if rng_pct > MORNING_REPORT_MAX_RANGE_PCT:
         span = cur * (MORNING_REPORT_MAX_RANGE_PCT / 100)
-        lower = cur - span / 2
-        upper = cur + span / 2
+        lower = cur - span / 2; upper = cur + span / 2
         rng_pct = MORNING_REPORT_MAX_RANGE_PCT
-    if rng_pct <= 0:
-        return None
+    if rng_pct <= 0: return None
     ideal = int(rng_pct / 0.10)
     grids = max(MORNING_REPORT_MIN_GRIDS, min(MORNING_REPORT_MAX_GRIDS, ideal))
     step = (upper - lower) / grids
@@ -972,29 +962,26 @@ async def analyze_range(symbol):
 # 17) بناء الرسائل
 # ═══════════════════════════════════════════════════════════
 def build_signal_message(cross):
-    sym = cross["symbol"]
-    tf = cross["timeframe"]
+    sym = cross["symbol"]; tf = cross["timeframe"]
     bull = cross["direction"] == "bullish"
     at = cross.get("alert_type", "confirmed")
     s = cross.get("support", {})
-    score = s.get("score", 0)
-    grade = s.get("grade", "?")
+    score = s.get("score", 0); grade = s.get("grade", "?")
 
     if at == "pre":
         emoji, title = "🔔", "تقارب وشيك"
-        type_lbl = "🔔 <b>تحذير مبكر</b> — لم يحدث التقاطع بعد"
-        dir_lbl = "🟢 اتجاه محتمل: صاعد" if bull else "🔴 اتجاه محتمل: هابط"
+        type_lbl = "🔔 <b>تحذير مبكر</b>"
+        dir_lbl = "🟢 محتمل صاعد" if bull else "🔴 محتمل هابط"
     elif at == "live":
         emoji, title = "⚡", "تقاطع مبدئي"
-        type_lbl = "⚡ <b>تقاطع مبدئي</b> — على الشمعة الجارية"
+        type_lbl = "⚡ <b>مبدئي</b> — شمعة جارية"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
     else:
         emoji, title = ("🚀" if bull else "🔻"), "تقاطع مؤكد"
-        type_lbl = "✅ <b>تقاطع مؤكد</b> — على شمعة مغلقة"
+        type_lbl = "✅ <b>مؤكد</b> — شمعة مغلقة"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
 
     candle_time = syria_from_ts(cross["candle_ts"])
-
     support_block = (
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>📌 مؤشرات داعمة:</b>\n"
@@ -1002,8 +989,7 @@ def build_signal_message(cross):
         f"{_stars(s.get('vol_pts',0),30)} <i>({s.get('vol_pts',0)}/30)</i>\n"
         f"• ADX: <b>{s.get('adx','?')}</b> "
         f"{_stars(s.get('adx_pts',0),20)} <i>({s.get('adx_pts',0)}/20)</i>\n"
-        f"• فرق EMA: <b>{s.get('gap_pct','?')}%</b> "
-        f"<i>({s.get('gap_pts',0)}/15)</i>\n"
+        f"• فرق EMA: <b>{s.get('gap_pct','?')}%</b> <i>({s.get('gap_pts',0)}/15)</i>\n"
         f"• MACD: {s.get('macd_label','?')} <i>({s.get('macd_pts',0)}/10)</i>\n"
         f"• RSI: <b>{s.get('rsi','?')}</b> — {s.get('rsi_label','?')} "
         f"<i>({s.get('rsi_pts',0)}/10)</i>\n"
@@ -1011,7 +997,6 @@ def build_signal_message(cross):
         f"• ATR: {s.get('atr_pct','?')}% — {s.get('atr_label','?')} "
         f"<i>({s.get('atr_pts',0)}/5)</i>\n"
     )
-
     return (
         f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
@@ -1037,7 +1022,7 @@ def build_price_alert_msg(a):
     emoji = "🚀" if up else "🔻"
     title = "ارتفاع مفاجئ 🟢" if up else "انخفاض مفاجئ 🔴"
     return (
-        f"{emoji} <b>تنبيه تغير مفاجئ — {short(a['symbol'])}</b>\n"
+        f"{emoji} <b>تغير مفاجئ — {short(a['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>{title}</b>\n"
@@ -1057,7 +1042,7 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
     header = (
         f"{title} — <b>النطاقات المقترحة</b>\n"
         f"🇸🇾 {syria_now_str()}\n"
-        f"📅 تحليل آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام\n"
+        f"📅 آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام\n"
         f"📐 ATR× <b>{MORNING_REPORT_ATR_MULTIPLIER}</b> | سقف: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
         f"🔌 المصدر: <b>{_exchange.primary_name}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1066,8 +1051,8 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
     for a in analyses:
         body += (
             f"\n💠 <b>{short(a['symbol'])}</b> — الحالي: <b>{fmt_price(a['current'])}</b>\n"
-            f"  📉 أدنى {a['lookback']} أيام: {fmt_price(a['lowest'])}\n"
-            f"  📈 أعلى {a['lookback']} أيام: {fmt_price(a['highest'])}\n"
+            f"  📉 أدنى: {fmt_price(a['lowest'])}\n"
+            f"  📈 أعلى: {fmt_price(a['highest'])}\n"
             f"  🎯 النطاق: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>\n"
             f"  📊 العرض: {a['range_pct']}% | ATR: {a['atr_pct']}%\n"
             f"  🔢 شبكات: <b>{a['grids']}</b> | خطوة: {fmt_price(a['grid_step'])} ({a['grid_step_pct']}%)\n"
@@ -1082,27 +1067,25 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds()
+    overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v3.0</b>\n"
+        f"🔀 <b>Unified Smart Bot v3.1</b> — بدون Binance\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔌 المنصة الأساسية: <b>{_exchange.primary_name}</b> ({MARKET_TYPE})\n"
+        f"🔌 الأساسية: <b>{_exchange.primary_name}</b> ({MARKET_TYPE})\n"
         f"🔁 البدائل: {', '.join(_exchange.chain_names[1:]) or '—'}\n\n"
-        f"<b>📊 رموز الإشارات ({len(SIG_SYMBOLS)}):</b>\n"
-        f"{', '.join(short(s) for s in SIG_SYMBOLS)}\n\n"
-        f"<b>🌅 رموز النطاق ({len(RNG_SYMBOLS)}):</b>\n"
-        f"{', '.join(short(s) for s in RNG_SYMBOLS)}\n\n"
-        f"<b>🎯 التشدد الحالي:</b> <b>{STRICTNESS.upper()}</b>\n"
+        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n{', '.join(short(s) for s in SIG_SYMBOLS)}\n\n"
+        f"<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n{', '.join(short(s) for s in RNG_SYMBOLS)}\n\n"
+        f"<b>🎯 STRICTNESS:</b> <b>{STRICTNESS.upper()}</b>\n"
         f"• Score ≥ {th['min_score']}\n"
         f"• Volume ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"• VWAP slope ≥ {th['vwap_slope_pct']}%\n"
-        f"• ضد HTF: {'محجوب' if th['block_against_htf'] else 'مسموح'}\n\n"
+        f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n\n"
+        f"<b>التجاوزات اليدوية:</b>\n{overrides}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/cross /cross5 /cross15 /cross1h\n"
-        f"/checkprice — تنبيهات التغير المفاجئ\n"
-        f"/report — تقرير النطاق عند الطلب\n"
-        f"/range — نفس التقرير\n"
+        f"/checkprice /report /range\n"
         f"/symbols /status /strict /clearcache",
         parse_mode="HTML",
     )
@@ -1114,28 +1097,25 @@ async def _run_cross(update, tfs=None):
         return
     tfs = tfs or TIMEFRAMES
     await update.message.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
-    clear_ohlcv_cache()
+    clear_caches()
 
     detectors = []
     if ENABLE_PRE_CROSS:  detectors.append(detect_pre_crossover)
     if ENABLE_LIVE_CROSS: detectors.append(detect_live_crossover)
     if ENABLE_CONFIRMED:  detectors.append(detect_crossover)
 
-    found = 0
-    filtered = 0
+    found = 0; filtered = 0
     for sym in SIG_SYMBOLS:
         for tf in tfs:
             for k in [(sym, tf), (sym, tf, "pre"), (sym, tf, "live")]:
                 _crossover_cache.pop(k, None)
             for det in detectors:
                 cross = await det(sym, tf)
-                if not cross:
-                    continue
+                if not cross: continue
                 htf = await get_htf_trend(sym)
                 passed, reason, _cat = await passes_filter(cross, htf)
                 if not passed:
-                    filtered += 1
-                    continue
+                    filtered += 1; continue
                 try:
                     await update.message.reply_text(
                         build_signal_message(cross), parse_mode="HTML"
@@ -1146,8 +1126,7 @@ async def _run_cross(update, tfs=None):
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
 
     msg = f"✅ {found} إشارة."
-    if filtered:
-        msg += f"\n🚫 {filtered} محجوبة (STRICTNESS={STRICTNESS})."
+    if filtered: msg += f"\n🚫 {filtered} محجوبة (STRICTNESS={STRICTNESS})."
     if found == 0 and filtered == 0:
         msg = f"⚪ لا إشارات على {', '.join(tfs)}"
     await update.message.reply_text(msg)
@@ -1161,9 +1140,8 @@ async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
 
 async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة.")
-        return
-    await update.message.reply_text("🔍 فحص التغيرات ...")
+        await update.message.reply_text("❌ لا منصة."); return
+    await update.message.reply_text("🔍 فحص ...")
     found = 0
     for sym in SC_SYMBOLS:
         a = await detect_sudden_change(sym)
@@ -1180,8 +1158,7 @@ async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة.")
-        return
+        await update.message.reply_text("❌ لا منصة."); return
     await update.message.reply_text(
         f"🔍 تحليل {len(RNG_SYMBOLS)} رمز على مدى {MORNING_REPORT_LOOKBACK_DAYS} أيام..."
     )
@@ -1189,14 +1166,12 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for sym in RNG_SYMBOLS:
         try:
             a = await analyze_range(sym)
-            if a:
-                analyses.append(a)
+            if a: analyses.append(a)
         except Exception as e:
             log.exception(f"range {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if not analyses:
-        await update.message.reply_text("⚪ لا بيانات.")
-        return
+        await update.message.reply_text("⚪ لا بيانات."); return
     try:
         await update.message.reply_text(
             build_range_report(analyses, "📊 تقرير النطاق"),
@@ -1208,11 +1183,11 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_symbols(update, context):
     await update.message.reply_text(
-        f"<b>📊 رموز الإشارات ({len(SIG_SYMBOLS)}):</b>\n"
+        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n"
         + "\n".join(f"• {s}" for s in SIG_SYMBOLS)
-        + f"\n\n<b>🌅 رموز النطاق ({len(RNG_SYMBOLS)}):</b>\n"
+        + f"\n\n<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n"
         + "\n".join(f"• {s}" for s in RNG_SYMBOLS)
-        + f"\n\n<b>⚡ رموز التنبيه المفاجئ ({len(SC_SYMBOLS)}):</b>\n"
+        + f"\n\n<b>⚡ مفاجئ ({len(SC_SYMBOLS)}):</b>\n"
         + "\n".join(f"• {s}" for s in SC_SYMBOLS),
         parse_mode="HTML",
     )
@@ -1220,31 +1195,52 @@ async def cmd_symbols(update, context):
 
 async def cmd_strict(update, context):
     th = get_thresholds()
-    mode_desc = "تلقائي (ATR)" if STRICTNESS == "auto" else STRICTNESS
+    dbg = th.get("_debug", {})
+    mode_desc = STRICTNESS.upper()
     overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
+
+    debug_block = ""
+    if STRICTNESS == "auto" and dbg:
+        debug_block = (
+            f"\n<b>🧠 تفاصيل Auto:</b>\n"
+            f"• النمط: {dbg.get('regime','?')} (ATR={dbg.get('atr_pct')}%)\n"
+            f"• Score أساسي: {dbg.get('base_score')}\n"
+            f"• ADX Δ: {dbg.get('adx_delta'):+d}\n"
+            f"• Feedback Δ: {dbg.get('feedback_delta'):+d}\n"
+            f"• نسبة القبول: {dbg.get('pass_ratio')} "
+            f"({dbg.get('sample_n')} عينة)\n"
+        )
+
     await update.message.reply_text(
-        f"🎯 <b>التشدد الحالي:</b> <b>{mode_desc.upper()}</b>\n"
+        f"🎯 <b>التشدد:</b> <b>{mode_desc}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>العتبات الفعالة:</b>\n"
-        f"• Score أدنى: <b>{th['min_score']}</b>\n"
-        f"• Score 15m: <b>{th.get('score_15m_override', th['min_score'])}</b>\n"
-        f"• Volume أدنى: <b>{th['min_vol_ratio']}×</b>\n"
-        f"• ADX أدنى: <b>{th['min_adx']}</b>\n"
-        f"• ATR أقصى: <b>{th['max_atr_pct']}%</b>\n"
-        f"• VWAP slope: <b>{th['vwap_slope_pct']}%</b>\n"
-        f"• فرق EMA أدنى: <b>{th['min_ema_gap']}%</b>\n"
-        f"• RSI LONG: {th['rsi_long'][0]}–{th['rsi_long'][1]}\n"
-        f"• RSI SHORT: {th['rsi_short'][0]}–{th['rsi_short'][1]}\n"
-        f"• حجب ضد HTF: {'✅' if th['block_against_htf'] else '❌'}\n\n"
-        f"<b>التجاوزات اليدوية:</b>\n{overrides}\n\n"
-        f"<i>للتعديل: عدّل STRICTNESS أو STRICTNESS_OVERRIDE في الكود</i>",
+        f"• Score ≥ <b>{th['min_score']}</b>\n"
+        f"• Score 15m ≥ <b>{th.get('score_15m_override', th['min_score'])}</b>\n"
+        f"• Volume ≥ <b>{th['min_vol_ratio']}×</b>\n"
+        f"• ADX ≥ <b>{th['min_adx']}</b>\n"
+        f"• ATR ≤ <b>{th['max_atr_pct']}%</b>\n"
+        f"• VWAP slope ≥ <b>{th['vwap_slope_pct']}%</b>\n"
+        f"• فرق EMA ≥ <b>{th['min_ema_gap']}%</b>\n"
+        f"• RSI LONG: {th['rsi_long']}\n"
+        f"• RSI SHORT: {th['rsi_short']}\n"
+        f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n"
+        f"{debug_block}\n"
+        f"<b>التجاوزات اليدوية:</b>\n{overrides}",
         parse_mode="HTML",
     )
 
 
 async def cmd_clearcache(update, context):
-    clear_ohlcv_cache()
-    await update.message.reply_text("✅ تم تفريغ الكاش.")
+    clear_caches()
+    _smart.reset_feedback()
+    await update.message.reply_text(
+        "✅ تم تفريغ:\n"
+        "• كاش الشموع\n"
+        "• كاش التقاطعات\n"
+        "• إشارات التعارض\n"
+        "• سجل التغذية الراجعة (Auto)"
+    )
 
 
 async def cmd_status(update, context):
@@ -1254,8 +1250,8 @@ async def cmd_status(update, context):
         f"🔌 {_exchange.primary_name} | بدائل: {len(_exchange.chain_names)-1}\n"
         f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 إرسال: <b>{_filter_stats['sent']}</b>\n"
-        f"🚫 محجوبة:\n"
+        f"📊 مُرسَل: <b>{_filter_stats['sent']}</b>\n"
+        f"🚫 محجوب:\n"
         f"  • Score: {_filter_stats['filtered_score']}\n"
         f"  • Volume: {_filter_stats['filtered_vol']}\n"
         f"  • ADX: {_filter_stats['filtered_adx']}\n"
@@ -1264,10 +1260,10 @@ async def cmd_status(update, context):
         f"  • VWAP: {_filter_stats['filtered_vwap']}\n"
         f"  • Conflict: {_filter_stats['filtered_conflict']}\n"
         f"  • 15m: {_filter_stats['filtered_15m']}\n"
-        f"  • أخرى: {_filter_stats['filtered_other']}\n"
         f"الإجمالي: {total_filtered}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💾 كاش: {len(_ohlcv_cache)} OHLCV",
+        f"💾 كاش: {len(_ohlcv_cache)} OHLCV\n"
+        f"🧠 سجل Auto: {len(_smart.history)} عينة",
         parse_mode="HTML",
     )
 
@@ -1275,8 +1271,7 @@ async def cmd_status(update, context):
 async def error_handler(update, context):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
-        log.warning(f"⚠️ network: {err}")
-        return
+        log.warning(f"⚠️ network: {err}"); return
     log.error(f"❌ error: {err}", exc_info=err)
 
 
@@ -1284,8 +1279,7 @@ async def error_handler(update, context):
 # 19) Jobs
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
-    if not _exchange.ok():
-        return
+    if not _exchange.ok(): return
     detectors = []
     if ENABLE_PRE_CROSS:  detectors.append(detect_pre_crossover)
     if ENABLE_LIVE_CROSS: detectors.append(detect_live_crossover)
@@ -1297,8 +1291,7 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
             for det in detectors:
                 try:
                     cross = await det(sym, tf)
-                    if not cross:
-                        continue
+                    if not cross: continue
                     htf = await get_htf_trend(sym)
                     passed, reason, cat = await passes_filter(cross, htf)
                     if not passed:
@@ -1317,7 +1310,6 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
                             )
                             total += 1
                             _filter_stats["sent"] += 1
-                            # سجّل الإشارة لمنع التعارض
                             if cross["alert_type"] == "confirmed":
                                 record_signal(sym, cross["direction"])
                         except Exception as e:
@@ -1330,8 +1322,7 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
-    if not _exchange.ok():
-        return
+    if not _exchange.ok(): return
     total = 0
     for sym in SC_SYMBOLS:
         try:
@@ -1352,19 +1343,16 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
-    if not MORNING_REPORT_ENABLED or not _exchange.ok():
-        return
+    if not MORNING_REPORT_ENABLED or not _exchange.ok(): return
     analyses = []
     for sym in RNG_SYMBOLS:
         try:
             a = await analyze_range(sym)
-            if a:
-                analyses.append(a)
+            if a: analyses.append(a)
         except Exception as e:
             log.exception(f"morning {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if not analyses or not CHAT_ID:
-        return
+    if not analyses or not CHAT_ID: return
     try:
         await context.bot.send_message(
             chat_id=CHAT_ID,
@@ -1376,14 +1364,14 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
-# 20) Health server
+# 20) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v3.0")
+        self.wfile.write(b"OK - Unified Smart Bot v3.1 (No Binance)")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -1405,8 +1393,8 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
 
     th = get_thresholds()
-    print(f"🔀 Unified Smart Bot v3.0")
-    print(f"🔌 {_exchange.primary_name} ({MARKET_TYPE}) | بدائل: {_exchange.chain_names[1:]}")
+    print(f"🔀 Unified Smart Bot v3.1 (No Binance)")
+    print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 إشارات: {len(SIG_SYMBOLS)} | نطاق: {len(RNG_SYMBOLS)} | مفاجئ: {len(SC_SYMBOLS)}")
     print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | فريمات: {TIMEFRAMES}")
     print(f"🎯 STRICTNESS = {STRICTNESS}")
@@ -1414,7 +1402,6 @@ def main():
           f"ADX ≥ {th['min_adx']} | ATR ≤ {th['max_atr_pct']}%")
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
