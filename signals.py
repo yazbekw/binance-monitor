@@ -1,13 +1,13 @@
 """
-Unified Smart Bot v3.2 — No-Binance Edition + Range Breakout Alerts
-====================================================================
-  ✓ لا يستخدم Binance إطلاقاً
-  ✓ منصات متعددة: Bybit / OKX / KuCoin / Bitget / MEXC / Gate / HTX / Kraken
-  ✓ وضع auto ذكي تكيفي بثلاث طبقات
-  ✓ قوائم رموز منفصلة (إشارات / نطاق / مفاجئ)
-  ✓ متغيّران فقط للتحكم: STRICTNESS + STRICTNESS_OVERRIDE
+Unified Smart Bot v3.3 — Final Stable Edition
+==============================================
+  ✓ لا Binance نهائياً
+  ✓ منصات متعددة مع getattr آمن
+  ✓ log مُعرَّف قبل أي استخدام
+  ✓ STRICTNESS + STRICTNESS_OVERRIDE (متغيّران فقط للتشدد)
   ✓ RANGE_WIDTH_MULTIPLIER لتضييق/توسيع النطاق
-  ✓ إشعارات فورية عند خروج السعر عن نطاق آخر تقرير
+  ✓ إشعارات فورية عند خروج السعر عن النطاق
+  ✓ قوائم رموز منفصلة (إشارات / نطاق / مفاجئ)
 """
 import os
 import re
@@ -20,6 +20,18 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
 
+# ═══════════════════════════════════════════════════════════
+# 0) Logging — أول شيء يُنفَّذ قبل أي استخدام لـ log
+# ═══════════════════════════════════════════════════════════
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+for _name in ("httpx", "telegram", "telegram.ext", "ccxt"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+log = logging.getLogger("unified")
+
+# ─── المكتبات الأخرى ───
 import ccxt
 import pandas as pd
 from dotenv import load_dotenv
@@ -28,6 +40,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import NetworkError, TimedOut
 
 load_dotenv()
+
 
 # ═══════════════════════════════════════════════════════════
 # 1) إعدادات عامة
@@ -47,7 +60,7 @@ def _get_bool(n, d):  return os.getenv(n, str(d)).strip().lower() in ("true", "1
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) المنصات — بدون Binance نهائياً
+# 2) المنصات — بدون Binance + getattr آمن
 # ═══════════════════════════════════════════════════════════
 PRIMARY_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "bybit").strip().lower()
 FALLBACK_EXCHANGES = [
@@ -59,18 +72,17 @@ MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
 if MARKET_TYPE not in ("spot", "swap", "future"):
     MARKET_TYPE = "swap"
 
+# بناء ديناميكي — يتجاهل أي منصة غير موجودة في نسخة ccxt الحالية
+_EXCHANGE_NAMES = [
+    "bybit", "okx", "kucoin", "kraken", "gate",
+    "bitget", "mexc", "htx", "coinex", "bitmart",
+]
 _EXCHANGE_CLASSES = {
-    "bybit":   ccxt.bybit,
-    "okx":     ccxt.okx,
-    "kucoin":  ccxt.kucoin,
-    "kraken":  ccxt.kraken,
-    "gate":    ccxt.gate,
-    "bitget":  ccxt.bitget,
-    "mexc":    ccxt.mexc,
-    "htx":     ccxt.htx,
-    "bitmart": ccxt.bitmart,
-    "coinex":  ccxt.coinex,
+    name: getattr(ccxt, name)
+    for name in _EXCHANGE_NAMES
+    if hasattr(ccxt, name)
 }
+log.info(f"📦 ccxt {ccxt.__version__} | Available: {list(_EXCHANGE_CLASSES.keys())}")
 
 
 class MultiExchange:
@@ -86,7 +98,7 @@ class MultiExchange:
             log.warning("🚫 Binance محجوب في هذا البوت")
             return None
         if name not in _EXCHANGE_CLASSES:
-            log.warning(f"⚠️ منصة غير مدعومة: {name}")
+            log.warning(f"⚠️ منصة غير متوفرة في ccxt: {name}")
             return None
         try:
             opts = {
@@ -116,6 +128,9 @@ class MultiExchange:
             ex = self._make(name)
             if ex:
                 self.fallbacks.append(ex)
+        if not self.primary and self.fallbacks:
+            self.primary = self.fallbacks.pop(0)
+            log.warning(f"🔄 استخدام {self.primary.name} كمنصة أساسية بديلة")
 
     def _chain(self):
         out = []
@@ -216,7 +231,6 @@ PRICE_CHANGE_THRESHOLDS = {
     "XRP/USDT:USDT": _get_float("THRESHOLD_XRP", 1.5),
 }
 
-# ─── التقرير الصباحي ───
 MORNING_REPORT_ENABLED = _get_bool("MORNING_REPORT_ENABLED", True)
 MORNING_REPORT_HOUR = _get_int("MORNING_REPORT_HOUR", 9)
 MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
@@ -225,12 +239,9 @@ MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
 MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
 MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
 
-# ─── 🆕 التحكم في عرض النطاق ───
-# 1.0 = افتراضي | 0.5 = أضيق (نصف العرض) | 2.0 = أوسع (ضعف العرض)
 RANGE_WIDTH_MULTIPLIER = _get_float("RANGE_WIDTH_MULTIPLIER", 1.0)
 RANGE_WIDTH_MULTIPLIER = max(0.2, min(3.0, RANGE_WIDTH_MULTIPLIER))
 
-# ─── 🆕 إشعارات خروج السعر عن النطاق ───
 RANGE_BREAKOUT_ENABLED = _get_bool("RANGE_BREAKOUT_ENABLED", True)
 RANGE_BREAKOUT_INTERVAL_MIN = _get_int("RANGE_BREAKOUT_INTERVAL_MIN", 5)
 RANGE_BREAKOUT_COOLDOWN_MIN = _get_int("RANGE_BREAKOUT_COOLDOWN_MIN", 60)
@@ -242,16 +253,7 @@ SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
 
 # ═══════════════════════════════════════════════════════════
-# 5) Logging
-# ═══════════════════════════════════════════════════════════
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-for name in ("httpx", "telegram", "telegram.ext", "ccxt"):
-    logging.getLogger(name).setLevel(logging.WARNING)
-log = logging.getLogger("unified")
-
-
-# ═══════════════════════════════════════════════════════════
-# 6) 🧠 محرك التشدد الذكي
+# 5) 🧠 محرك التشدد الذكي
 # ═══════════════════════════════════════════════════════════
 STRICTNESS = os.getenv("STRICTNESS", "balanced").strip().lower()
 STRICTNESS_OVERRIDE: dict = {}
@@ -292,8 +294,8 @@ class SmartStrictness:
     """
     محرك تشدد ذكي بثلاث طبقات:
       1) تقلب ATR% → score أساسي
-      2) ADX → تعديل (اتجاه قوي = تخفيف، عرضي = تشديد)
-      3) Feedback loop → نسبة القبول في آخر N إشارة تعدّل score
+      2) ADX → تعديل
+      3) Feedback loop → نسبة القبول
     """
 
     def __init__(self):
@@ -401,7 +403,7 @@ def get_thresholds(atr_pct: float = None, adx: float = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# 7) أدوات مساعدة
+# 6) أدوات مساعدة
 # ═══════════════════════════════════════════════════════════
 def short(symbol: str) -> str:
     return symbol.split("/")[0].split(":")[0].upper()
@@ -434,7 +436,7 @@ def fmt_price(v: float) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# 8) المؤشرات
+# 7) المؤشرات
 # ═══════════════════════════════════════════════════════════
 def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
@@ -484,13 +486,13 @@ def calc_vwap(df):
 
 
 # ═══════════════════════════════════════════════════════════
-# 9) كاشات وحالات
+# 8) كاشات وحالات
 # ═══════════════════════════════════════════════════════════
 _ohlcv_cache: dict = {}
 _crossover_cache: dict = {}
 _price_state: dict = {}
 _recent_signals: dict = {}
-_last_range: dict = {}   # symbol -> range info for breakout alerts
+_last_range: dict = {}
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0,
@@ -502,7 +504,7 @@ _filter_stats = {
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) جلب الشموع
+# 9) جلب الشموع
 # ═══════════════════════════════════════════════════════════
 async def fetch_ohlcv_cached(symbol, tf, limit=150):
     key = (symbol, tf, limit)
@@ -523,7 +525,7 @@ def clear_caches():
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) HTF / VWAP / Conflict
+# 10) HTF / VWAP / Conflict
 # ═══════════════════════════════════════════════════════════
 async def get_htf_trend(symbol):
     if not HTF_ENABLED:
@@ -573,7 +575,7 @@ def record_signal(symbol, direction):
 
 
 # ═══════════════════════════════════════════════════════════
-# 12) حساب الـ Score
+# 11) حساب الـ Score
 # ═══════════════════════════════════════════════════════════
 def _stars(pts, mx):
     if mx == 0: return ""
@@ -694,7 +696,7 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 13) الفلتر الموحّد
+# 12) الفلتر الموحّد
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
     s = cross.get("support", {})
@@ -748,7 +750,7 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════
-# 14) كواشف الإشارات
+# 13) كواشف الإشارات
 # ═══════════════════════════════════════════════════════════
 async def _df_for(symbol, tf, extra=60):
     data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
@@ -882,7 +884,7 @@ async def detect_pre_crossover(symbol, tf):
 
 
 # ═══════════════════════════════════════════════════════════
-# 15) تنبيه التغير المفاجئ
+# 14) تنبيه التغير المفاجئ
 # ═══════════════════════════════════════════════════════════
 async def detect_sudden_change(symbol):
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 3)
@@ -915,7 +917,7 @@ async def detect_sudden_change(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) تحليل النطاق + تخزينه للمراقبة
+# 15) تحليل النطاق + تخزينه
 # ═══════════════════════════════════════════════════════════
 def _store_range(symbol: str, rng: dict):
     _last_range[symbol] = {
@@ -952,7 +954,6 @@ async def analyze_range(symbol):
     recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
     highest = float(recent["h"].max()); lowest = float(recent["l"].min())
 
-    # ─── تطبيق كلا المضاعفين ───
     span = atr * MORNING_REPORT_ATR_MULTIPLIER * RANGE_WIDTH_MULTIPLIER
     if span <= 0: return None
 
@@ -987,7 +988,7 @@ async def analyze_range(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 17) 🆕 مراقبة خروج السعر عن النطاق
+# 16) مراقبة خروج السعر عن النطاق
 # ═══════════════════════════════════════════════════════════
 async def _get_current_price(symbol: str) -> float:
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 2)
@@ -1014,12 +1015,10 @@ async def check_range_breakout(symbol: str):
     now = _time.time()
     cooldown_sec = RANGE_BREAKOUT_COOLDOWN_MIN * 60
 
-    # داخل النطاق → إعادة تصفير الحالة
     if r["lower"] <= price <= r["upper"]:
         r["state"] = "inside"
         return None
 
-    # اختراق علوي
     if price > r["upper"]:
         if r["state"] == "above":
             return None
@@ -1035,7 +1034,6 @@ async def check_range_breakout(symbol: str):
             "age_min": int((now - r["computed_at"]) / 60),
         }
 
-    # اختراق سفلي
     if price < r["lower"]:
         if r["state"] == "below":
             return None
@@ -1075,7 +1073,7 @@ def build_range_breakout_msg(b: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# 18) بناء رسائل الإشارات
+# 17) بناء رسائل الإشارات
 # ═══════════════════════════════════════════════════════════
 def build_signal_message(cross):
     sym = cross["symbol"]; tf = cross["timeframe"]
@@ -1182,13 +1180,13 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
 
 
 # ═══════════════════════════════════════════════════════════
-# 19) الأوامر
+# 18) الأوامر
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds()
     overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v3.2</b> — بدون Binance\n"
+        f"🔀 <b>Unified Smart Bot v3.3</b> — بدون Binance\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 الأساسية: <b>{_exchange.primary_name}</b> ({MARKET_TYPE})\n"
         f"🔁 البدائل: {', '.join(_exchange.chain_names[1:]) or '—'}\n\n"
@@ -1309,7 +1307,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يعرض كل النطاقات المحفوظة حالياً"""
     if not _last_range:
         await update.message.reply_text(
             "📭 لا نطاقات محفوظة.\nاستخدم /report أو انتظر التقرير الصباحي."
@@ -1437,7 +1434,7 @@ async def error_handler(update, context):
 
 
 # ═══════════════════════════════════════════════════════════
-# 20) Jobs
+# 19) Jobs
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok(): return
@@ -1550,14 +1547,14 @@ async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════
-# 21) Health
+# 20) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v3.2 (No Binance)")
+        self.wfile.write(b"OK - Unified Smart Bot v3.3 (No Binance)")
 
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
@@ -1571,7 +1568,7 @@ def run_health():
 
 
 # ═══════════════════════════════════════════════════════════
-# 22) Main
+# 21) Main
 # ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -1581,7 +1578,7 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
 
     th = get_thresholds()
-    print("🔀 Unified Smart Bot v3.2 (No Binance)")
+    print("🔀 Unified Smart Bot v3.3 (No Binance)")
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 إشارات: {len(SIG_SYMBOLS)} | نطاق: {len(RNG_SYMBOLS)} | مفاجئ: {len(SC_SYMBOLS)}")
     print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | فريمات: {TIMEFRAMES}")
