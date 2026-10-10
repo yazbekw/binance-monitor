@@ -1,13 +1,10 @@
 """
-Unified Smart Bot v3.3 — Final Stable Edition
-==============================================
-  ✓ لا Binance نهائياً
-  ✓ منصات متعددة مع getattr آمن
-  ✓ log مُعرَّف قبل أي استخدام
-  ✓ STRICTNESS + STRICTNESS_OVERRIDE (متغيّران فقط للتشدد)
-  ✓ RANGE_WIDTH_MULTIPLIER لتضييق/توسيع النطاق
-  ✓ إشعارات فورية عند خروج السعر عن النطاق
-  ✓ قوائم رموز منفصلة (إشارات / نطاق / مفاجئ)
+Unified Smart Bot v4.2 — Per-Coin Ranges Edition
+=================================================
+  ✓ متغيران لكل عملة: SYMBOL_LOWER + SYMBOL_UPPER
+  ✓ اكتشاف تلقائي (أي متغير ينتهي بـ _UPPER/_LOWER)
+  ✓ تحذير اقتراب + خروج + اقتراح إزاحة (بدون توسيع)
+  ✓ إشارات EMA + تقارب + تنبيه مفاجئ + تقرير ATR
 """
 import os
 import re
@@ -21,7 +18,7 @@ from zoneinfo import ZoneInfo
 from collections import deque
 
 # ═══════════════════════════════════════════════════════════
-# 0) Logging — أول شيء يُنفَّذ قبل أي استخدام لـ log
+# 0) Logging
 # ═══════════════════════════════════════════════════════════
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -31,7 +28,6 @@ for _name in ("httpx", "telegram", "telegram.ext", "ccxt"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 log = logging.getLogger("unified")
 
-# ─── المكتبات الأخرى ───
 import ccxt
 import pandas as pd
 from dotenv import load_dotenv
@@ -43,36 +39,157 @@ load_dotenv()
 
 
 # ═══════════════════════════════════════════════════════════
-# 1) إعدادات عامة
+# 1) الإعدادات الأساسية
 # ═══════════════════════════════════════════════════════════
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_REPORT_CHAT_ID")
 
+PRIMARY_EXCHANGE = "bybit"
+FALLBACK_EXCHANGES = ["okx", "kucoin", "bitget", "mexc", "gate"]
+MARKET_TYPE = "swap"
 
-def _get_float(n, d):
-    raw = os.getenv(n, str(d))
-    m = re.search(r"-?\d+(\.\d+)?", str(raw))
-    return float(m.group(0)) if m else float(d)
+TIMEFRAMES = ["5m", "15m", "1h"]
+EMA_FAST = 7
+EMA_SLOW = 25
+JOB_INTERVAL_MIN = 2
 
+ENABLE_PRE_CROSS  = True
+ENABLE_LIVE_CROSS = True
+ENABLE_CONFIRMED  = True
+PRE_CROSS_GAP = 0.05
+PRE_CROSS_LOOKBACK = 3
+PRE_CROSS_COOLDOWN = 3
 
-def _get_int(n, d):   return int(_get_float(n, d))
-def _get_bool(n, d):  return os.getenv(n, str(d)).strip().lower() in ("true", "1", "yes", "on")
+OHLCV_CACHE_SECONDS = 90
+CONFLICT_WINDOW_SEC = 300
+
+HTF_ENABLED = True
+HTF_TIMEFRAME = "1h"
+HTF_BLOCK_OPPOSITE = True
+VWAP_SLOPE_LOOKBACK = 5
+
+STRICTNESS = "auto"
+STRICTNESS_OVERRIDE: dict = {}
+
+PRICE_ALERT_INTERVAL_MIN = 1
+MAX_PRICE_ALERTS = 3
+DEFAULT_THRESHOLD = 1.5
+
+MORNING_REPORT_ENABLED = True
+MORNING_REPORT_HOUR = 9
+MORNING_REPORT_LOOKBACK_DAYS = 10
+MORNING_REPORT_MIN_GRIDS = 15
+MORNING_REPORT_MAX_GRIDS = 35
+MORNING_REPORT_ATR_MULTIPLIER = 3.0
+MORNING_REPORT_MAX_RANGE_PCT = 8.0
+RANGE_WIDTH_MULTIPLIER = 1.0
+
+# ─── إشعارات النطاق ───
+RANGE_MONITOR_INTERVAL_MIN = 3
+RANGE_APPROACH_ENABLED = True
+RANGE_APPROACH_PCT = 25.0
+RANGE_APPROACH_COOLDOWN_MIN = 45
+RANGE_BREAKOUT_ENABLED = True
+RANGE_BREAKOUT_COOLDOWN_MIN = 60
+RANGE_MAX_AGE_HOURS = 720
+
+SYMBOL_DELAY_MS = 200
+SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) المنصات — بدون Binance + getattr آمن
+# 2) 🎯 اكتشاف النطاقات تلقائياً من env
 # ═══════════════════════════════════════════════════════════
-PRIMARY_EXCHANGE = os.getenv("PRIMARY_EXCHANGE", "bybit").strip().lower()
-FALLBACK_EXCHANGES = [
-    x.strip().lower() for x in
-    os.getenv("FALLBACK_EXCHANGES", "okx,kucoin,bitget,mexc,gate").split(",")
-    if x.strip() and x.strip().lower() != "binance"
+def _normalize_symbol_from_var(name: str) -> str:
+    """
+    يحوّل اسم متغيّر إلى رمز تداول كامل:
+      XRP          → XRP/USDT:USDT
+      DOGE         → DOGE/USDT:USDT
+      BTC_USDT     → BTC/USDT:USDT
+      BTC_USDT:USDT → BTC/USDT:USDT
+    """
+    name = name.strip().upper()
+    # إذا كان يحتوي على / فهو رمز كامل
+    if "/" in name:
+        return name
+    # _USDT في النهاية → أزل اللاحقة
+    if name.endswith("_USDT"):
+        name = name[:-5]
+    # :USDT أو ما شابه
+    if ":" in name:
+        return name if "/" in name else name.replace("_", "/", 1)
+    # الافتراضي: XXX → XXX/USDT:USDT
+    return f"{name}/USDT:USDT"
+
+
+def _detect_ranges_from_env() -> dict:
+    """
+    يبحث في البيئة عن أي متغير ينتهي بـ _LOWER مع _UPPER مطابق.
+    يرجع dict: { "XRP/USDT:USDT": {"lower": 0.50, "upper": 0.65}, ... }
+    """
+    env = dict(os.environ)
+    out = {}
+
+    # 1) نبدأ من _UPPER
+    for key, upper_val in env.items():
+        if not key.upper().endswith("_UPPER"):
+            continue
+        coin_part = key[:-6]  # نحذف _UPPER
+        lower_key = f"{coin_part}_LOWER"
+
+        # ابحث عنها بحساسية حالة الأحرف
+        lower_val = env.get(lower_key)
+        if lower_val is None:
+            for k in env:
+                if k.upper() == lower_key.upper():
+                    lower_val = env[k]
+                    break
+        if lower_val is None:
+            log.warning(f"⚠️ {key} بدون {lower_key} مطابق — تخطي")
+            continue
+
+        try:
+            upper = float(str(upper_val).strip())
+            lower = float(str(lower_val).strip())
+        except Exception as e:
+            log.warning(f"⚠️ فشل تحويل {key}={upper_val} / {lower_key}={lower_val}: {e}")
+            continue
+
+        if upper <= lower:
+            log.warning(f"⚠️ نطاق غير صالح {coin_part}: {lower} >= {upper}")
+            continue
+
+        symbol = _normalize_symbol_from_var(coin_part)
+        out[symbol] = {"lower": lower, "upper": upper}
+        log.info(f"📌 {symbol}: [{lower} – {upper}]")
+
+    # 2) احتياطي: نبحث أيضاً عن _LOWER بدون _UPPER مطابق
+    for key, lower_val in env.items():
+        if not key.upper().endswith("_LOWER"):
+            continue
+        coin_part = key[:-6]
+        upper_key = f"{coin_part}_UPPER"
+        has_upper = any(k.upper() == upper_key.upper() for k in env)
+        if not has_upper:
+            log.warning(f"⚠️ {key} بدون {upper_key} مطابق — تخطي")
+
+    return out
+
+
+_MANUAL_RANGES = _detect_ranges_from_env()
+ALL_SYMBOLS = list(_MANUAL_RANGES.keys()) if _MANUAL_RANGES else [
+    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT"
 ]
-MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()
-if MARKET_TYPE not in ("spot", "swap", "future"):
-    MARKET_TYPE = "swap"
 
-# بناء ديناميكي — يتجاهل أي منصة غير موجودة في نسخة ccxt الحالية
+if not _MANUAL_RANGES:
+    log.warning("⚠️ لم يتم اكتشاف أي نطاق — تأكد من XRP_LOWER/XRP_UPPER إلخ")
+else:
+    log.info(f"✅ تم اكتشاف {len(_MANUAL_RANGES)} نطاق يدوي")
+
+
+# ═══════════════════════════════════════════════════════════
+# 3) المنصات
+# ═══════════════════════════════════════════════════════════
 _EXCHANGE_NAMES = [
     "bybit", "okx", "kucoin", "kraken", "gate",
     "bitget", "mexc", "htx", "coinex", "bitmart",
@@ -86,8 +203,6 @@ log.info(f"📦 ccxt {ccxt.__version__} | Available: {list(_EXCHANGE_CLASSES.key
 
 
 class MultiExchange:
-    """طبقة موحّدة: تجرب الأساسية ثم البدائل بالترتيب"""
-
     def __init__(self):
         self.primary = None
         self.fallbacks = []
@@ -95,10 +210,10 @@ class MultiExchange:
 
     def _make(self, name):
         if name == "binance":
-            log.warning("🚫 Binance محجوب في هذا البوت")
+            log.warning("🚫 Binance محجوب")
             return None
         if name not in _EXCHANGE_CLASSES:
-            log.warning(f"⚠️ منصة غير متوفرة في ccxt: {name}")
+            log.warning(f"⚠️ منصة غير متوفرة: {name}")
             return None
         try:
             opts = {
@@ -117,7 +232,7 @@ class MultiExchange:
             log.info(f"✅ {ex.name} | {len(ex.markets)} سوق")
             return ex
         except Exception as e:
-            log.warning(f"❌ فشل تهيئة {name}: {type(e).__name__}: {e}")
+            log.warning(f"❌ فشل {name}: {type(e).__name__}: {e}")
             return None
 
     def _init_all(self):
@@ -130,7 +245,7 @@ class MultiExchange:
                 self.fallbacks.append(ex)
         if not self.primary and self.fallbacks:
             self.primary = self.fallbacks.pop(0)
-            log.warning(f"🔄 استخدام {self.primary.name} كمنصة أساسية بديلة")
+            log.warning(f"🔄 الأساسية البديلة: {self.primary.name}")
 
     def _chain(self):
         out = []
@@ -156,7 +271,7 @@ class MultiExchange:
                 last_err = e
                 continue
         if last_err:
-            log.debug(f"fetch_ohlcv {symbol} {tf}: {type(last_err).__name__}")
+            log.debug(f"fetch {symbol} {tf}: {type(last_err).__name__}")
         return None, None
 
     @property
@@ -175,129 +290,25 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 3) قوائم الرموز — منفصلة
+# 4) محرك التشدد
 # ═══════════════════════════════════════════════════════════
-_SIG_DEFAULT = "BTC/USDT:USDT,XRP/USDT:USDT,XAU/USDT:USDT"
-SIG_SYMBOLS = [
-    s.strip().upper() for s in
-    (os.getenv("SYMBOLS_SIGNALS", "").strip() or _SIG_DEFAULT).split(",")
-    if s.strip()
-]
-
-_RNG_DEFAULT = "BTC/USDT:USDT,XAU/USDT:USDT,XAG/USDT:USDT"
-RNG_SYMBOLS = [
-    s.strip().upper() for s in
-    (os.getenv("SYMBOLS_RANGE", "").strip() or _RNG_DEFAULT).split(",")
-    if s.strip()
-]
-
-SC_SYMBOLS = [
-    s.strip().upper() for s in
-    (os.getenv("SYMBOLS_SUDDEN", "").strip() or ",".join(SIG_SYMBOLS)).split(",")
-    if s.strip()
-]
-
-
-# ═══════════════════════════════════════════════════════════
-# 4) إعدادات عامة
-# ═══════════════════════════════════════════════════════════
-TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", "5m,15m,1h").split(",") if t.strip()]
-EMA_FAST = _get_int("EMA_FAST", 7)
-EMA_SLOW = _get_int("EMA_SLOW", 25)
-JOB_INTERVAL_MIN = _get_int("JOB_INTERVAL_MIN", 2)
-
-ENABLE_PRE_CROSS  = _get_bool("ENABLE_PRE_CROSS", True)
-ENABLE_LIVE_CROSS = _get_bool("ENABLE_LIVE_CROSS", True)
-ENABLE_CONFIRMED  = _get_bool("ENABLE_CONFIRMED", True)
-PRE_CROSS_GAP = _get_float("PRE_CROSS_GAP", 0.05)
-PRE_CROSS_LOOKBACK = _get_int("PRE_CROSS_LOOKBACK", 3)
-PRE_CROSS_COOLDOWN = _get_int("PRE_CROSS_COOLDOWN", 3)
-
-OHLCV_CACHE_SECONDS = _get_int("OHLCV_CACHE_SECONDS", 90)
-CONFLICT_WINDOW_SEC = _get_int("CONFLICT_WINDOW_SEC", 300)
-
-HTF_ENABLED = _get_bool("HTF_TREND_ENABLED", True)
-HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "1h")
-HTF_BLOCK_OPPOSITE = _get_bool("HTF_BLOCK_OPPOSITE", True)
-VWAP_SLOPE_LOOKBACK = _get_int("VWAP_SLOPE_LOOKBACK", 5)
-
-PRICE_ALERT_INTERVAL_MIN = _get_int("PRICE_ALERT_INTERVAL_MIN", 1)
-MAX_PRICE_ALERTS = _get_int("MAX_PRICE_ALERTS", 3)
-DEFAULT_THRESHOLD = _get_float("DEFAULT_THRESHOLD", 1.0)
-PRICE_CHANGE_THRESHOLDS = {
-    "BTC/USDT:USDT": _get_float("THRESHOLD_BTC", 1.0),
-    "XAU/USDT:USDT": _get_float("THRESHOLD_XAU", 0.4),
-    "XAG/USDT:USDT": _get_float("THRESHOLD_XAG", 0.6),
-    "XRP/USDT:USDT": _get_float("THRESHOLD_XRP", 1.5),
-}
-
-MORNING_REPORT_ENABLED = _get_bool("MORNING_REPORT_ENABLED", True)
-MORNING_REPORT_HOUR = _get_int("MORNING_REPORT_HOUR", 9)
-MORNING_REPORT_LOOKBACK_DAYS = _get_int("MORNING_REPORT_LOOKBACK_DAYS", 10)
-MORNING_REPORT_MIN_GRIDS = _get_int("MORNING_REPORT_MIN_GRIDS", 15)
-MORNING_REPORT_MAX_GRIDS = _get_int("MORNING_REPORT_MAX_GRIDS", 35)
-MORNING_REPORT_ATR_MULTIPLIER = _get_float("MORNING_REPORT_ATR_MULTIPLIER", 3.0)
-MORNING_REPORT_MAX_RANGE_PCT = _get_float("MORNING_REPORT_MAX_RANGE_PCT", 8.0)
-
-RANGE_WIDTH_MULTIPLIER = _get_float("RANGE_WIDTH_MULTIPLIER", 1.0)
-RANGE_WIDTH_MULTIPLIER = max(0.2, min(3.0, RANGE_WIDTH_MULTIPLIER))
-
-RANGE_BREAKOUT_ENABLED = _get_bool("RANGE_BREAKOUT_ENABLED", True)
-RANGE_BREAKOUT_INTERVAL_MIN = _get_int("RANGE_BREAKOUT_INTERVAL_MIN", 5)
-RANGE_BREAKOUT_COOLDOWN_MIN = _get_int("RANGE_BREAKOUT_COOLDOWN_MIN", 60)
-RANGE_MAX_AGE_HOURS = _get_int("RANGE_MAX_AGE_HOURS", 24)
-
-SYMBOL_DELAY_MS = _get_int("SYMBOL_DELAY_MS", 200)
-
-SYRIA_TZ = ZoneInfo("Asia/Damascus")
-
-
-# ═══════════════════════════════════════════════════════════
-# 5) 🧠 محرك التشدد الذكي
-# ═══════════════════════════════════════════════════════════
-STRICTNESS = os.getenv("STRICTNESS", "balanced").strip().lower()
-STRICTNESS_OVERRIDE: dict = {}
-
 STATIC_PROFILES = {
-    "relaxed": {
-        "min_score": 45, "min_vol_ratio": 0.80, "min_adx": 14.0,
-        "max_atr_pct": 0.95,
-        "rsi_long": (32, 80), "rsi_short": (20, 68),
-        "vwap_slope_pct": 0.03, "min_ema_gap": 0.03,
-        "block_against_htf": False, "score_15m_override": 55,
-    },
     "balanced": {
         "min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
         "max_atr_pct": 0.70,
-        "rsi_long": (35, 75), "rsi_short": (25, 65),
-        "vwap_slope_pct": 0.05, "min_ema_gap": 0.05,
-        "block_against_htf": True, "score_15m_override": 65,
+        "vwap_slope_pct": 0.05, "block_against_htf": True,
+        "score_15m_override": 65,
     },
     "strict": {
         "min_score": 70, "min_vol_ratio": 1.30, "min_adx": 22.0,
         "max_atr_pct": 0.60,
-        "rsi_long": (40, 72), "rsi_short": (28, 60),
-        "vwap_slope_pct": 0.07, "min_ema_gap": 0.08,
-        "block_against_htf": True, "score_15m_override": 75,
-    },
-    "elite": {
-        "min_score": 82, "min_vol_ratio": 1.80, "min_adx": 28.0,
-        "max_atr_pct": 0.50,
-        "rsi_long": (45, 68), "rsi_short": (32, 55),
-        "vwap_slope_pct": 0.10, "min_ema_gap": 0.12,
-        "block_against_htf": True, "score_15m_override": 85,
+        "vwap_slope_pct": 0.07, "block_against_htf": True,
+        "score_15m_override": 75,
     },
 }
 
 
 class SmartStrictness:
-    """
-    محرك تشدد ذكي بثلاث طبقات:
-      1) تقلب ATR% → score أساسي
-      2) ADX → تعديل
-      3) Feedback loop → نسبة القبول
-    """
-
     def __init__(self):
         self.history = deque(maxlen=200)
         self._lock = threading.Lock()
@@ -354,28 +365,16 @@ class SmartStrictness:
             "min_vol_ratio": round(max(0.7, (final_score - 30) / 30), 2),
             "min_adx": round(max(12, final_score * 0.28), 1),
             "max_atr_pct": round(max(0.35, 1.2 - final_score / 100), 2),
-            "rsi_long": (
-                min(50, 30 + max(0, final_score - 50) // 4),
-                max(70, 82 - max(0, final_score - 50) // 5),
-            ),
-            "rsi_short": (
-                min(40, 18 + max(0, final_score - 50) // 4),
-                max(55, 68 - max(0, final_score - 50) // 6),
-            ),
             "vwap_slope_pct": round(0.02 + final_score / 1000, 3),
             "min_ema_gap": round(final_score / 800, 3),
             "block_against_htf": final_score >= 55,
             "score_15m_override": min(90, final_score + 10),
             "_debug": {
-                "mode": "auto",
-                "base_score": base,
-                "adx_delta": adx_delta,
-                "feedback_delta": fb_delta,
+                "mode": "auto", "base_score": base,
+                "adx_delta": adx_delta, "feedback_delta": fb_delta,
                 "pass_ratio": round(pass_ratio, 2) if pass_ratio is not None else None,
-                "sample_n": sample_n,
-                "regime": regime,
-                "atr_pct": atr_pct,
-                "adx": adx,
+                "sample_n": sample_n, "regime": regime,
+                "atr_pct": atr_pct, "adx": adx,
             },
         }
         self._cached_profile = profile
@@ -403,7 +402,7 @@ def get_thresholds(atr_pct: float = None, adx: float = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# 6) أدوات مساعدة
+# 5) أدوات
 # ═══════════════════════════════════════════════════════════
 def short(symbol: str) -> str:
     return symbol.split("/")[0].split(":")[0].upper()
@@ -436,7 +435,7 @@ def fmt_price(v: float) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# 7) المؤشرات
+# 6) المؤشرات
 # ═══════════════════════════════════════════════════════════
 def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
@@ -486,7 +485,7 @@ def calc_vwap(df):
 
 
 # ═══════════════════════════════════════════════════════════
-# 8) كاشات وحالات
+# 7) كاشات وحالات
 # ═══════════════════════════════════════════════════════════
 _ohlcv_cache: dict = {}
 _crossover_cache: dict = {}
@@ -498,13 +497,12 @@ _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0,
     "filtered_adx": 0, "filtered_atr": 0, "filtered_htf": 0,
     "filtered_vwap": 0, "filtered_conflict": 0,
-    "filtered_15m": 0, "filtered_other": 0,
-    "range_breakouts": 0,
+    "range_breakouts": 0, "range_approaches": 0,
 }
 
 
 # ═══════════════════════════════════════════════════════════
-# 9) جلب الشموع
+# 8) جلب الشموع
 # ═══════════════════════════════════════════════════════════
 async def fetch_ohlcv_cached(symbol, tf, limit=150):
     key = (symbol, tf, limit)
@@ -525,7 +523,7 @@ def clear_caches():
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) HTF / VWAP / Conflict
+# 9) HTF / VWAP / Conflict
 # ═══════════════════════════════════════════════════════════
 async def get_htf_trend(symbol):
     if not HTF_ENABLED:
@@ -575,106 +573,90 @@ def record_signal(symbol, direction):
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) حساب الـ Score
+# 10) حساب الـ Score
 # ═══════════════════════════════════════════════════════════
-def _stars(pts, mx):
-    if mx == 0: return ""
-    r = pts / mx
-    if r >= 0.9:  return "⭐⭐⭐"
-    if r >= 0.6:  return "⭐⭐"
-    if r >= 0.3:  return "⭐"
-    return "▫️"
-
-
 def compute_score(df, direction, curr_idx=-2):
     close = df["c"]; vol = df["v"]
     price = float(close.iloc[curr_idx])
 
-    # Volume
     try:
         s = max(0, len(df) + curr_idx - 20); e = len(df) + curr_idx
         vma = float(vol.iloc[s:e].mean())
         vr = float(vol.iloc[curr_idx]) / vma if vma > 0 else 0
     except Exception:
         vr = 0
-    if vr >= 4.0:   v_pts, v_lbl = 30, "قوي جداً 🔥"
-    elif vr >= 2.5: v_pts, v_lbl = 25, "قوي"
-    elif vr >= 1.5: v_pts, v_lbl = 18, "جيد"
-    elif vr >= 1.0: v_pts, v_lbl = 10, "طبيعي"
-    elif vr >= 0.5: v_pts, v_lbl = 5,  "ضعيف"
-    else:           v_pts, v_lbl = 0,  "ضعيف جداً ⚠️"
+    if vr >= 4.0:   v_pts = 30
+    elif vr >= 2.5: v_pts = 25
+    elif vr >= 1.5: v_pts = 18
+    elif vr >= 1.0: v_pts = 10
+    elif vr >= 0.5: v_pts = 5
+    else:           v_pts = 0
 
-    # ADX
     try:  adx = float(calc_adx(df).iloc[curr_idx])
     except Exception: adx = 0
-    if adx >= 50:    a_pts, a_lbl = 18, "اتجاه متطرف"
-    elif adx >= 35:  a_pts, a_lbl = 20, "قوي جداً"
-    elif adx >= 25:  a_pts, a_lbl = 18, "واضح"
-    elif adx >= 20:  a_pts, a_lbl = 12, "ضعيف"
-    elif adx >= 15:  a_pts, a_lbl = 5,  "عرضي"
-    else:            a_pts, a_lbl = 0,  "عرضي جداً"
+    if adx >= 50:    a_pts = 18
+    elif adx >= 35:  a_pts = 20
+    elif adx >= 25:  a_pts = 18
+    elif adx >= 20:  a_pts = 12
+    elif adx >= 15:  a_pts = 5
+    else:            a_pts = 0
 
-    # EMA gap
     try:
         ef = float(calc_ema(close, EMA_FAST).iloc[curr_idx])
         es = float(calc_ema(close, EMA_SLOW).iloc[curr_idx])
         gap = abs(ef - es) / es * 100 if es else 0
     except Exception:
         gap = 0
-    if gap >= 0.60:   g_pts, g_lbl = 12, "كبير جداً"
-    elif gap >= 0.30: g_pts, g_lbl = 15, "كبير"
-    elif gap >= 0.10: g_pts, g_lbl = 10, "متوسط"
-    elif gap >= 0.05: g_pts, g_lbl = 6,  "صغير"
-    elif gap >= 0.02: g_pts, g_lbl = 3,  "صغير جداً"
-    else:             g_pts, g_lbl = 0,  "طفيلي"
+    if gap >= 0.60:   g_pts = 12
+    elif gap >= 0.30: g_pts = 15
+    elif gap >= 0.10: g_pts = 10
+    elif gap >= 0.05: g_pts = 6
+    elif gap >= 0.02: g_pts = 3
+    else:             g_pts = 0
 
-    # MACD
     try:
         _, _, hist = calc_macd(close)
         hn = float(hist.iloc[curr_idx]); hp = float(hist.iloc[curr_idx - 1])
         rising = hn > hp
-        if hn > 0 and rising:    m_pts, m_lbl = 10, "يتسارع صعوداً ↗"
-        elif hn > 0:             m_pts, m_lbl = 5,  "يتباطأ صعوداً ↘"
-        elif hn < 0 and rising:  m_pts, m_lbl = 7,  "يتباطأ هبوطاً ↗"
-        else:                    m_pts, m_lbl = 5,  "يتسارع هبوطاً ↘"
+        if hn > 0 and rising:    m_pts = 10
+        elif hn > 0:             m_pts = 5
+        elif hn < 0 and rising:  m_pts = 7
+        else:                    m_pts = 5
     except Exception:
-        m_pts, m_lbl = 0, "غير محدد"
+        m_pts = 0
 
-    # RSI
     try: rsi = float(calc_rsi(close).iloc[curr_idx])
     except Exception: rsi = 50
     if direction == "bullish":
-        if 55 <= rsi <= 70:   r_pts, r_lbl = 10, "زخم صاعد صحي ⭐"
-        elif rsi > 70:        r_pts, r_lbl = 5,  "تشبع شرائي"
-        elif rsi >= 45:       r_pts, r_lbl = 7,  "محايد"
-        elif rsi >= 30:       r_pts, r_lbl = 3,  "زخم هابط (ضد)"
-        else:                 r_pts, r_lbl = 0,  "تشبع بيعي"
+        if 55 <= rsi <= 70:   r_pts = 10
+        elif rsi > 70:        r_pts = 5
+        elif rsi >= 45:       r_pts = 7
+        elif rsi >= 30:       r_pts = 3
+        else:                 r_pts = 0
     else:
-        if 30 <= rsi <= 45:   r_pts, r_lbl = 10, "زخم هابط صحي ⭐"
-        elif rsi < 30:        r_pts, r_lbl = 5,  "تشبع بيعي"
-        elif rsi <= 55:       r_pts, r_lbl = 7,  "محايد"
-        elif rsi <= 70:       r_pts, r_lbl = 3,  "زخم صاعد (ضد)"
-        else:                 r_pts, r_lbl = 0,  "تشبع شرائي"
+        if 30 <= rsi <= 45:   r_pts = 10
+        elif rsi < 30:        r_pts = 5
+        elif rsi <= 55:       r_pts = 7
+        elif rsi <= 70:       r_pts = 3
+        else:                 r_pts = 0
 
-    # EMA50 alignment
     try:
         e50 = float(calc_ema(close, 50).iloc[curr_idx])
     except Exception:
         e50 = price
     above = price > e50
-    if direction == "bullish" and above:          h_pts, h_lbl = 10, "مع الاتجاه ✅"
-    elif direction == "bearish" and not above:    h_pts, h_lbl = 10, "مع الاتجاه ✅"
-    else:                                          h_pts, h_lbl = 0,  "ضد الاتجاه ⚠️"
+    if direction == "bullish" and above:          h_pts = 10
+    elif direction == "bearish" and not above:    h_pts = 10
+    else:                                          h_pts = 0
 
-    # ATR
     try:
         atr = float(calc_atr(df).iloc[curr_idx])
         atr_pct = (atr / price) * 100 if price > 0 else 0
     except Exception:
         atr_pct = 0
-    if atr_pct >= 0.30:   t_pts, t_lbl = 5, "نشاط جيد"
-    elif atr_pct >= 0.15: t_pts, t_lbl = 3, "طبيعي"
-    else:                 t_pts, t_lbl = 1, "خمول"
+    if atr_pct >= 0.30:   t_pts = 5
+    elif atr_pct >= 0.15: t_pts = 3
+    else:                 t_pts = 1
 
     total = v_pts + a_pts + g_pts + m_pts + r_pts + h_pts + t_pts
     if total >= 80:   grade = "🌟 ذهبية"
@@ -685,18 +667,18 @@ def compute_score(df, direction, curr_idx=-2):
 
     return {
         "score": total, "grade": grade,
-        "adx": round(adx, 1), "adx_label": a_lbl, "adx_pts": a_pts,
-        "rsi": round(rsi, 1), "rsi_label": r_lbl, "rsi_pts": r_pts,
-        "macd_label": m_lbl, "macd_pts": m_pts,
-        "vol_ratio": round(vr, 2), "vol_label": v_lbl, "vol_pts": v_pts,
-        "atr_pct": round(atr_pct, 2), "atr_label": t_lbl, "atr_pts": t_pts,
-        "htf_label": h_lbl, "htf_pts": h_pts,
-        "gap_pct": round(gap, 3), "gap_label": g_lbl, "gap_pts": g_pts,
+        "adx": round(adx, 1), "adx_pts": a_pts,
+        "rsi": round(rsi, 1), "rsi_pts": r_pts,
+        "macd_pts": m_pts,
+        "vol_ratio": round(vr, 2), "vol_pts": v_pts,
+        "atr_pct": round(atr_pct, 2), "atr_pts": t_pts,
+        "htf_pts": h_pts,
+        "gap_pct": round(gap, 3), "gap_pts": g_pts,
     }
 
 
 # ═══════════════════════════════════════════════════════════
-# 12) الفلتر الموحّد
+# 11) الفلتر
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
     s = cross.get("support", {})
@@ -715,8 +697,7 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
         min_score = max(min_score, th.get("score_15m_override", min_score))
 
     passed = True
-    reason = ""
-    category = ""
+    reason = ""; category = ""
 
     if score < min_score:
         passed, reason, category = False, f"Score {score} < {min_score}", "score"
@@ -750,27 +731,13 @@ async def passes_filter(cross: dict, htf_trend: str = None) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════
-# 13) كواشف الإشارات
+# 12) كواشف الإشارات
 # ═══════════════════════════════════════════════════════════
 async def _df_for(symbol, tf, extra=60):
     data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
     if not data or len(data) < EMA_SLOW + 5:
         return None
     return pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-
-
-def _classify_strength(tf, gap):
-    if tf == "1h":
-        if gap >= 0.30: return "🔥 قوية جداً"
-        if gap >= 0.10: return "🟢 قوية"
-        return "🟡 متوسطة"
-    if tf == "15m":
-        if gap >= 0.20: return "🟢 قوية"
-        if gap >= 0.10: return "🟡 متوسطة"
-        return "⚪ ضعيفة"
-    if gap >= 0.25: return "🟢 قوية"
-    if gap >= 0.10: return "🟡 متوسطة"
-    return "⚪ ضعيفة"
 
 
 async def detect_crossover(symbol, tf):
@@ -799,7 +766,7 @@ async def detect_crossover(symbol, tf):
         "price": round(float(df["c"].iloc[curr]), 8),
         "candle_ts": cts,
         "gap_pct": round(abs(cf - cs) / cs * 100, 3),
-        "strength": _classify_strength(tf, abs(cf - cs) / cs * 100),
+        "strength": "✅ مؤكد",
         "alert_type": "confirmed", "support": support, "_df": df,
         "exchange": _exchange.primary_name,
     }
@@ -837,9 +804,7 @@ async def detect_live_crossover(symbol, tf):
 
 
 _TF_MS = {
-    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
-    "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
-    "4h": 14_400_000, "1d": 86_400_000,
+    "1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "1d": 86_400_000,
 }
 
 
@@ -884,7 +849,7 @@ async def detect_pre_crossover(symbol, tf):
 
 
 # ═══════════════════════════════════════════════════════════
-# 14) تنبيه التغير المفاجئ
+# 13) التنبيه المفاجئ
 # ═══════════════════════════════════════════════════════════
 async def detect_sudden_change(symbol):
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 3)
@@ -892,7 +857,7 @@ async def detect_sudden_change(symbol):
     prev = float(data[-2][4]); cur = float(data[-1][4])
     if prev == 0: return None
     pct = ((cur - prev) / prev) * 100
-    th = PRICE_CHANGE_THRESHOLDS.get(symbol, DEFAULT_THRESHOLD)
+    th = DEFAULT_THRESHOLD
     st = _price_state.setdefault(symbol, {"direction": None, "count": 0, "alerting": False})
     if abs(pct) >= th:
         d = "up" if pct > 0 else "down"
@@ -917,78 +882,32 @@ async def detect_sudden_change(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 15) تحليل النطاق + تخزينه
+# 14) تخزين النطاق
 # ═══════════════════════════════════════════════════════════
-def _store_range(symbol: str, rng: dict):
+def _store_range(symbol: str, lower: float, upper: float, source: str = "manual"):
     _last_range[symbol] = {
-        "lower": float(rng["suggested_lower"]),
-        "upper": float(rng["suggested_upper"]),
+        "lower": float(lower),
+        "upper": float(upper),
         "computed_at": _time.time(),
         "state": "inside",
         "last_alert_at": 0.0,
-        "range_pct": rng.get("range_pct", 0),
-        "grids": rng.get("grids", 0),
+        "last_approach_alert_at": 0.0,
+        "last_near_side": None,
+        "source": source,
     }
-    log.info(
-        f"📌 Range stored: {symbol} "
-        f"[{rng['suggested_lower']:.6f} – {rng['suggested_upper']:.6f}]"
-    )
+    log.info(f"📌 Range [{source}]: {symbol} [{lower} – {upper}]")
 
 
-async def analyze_range(symbol):
-    data, _ = await _exchange.fetch_ohlcv(
-        symbol, "1d", MORNING_REPORT_LOOKBACK_DAYS + 20
-    )
-    if not data or len(data) < 10:
-        return None
-    df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-    cur = float(df["c"].iloc[-1])
-    if cur == 0: return None
-    df["tr"] = pd.concat([
-        df["h"] - df["l"],
-        (df["h"] - df["c"].shift()).abs(),
-        (df["l"] - df["c"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr = float(df["tr"].tail(14).mean())
-    atr_pct = (atr / cur) * 100
-    recent = df.tail(MORNING_REPORT_LOOKBACK_DAYS)
-    highest = float(recent["h"].max()); lowest = float(recent["l"].min())
-
-    span = atr * MORNING_REPORT_ATR_MULTIPLIER * RANGE_WIDTH_MULTIPLIER
-    if span <= 0: return None
-
-    lower = cur - span / 2; upper = cur + span / 2
-    rng_pct = ((upper - lower) / cur) * 100
-
-    if rng_pct > MORNING_REPORT_MAX_RANGE_PCT:
-        span = cur * (MORNING_REPORT_MAX_RANGE_PCT / 100)
-        lower = cur - span / 2; upper = cur + span / 2
-        rng_pct = MORNING_REPORT_MAX_RANGE_PCT
-    if rng_pct <= 0: return None
-
-    ideal = int(rng_pct / 0.10)
-    grids = max(MORNING_REPORT_MIN_GRIDS, min(MORNING_REPORT_MAX_GRIDS, ideal))
-    step = (upper - lower) / grids
-    step_pct = (step / cur) * 100 if cur else 0
-
-    result = {
-        "symbol": symbol, "current": cur,
-        "highest": highest, "lowest": lowest,
-        "suggested_lower": lower, "suggested_upper": upper,
-        "range_pct": round(rng_pct, 2), "atr_pct": round(atr_pct, 2),
-        "atr_multiplier": MORNING_REPORT_ATR_MULTIPLIER,
-        "width_multiplier": RANGE_WIDTH_MULTIPLIER,
-        "max_range_pct": MORNING_REPORT_MAX_RANGE_PCT,
-        "grids": grids, "grid_step": step,
-        "grid_step_pct": round(step_pct, 3),
-        "lookback": MORNING_REPORT_LOOKBACK_DAYS,
-    }
-    _store_range(symbol, result)
-    return result
+def _load_manual_ranges():
+    n = 0
+    for sym, r in _MANUAL_RANGES.items():
+        _store_range(sym, r["lower"], r["upper"], source="manual")
+        n += 1
+    return n
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) مراقبة خروج السعر عن النطاق
+# 15) مراقبة النطاق: اقتراب + خروج
 # ═══════════════════════════════════════════════════════════
 async def _get_current_price(symbol: str) -> float:
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 2)
@@ -1014,66 +933,150 @@ async def check_range_breakout(symbol: str):
 
     now = _time.time()
     cooldown_sec = RANGE_BREAKOUT_COOLDOWN_MIN * 60
+    width = r["upper"] - r["lower"]
 
     if r["lower"] <= price <= r["upper"]:
         r["state"] = "inside"
         return None
 
     if price > r["upper"]:
-        if r["state"] == "above":
+        if r["state"] == "above" or now - r["last_alert_at"] < cooldown_sec:
             return None
-        if now - r["last_alert_at"] < cooldown_sec:
-            return None
-        r["state"] = "above"
-        r["last_alert_at"] = now
+        r["state"] = "above"; r["last_alert_at"] = now
         return {
             "symbol": symbol, "direction": "above",
             "price": price, "boundary": r["upper"],
-            "lower": r["lower"], "upper": r["upper"],
-            "deviation_pct": ((price - r["upper"]) / r["upper"]) * 100,
+            "lower": r["lower"], "upper": r["upper"], "width": width,
+            "deviation_pct": ((price - r["upper"]) / width) * 100,
             "age_min": int((now - r["computed_at"]) / 60),
+            "source": r.get("source", "manual"),
         }
 
     if price < r["lower"]:
-        if r["state"] == "below":
+        if r["state"] == "below" or now - r["last_alert_at"] < cooldown_sec:
             return None
-        if now - r["last_alert_at"] < cooldown_sec:
-            return None
-        r["state"] = "below"
-        r["last_alert_at"] = now
+        r["state"] = "below"; r["last_alert_at"] = now
         return {
             "symbol": symbol, "direction": "below",
             "price": price, "boundary": r["lower"],
-            "lower": r["lower"], "upper": r["upper"],
-            "deviation_pct": ((r["lower"] - price) / r["lower"]) * 100,
+            "lower": r["lower"], "upper": r["upper"], "width": width,
+            "deviation_pct": ((r["lower"] - price) / width) * 100,
             "age_min": int((now - r["computed_at"]) / 60),
+            "source": r.get("source", "manual"),
         }
     return None
 
 
-def build_range_breakout_msg(b: dict) -> str:
+async def check_range_approach(symbol: str):
+    if not RANGE_APPROACH_ENABLED:
+        return None
+    r = _last_range.get(symbol)
+    if not r or not _range_is_fresh(r):
+        return None
+    if r["state"] != "inside":
+        return None
+
+    price = await _get_current_price(symbol)
+    if price <= 0:
+        return None
+
+    width = r["upper"] - r["lower"]
+    if width <= 0:
+        return None
+
+    position_pct = ((price - r["lower"]) / width) * 100
+    distance_to_upper = 100 - position_pct
+    distance_to_lower = position_pct
+
+    if distance_to_upper <= RANGE_APPROACH_PCT:
+        side = "upper"; distance_pct = distance_to_upper
+    elif distance_to_lower <= RANGE_APPROACH_PCT:
+        side = "lower"; distance_pct = distance_to_lower
+    else:
+        r["last_near_side"] = None
+        return None
+
+    now = _time.time()
+    cooldown_sec = RANGE_APPROACH_COOLDOWN_MIN * 60
+    if r["last_near_side"] == side and now - r["last_approach_alert_at"] < cooldown_sec:
+        return None
+    r["last_near_side"] = side
+    r["last_approach_alert_at"] = now
+
+    mid = (r["lower"] + r["upper"]) / 2
+    shift = price - mid
+    suggested_lower = price - width / 2
+    suggested_upper = price + width / 2
+    shift_pct = (shift / mid) * 100 if mid else 0
+
+    return {
+        "symbol": symbol, "side": side,
+        "price": price,
+        "lower": r["lower"], "upper": r["upper"], "width": width,
+        "position_pct": round(position_pct, 1),
+        "distance_pct": round(distance_pct, 1),
+        "suggested_lower": suggested_lower,
+        "suggested_upper": suggested_upper,
+        "shift": shift, "shift_pct": shift_pct,
+        "age_min": int((now - r["computed_at"]) / 60),
+        "source": r.get("source", "manual"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# 16) رسائل النطاق
+# ═══════════════════════════════════════════════════════════
+def build_breakout_msg(b: dict) -> str:
     up = b["direction"] == "above"
-    emoji = "🚨" if up else "⚠️"
-    title = "اختراق صعودي — فوق النطاق 🟢" if up else "اختراق هبوطي — تحت النطاق 🔴"
+    emoji = "🚨" if up else "🔻"
+    title = "خروج صعودي — فوق الحد الأعلى 🟢" if up else "خروج هبوطي — تحت الحد الأدنى 🔴"
     arrow = "⬆️" if up else "⬇️"
     return (
         f"{emoji} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>{title}</b>\n"
-        f"{arrow} السعر الحالي: <b>{fmt_price(b['price'])}</b>\n"
+        f"{arrow} السعر: <b>{fmt_price(b['price'])}</b>\n"
         f"🎯 الحد المخترق: <b>{fmt_price(b['boundary'])}</b>\n"
-        f"📏 الانحراف: <b>{b['deviation_pct']:.3f}%</b>\n"
+        f"📏 المسافة خارج النطاق: <b>{b['deviation_pct']:.2f}%</b> من العرض\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• النطاق المحدد: <b>{fmt_price(b['lower'])} – {fmt_price(b['upper'])}</b>\n"
-        f"• عُمر النطاق: <b>{b['age_min']} دقيقة</b>\n"
-        f"• المصدر: {_exchange.primary_name}\n\n"
-        f"💡 <i>قد يكون بداية اتجاه جديد — راقب الزخم.</i>"
+        f"• النطاق: <b>{fmt_price(b['lower'])} – {fmt_price(b['upper'])}</b>\n"
+        f"• العرض: {fmt_price(b['width'])}\n"
+        f"• عمر: {b['age_min']} دقيقة"
+    )
+
+
+def build_approach_msg(a: dict) -> str:
+    up = a["side"] == "upper"
+    emoji = "⚠️" if up else "🔔"
+    title = ("اقتراب من الحد الأعلى 🔺" if up else "اقتراب من الحد الأدنى 🔻")
+    arrow = "⬆️" if up else "⬇️"
+    shift_sign = "+" if a["shift"] > 0 else ""
+
+    return (
+        f"{emoji} <b>اقتراب من النطاق — {short(a['symbol'])}</b>\n"
+        f"🇸🇾 <b>{syria_now_str()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>{title}</b>\n"
+        f"{arrow} السعر: <b>{fmt_price(a['price'])}</b>\n"
+        f"📏 المسافة للحد: <b>{a['distance_pct']}%</b> من العرض\n"
+        f"📍 الموضع في النطاق: <b>{a['position_pct']}%</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>📍 النطاق الحالي:</b>\n"
+        f"   • الأدنى: {fmt_price(a['lower'])}\n"
+        f"   • الأعلى: {fmt_price(a['upper'])}\n"
+        f"   • العرض: {fmt_price(a['width'])}\n\n"
+        f"<b>💡 الاقتراح: إزاحة النطاق (بنفس العرض)</b>\n"
+        f"   • الأدنى الجديد: <b>{fmt_price(a['suggested_lower'])}</b>\n"
+        f"   • الأعلى الجديد: <b>{fmt_price(a['suggested_upper'])}</b>\n"
+        f"   • الإزاحة: <b>{shift_sign}{fmt_price(a['shift'])}</b> "
+        f"({shift_sign}{a['shift_pct']:.2f}%)\n\n"
+        f"⚙️ <i>لتحديث: عدّل {short(a['symbol'])}_LOWER و {short(a['symbol'])}_UPPER في Render</i>"
     )
 
 
 # ═══════════════════════════════════════════════════════════
-# 17) بناء رسائل الإشارات
+# 17) رسائل الإشارات
 # ═══════════════════════════════════════════════════════════
 def build_signal_message(cross):
     sym = cross["symbol"]; tf = cross["timeframe"]
@@ -1088,44 +1091,30 @@ def build_signal_message(cross):
         dir_lbl = "🟢 محتمل صاعد" if bull else "🔴 محتمل هابط"
     elif at == "live":
         emoji, title = "⚡", "تقاطع مبدئي"
-        type_lbl = "⚡ <b>مبدئي</b> — شمعة جارية"
+        type_lbl = "⚡ <b>مبدئي</b>"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
     else:
         emoji, title = ("🚀" if bull else "🔻"), "تقاطع مؤكد"
-        type_lbl = "✅ <b>مؤكد</b> — شمعة مغلقة"
+        type_lbl = "✅ <b>مؤكد</b>"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
 
-    candle_time = syria_from_ts(cross["candle_ts"])
-    support_block = (
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📌 مؤشرات داعمة:</b>\n"
-        f"• الحجم: <b>{s.get('vol_ratio','?')}×</b> "
-        f"{_stars(s.get('vol_pts',0),30)} <i>({s.get('vol_pts',0)}/30)</i>\n"
-        f"• ADX: <b>{s.get('adx','?')}</b> "
-        f"{_stars(s.get('adx_pts',0),20)} <i>({s.get('adx_pts',0)}/20)</i>\n"
-        f"• فرق EMA: <b>{s.get('gap_pct','?')}%</b> <i>({s.get('gap_pts',0)}/15)</i>\n"
-        f"• MACD: {s.get('macd_label','?')} <i>({s.get('macd_pts',0)}/10)</i>\n"
-        f"• RSI: <b>{s.get('rsi','?')}</b> — {s.get('rsi_label','?')} "
-        f"<i>({s.get('rsi_pts',0)}/10)</i>\n"
-        f"• EMA50: {s.get('htf_label','?')} <i>({s.get('htf_pts',0)}/10)</i>\n"
-        f"• ATR: {s.get('atr_pct','?')}% — {s.get('atr_label','?')} "
-        f"<i>({s.get('atr_pts',0)}/5)</i>\n"
-    )
     return (
         f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"{type_lbl}\n"
         f"📊 <b>{dir_lbl}</b>\n"
-        f"⚡ القوة: <b>{cross['strength']}</b>\n"
         f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
         f"🎯 <b>العلامة: {score}/100 {grade}</b>\n"
-        f"{support_block}"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"• الحجم: {s.get('vol_ratio','?')}× ({s.get('vol_pts',0)}/30)\n"
+        f"• ADX: {s.get('adx','?')} ({s.get('adx_pts',0)}/20)\n"
+        f"• RSI: {s.get('rsi','?')} ({s.get('rsi_pts',0)}/10)\n"
+        f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"• EMA{EMA_FAST}: {fmt_price(cross['ema_fast'])}\n"
         f"• EMA{EMA_SLOW}: {fmt_price(cross['ema_slow'])}\n"
         f"• السعر: {fmt_price(cross['price'])}\n"
-        f"• وقت الشمعة: {candle_time}\n"
         f"• المصدر: {cross.get('exchange','?')} ({MARKET_TYPE})\n"
         f"• التشدد: <b>{STRICTNESS}</b>"
     )
@@ -1141,42 +1130,36 @@ def build_price_alert_msg(a):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>{title}</b>\n"
         f"📈 التغير: <b>{a['change_pct']}%</b>\n"
-        f"🎯 العتبة: {a['threshold']}%\n"
         f"🔔 التنبيه: <b>{a['alert_count']} من {a['max_alerts']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"• الحالي: {fmt_price(a['current_price'])}\n"
-        f"• السابق: {fmt_price(a['prev_price'])}\n"
-        f"• المصدر: {_exchange.primary_name}"
+        f"• السابق: {fmt_price(a['prev_price'])}"
     )
 
 
-def build_range_report(analyses, title="🌅 التقرير الصباحي"):
-    if not analyses:
-        return f"{title}\n📭 لا بيانات كافية."
-    header = (
-        f"{title} — <b>النطاقات المقترحة</b>\n"
-        f"🇸🇾 {syria_now_str()}\n"
-        f"📅 آخر <b>{MORNING_REPORT_LOOKBACK_DAYS}</b> أيام\n"
-        f"📐 ATR× <b>{MORNING_REPORT_ATR_MULTIPLIER}</b> × "
-        f"<b>{RANGE_WIDTH_MULTIPLIER}</b> | سقف: {MORNING_REPORT_MAX_RANGE_PCT}%\n"
-        f"🔌 المصدر: <b>{_exchange.primary_name}</b>\n"
-        f"🚨 المراقبة: {'✅ مفعلة' if RANGE_BREAKOUT_ENABLED else '❌ معطلة'}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-    )
-    body = ""
-    for a in analyses:
-        body += (
-            f"\n💠 <b>{short(a['symbol'])}</b> — الحالي: <b>{fmt_price(a['current'])}</b>\n"
-            f"  📉 أدنى: {fmt_price(a['lowest'])}\n"
-            f"  📈 أعلى: {fmt_price(a['highest'])}\n"
-            f"  🎯 النطاق: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>\n"
-            f"  📊 العرض: {a['range_pct']}% | ATR: {a['atr_pct']}%\n"
-            f"  🔢 شبكات: <b>{a['grids']}</b> | خطوة: {fmt_price(a['grid_step'])} "
-            f"({a['grid_step_pct']}%)\n"
-            f"  ──────────────────\n"
+def build_ranges_report() -> str:
+    if not _last_range:
+        return "📭 لا نطاقات محددة."
+    lines = ["<b>📊 النطاقات المراقبة:</b>\n"]
+    now = _time.time()
+    for sym, r in _last_range.items():
+        age = int((now - r["computed_at"]) / 60)
+        state_icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
+        width = r["upper"] - r["lower"]
+        lines.append(
+            f"{state_icon} <b>{short(sym)}</b>\n"
+            f"   الأدنى: <b>{fmt_price(r['lower'])}</b>\n"
+            f"   الأعلى: <b>{fmt_price(r['upper'])}</b>\n"
+            f"   العرض: {fmt_price(width)} | عمر: {age} د\n"
         )
-    footer = "\n💡 <i>الخطوة ≥ 0.10% لتغطية الرسوم. سيتم إشعارك عند خروج السعر عن أي نطاق.</i>"
-    return header + body + footer
+    lines.append(
+        f"\n🎯 <b>المعايير:</b>\n"
+        f"• تحذير الاقتراب: عند {RANGE_APPROACH_PCT}% من الحد\n"
+        f"• فحص كل: {RANGE_MONITOR_INTERVAL_MIN} دقيقة\n"
+        f"• كولداون اقتراب: {RANGE_APPROACH_COOLDOWN_MIN} د\n"
+        f"• كولداون خروج: {RANGE_BREAKOUT_COOLDOWN_MIN} د"
+    )
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1184,53 +1167,44 @@ def build_range_report(analyses, title="🌅 التقرير الصباحي"):
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds()
-    overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
+    ranges_txt = "\n".join(
+        f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
+        for s, r in _last_range.items()
+    ) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v3.3</b> — بدون Binance\n"
+        f"🔀 <b>Unified Smart Bot v4.2</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔌 الأساسية: <b>{_exchange.primary_name}</b> ({MARKET_TYPE})\n"
+        f"🔌 الأساسية: <b>{_exchange.primary_name}</b>\n"
         f"🔁 البدائل: {', '.join(_exchange.chain_names[1:]) or '—'}\n\n"
-        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n"
-        f"{', '.join(short(s) for s in SIG_SYMBOLS)}\n\n"
-        f"<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n"
-        f"{', '.join(short(s) for s in RNG_SYMBOLS)}\n\n"
-        f"<b>⚡ مفاجئ ({len(SC_SYMBOLS)}):</b>\n"
-        f"{', '.join(short(s) for s in SC_SYMBOLS)}\n\n"
-        f"<b>🎯 STRICTNESS:</b> <b>{STRICTNESS.upper()}</b>\n"
+        f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
+        f"<b>🎯 التشدد:</b> <b>{STRICTNESS.upper()}</b>\n"
         f"• Score ≥ {th['min_score']}\n"
-        f"• Volume ≥ {th['min_vol_ratio']}×\n"
-        f"• ADX ≥ {th['min_adx']}\n"
-        f"• ATR ≤ {th['max_atr_pct']}%\n"
-        f"• VWAP slope ≥ {th['vwap_slope_pct']}%\n"
-        f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n\n"
-        f"<b>📐 عرض النطاق:</b> <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
-        f"<b>🚨 مراقبة الاختراق:</b> "
-        f"{'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌'}\n\n"
-        f"<b>التجاوزات اليدوية:</b>\n{overrides}\n\n"
+        f"• Vol ≥ {th['min_vol_ratio']}×\n"
+        f"• ADX ≥ {th['min_adx']}\n\n"
+        f"<b>🚨 المراقبة:</b>\n"
+        f"• اقتراب عند {RANGE_APPROACH_PCT}% من الحد\n"
+        f"• فحص كل {RANGE_MONITOR_INTERVAL_MIN} دقيقة\n\n"
         f"<b>الأوامر:</b>\n"
+        f"/ranges /checkranges /refresh\n"
         f"/cross /cross5 /cross15 /cross1h\n"
-        f"/checkprice /report /range\n"
-        f"/ranges /clearranges\n"
-        f"/symbols /status /strict /clearcache",
+        f"/checkprice /status /strict /clearcache",
         parse_mode="HTML",
     )
 
 
 async def _run_cross(update, tfs=None):
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة متاحة.")
-        return
+        await update.message.reply_text("❌ لا منصة."); return
     tfs = tfs or TIMEFRAMES
     await update.message.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
     clear_caches()
-
     detectors = []
     if ENABLE_PRE_CROSS:  detectors.append(detect_pre_crossover)
     if ENABLE_LIVE_CROSS: detectors.append(detect_live_crossover)
     if ENABLE_CONFIRMED:  detectors.append(detect_crossover)
 
     found = 0; filtered = 0
-    for sym in SIG_SYMBOLS:
+    for sym in ALL_SYMBOLS:
         for tf in tfs:
             for k in [(sym, tf), (sym, tf, "pre"), (sym, tf, "live")]:
                 _crossover_cache.pop(k, None)
@@ -1251,7 +1225,7 @@ async def _run_cross(update, tfs=None):
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
 
     msg = f"✅ {found} إشارة."
-    if filtered: msg += f"\n🚫 {filtered} محجوبة (STRICTNESS={STRICTNESS})."
+    if filtered: msg += f"\n🚫 {filtered} محجوبة."
     if found == 0 and filtered == 0:
         msg = f"⚪ لا إشارات على {', '.join(tfs)}"
     await update.message.reply_text(msg)
@@ -1268,7 +1242,7 @@ async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لا منصة."); return
     await update.message.reply_text("🔍 فحص ...")
     found = 0
-    for sym in SC_SYMBOLS:
+    for sym in ALL_SYMBOLS:
         a = await detect_sudden_change(sym)
         if a:
             try:
@@ -1281,106 +1255,69 @@ async def cmd_checkprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚪ لا تغيرات مفاجئة.")
 
 
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_ranges_report(), parse_mode="HTML")
+
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يعيد قراءة المتغيرات (بعد إضافة عملات جديدة)"""
+    global _MANUAL_RANGES, ALL_SYMBOLS
+    _MANUAL_RANGES = _detect_ranges_from_env()
+    ALL_SYMBOLS = list(_MANUAL_RANGES.keys()) if _MANUAL_RANGES else ALL_SYMBOLS
+    _last_range.clear()
+    n = _load_manual_ranges()
+    await update.message.reply_text(f"✅ تم تحديث {n} نطاق.")
+
+
+async def cmd_checkranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok():
         await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text(
-        f"🔍 تحليل {len(RNG_SYMBOLS)} رمز على مدى {MORNING_REPORT_LOOKBACK_DAYS} أيام..."
-    )
-    analyses = []
-    for sym in RNG_SYMBOLS:
-        try:
-            a = await analyze_range(sym)
-            if a: analyses.append(a)
-        except Exception as e:
-            log.exception(f"range {sym}: {e}")
+    await update.message.reply_text("🔍 فحص فوري ...")
+    alerts = 0
+    for symbol in list(_last_range.keys()):
+        b = await check_range_breakout(symbol)
+        if b:
+            await update.message.reply_text(build_breakout_msg(b), parse_mode="HTML")
+            _filter_stats["range_breakouts"] += 1
+            alerts += 1
+            continue
+        a = await check_range_approach(symbol)
+        if a:
+            await update.message.reply_text(build_approach_msg(a), parse_mode="HTML")
+            _filter_stats["range_approaches"] += 1
+            alerts += 1
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if not analyses:
-        await update.message.reply_text("⚪ لا بيانات."); return
-    try:
-        await update.message.reply_text(
-            build_range_report(analyses, "📊 تقرير النطاق"),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.error(f"report: {e}")
+    if alerts == 0:
+        await update.message.reply_text("✅ كل الأسعار داخل النطاقات.")
 
 
-async def cmd_ranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _last_range:
-        await update.message.reply_text(
-            "📭 لا نطاقات محفوظة.\nاستخدم /report أو انتظر التقرير الصباحي."
-        )
-        return
-    lines = ["<b>📊 النطاقات المراقبة:</b>\n"]
-    now = _time.time()
-    for sym, r in _last_range.items():
-        age = int((now - r["computed_at"]) / 60)
-        state_icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
-        fresh_icon = "" if _range_is_fresh(r) else " ⏰"
-        lines.append(
-            f"{state_icon} <b>{short(sym)}</b> "
-            f"[{fmt_price(r['lower'])} – {fmt_price(r['upper'])}] "
-            f"<i>({age} د){fresh_icon}</i>"
-        )
-    lines.append(f"\n🚨 الإشعارات: "
-                 f"{'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌ معطلة'}")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_clearranges(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = len(_last_range)
-    _last_range.clear()
-    await update.message.reply_text(f"✅ تم مسح {n} نطاق محفوظ.")
-
-
-async def cmd_symbols(update, context):
+async def cmd_status(update, context):
+    total_filtered = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
     await update.message.reply_text(
-        f"<b>📊 إشارات ({len(SIG_SYMBOLS)}):</b>\n"
-        + "\n".join(f"• {s}" for s in SIG_SYMBOLS)
-        + f"\n\n<b>🌅 نطاق ({len(RNG_SYMBOLS)}):</b>\n"
-        + "\n".join(f"• {s}" for s in RNG_SYMBOLS)
-        + f"\n\n<b>⚡ مفاجئ ({len(SC_SYMBOLS)}):</b>\n"
-        + "\n".join(f"• {s}" for s in SC_SYMBOLS),
+        f"🤖 <b>الحالة</b>\n"
+        f"🔌 {_exchange.primary_name}\n"
+        f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
+        f"🚨 خروج نطاق: <b>{_filter_stats['range_breakouts']}</b>\n"
+        f"⚠️ اقتراب نطاق: <b>{_filter_stats['range_approaches']}</b>\n"
+        f"🚫 محجوبة: {total_filtered}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💾 كاش: {len(_ohlcv_cache)}\n"
+        f"📌 نطاقات: {len(_last_range)}",
         parse_mode="HTML",
     )
 
 
 async def cmd_strict(update, context):
     th = get_thresholds()
-    dbg = th.get("_debug", {})
-    mode_desc = STRICTNESS.upper()
-    overrides = "\n".join(f"  • {k} = {v}" for k, v in STRICTNESS_OVERRIDE.items()) or "  (لا يوجد)"
-
-    debug_block = ""
-    if STRICTNESS == "auto" and dbg:
-        debug_block = (
-            f"\n<b>🧠 تفاصيل Auto:</b>\n"
-            f"• النمط: {dbg.get('regime','?')} (ATR={dbg.get('atr_pct')}%)\n"
-            f"• Score أساسي: {dbg.get('base_score')}\n"
-            f"• ADX Δ: {dbg.get('adx_delta'):+d}\n"
-            f"• Feedback Δ: {dbg.get('feedback_delta'):+d}\n"
-            f"• نسبة القبول: {dbg.get('pass_ratio')} "
-            f"({dbg.get('sample_n')} عينة)\n"
-        )
-
     await update.message.reply_text(
-        f"🎯 <b>التشدد:</b> <b>{mode_desc}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>العتبات الفعالة:</b>\n"
-        f"• Score ≥ <b>{th['min_score']}</b>\n"
-        f"• Score 15m ≥ <b>{th.get('score_15m_override', th['min_score'])}</b>\n"
-        f"• Volume ≥ <b>{th['min_vol_ratio']}×</b>\n"
-        f"• ADX ≥ <b>{th['min_adx']}</b>\n"
-        f"• ATR ≤ <b>{th['max_atr_pct']}%</b>\n"
-        f"• VWAP slope ≥ <b>{th['vwap_slope_pct']}%</b>\n"
-        f"• فرق EMA ≥ <b>{th['min_ema_gap']}%</b>\n"
-        f"• RSI LONG: {th['rsi_long']}\n"
-        f"• RSI SHORT: {th['rsi_short']}\n"
-        f"• HTF block: {'✅' if th['block_against_htf'] else '❌'}\n"
-        f"{debug_block}\n"
-        f"<b>📐 عرض النطاق:</b> <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
-        f"<b>التجاوزات اليدوية:</b>\n{overrides}",
+        f"🎯 <b>التشدد:</b> <b>{STRICTNESS.upper()}</b>\n"
+        f"• Score ≥ {th['min_score']}\n"
+        f"• Vol ≥ {th['min_vol_ratio']}×\n"
+        f"• ADX ≥ {th['min_adx']}\n"
+        f"• ATR ≤ {th['max_atr_pct']}%\n"
+        f"• VWAP slope ≥ {th['vwap_slope_pct']}%",
         parse_mode="HTML",
     )
 
@@ -1388,42 +1325,7 @@ async def cmd_strict(update, context):
 async def cmd_clearcache(update, context):
     clear_caches()
     _smart.reset_feedback()
-    await update.message.reply_text(
-        "✅ تم تفريغ:\n"
-        "• كاش الشموع\n"
-        "• كاش التقاطعات\n"
-        "• إشارات التعارض\n"
-        "• سجل التغذية الراجعة (Auto)\n"
-        "⚠️ النطاقات المحفوظة لم تُمس (استخدم /clearranges)."
-    )
-
-
-async def cmd_status(update, context):
-    total_filtered = sum(_filter_stats.values()) - _filter_stats["sent"] - _filter_stats["range_breakouts"]
-    await update.message.reply_text(
-        f"🤖 <b>الحالة</b>\n"
-        f"🔌 {_exchange.primary_name} | بدائل: {len(_exchange.chain_names)-1}\n"
-        f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
-        f"📐 Width Multiplier: <b>{RANGE_WIDTH_MULTIPLIER}×</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 مُرسَل: <b>{_filter_stats['sent']}</b>\n"
-        f"🚨 اختراق نطاق: <b>{_filter_stats['range_breakouts']}</b>\n"
-        f"🚫 محجوب:\n"
-        f"  • Score: {_filter_stats['filtered_score']}\n"
-        f"  • Volume: {_filter_stats['filtered_vol']}\n"
-        f"  • ADX: {_filter_stats['filtered_adx']}\n"
-        f"  • ATR: {_filter_stats['filtered_atr']}\n"
-        f"  • HTF: {_filter_stats['filtered_htf']}\n"
-        f"  • VWAP: {_filter_stats['filtered_vwap']}\n"
-        f"  • Conflict: {_filter_stats['filtered_conflict']}\n"
-        f"  • 15m: {_filter_stats['filtered_15m']}\n"
-        f"الإجمالي: {total_filtered}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💾 كاش: {len(_ohlcv_cache)} OHLCV\n"
-        f"📌 نطاقات: {len(_last_range)}\n"
-        f"🧠 سجل Auto: {len(_smart.history)} عينة",
-        parse_mode="HTML",
-    )
+    await update.message.reply_text("✅ تم تفريغ الكاش.")
 
 
 async def error_handler(update, context):
@@ -1444,20 +1346,18 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
     if ENABLE_CONFIRMED:  detectors.append(detect_crossover)
 
     total = 0
-    for sym in SIG_SYMBOLS:
+    for sym in ALL_SYMBOLS:
         for tf in TIMEFRAMES:
             for det in detectors:
                 try:
                     cross = await det(sym, tf)
                     if not cross: continue
                     htf = await get_htf_trend(sym)
-                    passed, reason, cat = await passes_filter(cross, htf)
+                    passed, _r, cat = await passes_filter(cross, htf)
                     if not passed:
                         key = f"filtered_{cat}"
                         if key in _filter_stats:
                             _filter_stats[key] += 1
-                        else:
-                            _filter_stats["filtered_other"] += 1
                         continue
                     if CHAT_ID:
                         try:
@@ -1476,13 +1376,13 @@ async def crossover_job(context: ContextTypes.DEFAULT_TYPE):
                     log.exception(f"job {sym} {tf}: {e}")
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if total:
-        log.info(f"📤 {total} إشارة (STRICTNESS={STRICTNESS})")
+        log.info(f"📤 {total} إشارة")
 
 
 async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
     if not _exchange.ok(): return
     total = 0
-    for sym in SC_SYMBOLS:
+    for sym in ALL_SYMBOLS:
         try:
             a = await detect_sudden_change(sym)
             if a and CHAT_ID:
@@ -1500,50 +1400,35 @@ async def price_alert_job(context: ContextTypes.DEFAULT_TYPE):
         log.info(f"📤 {total} تغير مفاجئ")
 
 
-async def range_breakout_job(context: ContextTypes.DEFAULT_TYPE):
-    if not RANGE_BREAKOUT_ENABLED or not _exchange.ok(): return
-    if not _last_range: return
-
+async def range_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    if not _exchange.ok() or not _last_range: return
     total = 0
     for symbol in list(_last_range.keys()):
         try:
             b = await check_range_breakout(symbol)
             if b and CHAT_ID:
                 await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=build_range_breakout_msg(b),
-                    parse_mode="HTML",
+                    chat_id=CHAT_ID, text=build_breakout_msg(b), parse_mode="HTML"
                 )
-                total += 1
                 _filter_stats["range_breakouts"] += 1
-                log.info(f"🚨 Breakout: {symbol} {b['direction']} "
-                         f"{b['deviation_pct']:.3f}%")
+                total += 1
+                log.info(f"🚨 Breakout: {symbol} {b['direction']}")
+                continue
+
+            a = await check_range_approach(symbol)
+            if a and CHAT_ID:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID, text=build_approach_msg(a), parse_mode="HTML"
+                )
+                _filter_stats["range_approaches"] += 1
+                total += 1
+                log.info(f"⚠️ Approach: {symbol} {a['side']} "
+                         f"({a['distance_pct']}%)")
         except Exception as e:
-            log.exception(f"range_breakout {symbol}: {e}")
+            log.exception(f"range_monitor {symbol}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if total:
-        log.info(f"📤 {total} اختراق نطاق")
-
-
-async def morning_report_job(context: ContextTypes.DEFAULT_TYPE):
-    if not MORNING_REPORT_ENABLED or not _exchange.ok(): return
-    analyses = []
-    for sym in RNG_SYMBOLS:
-        try:
-            a = await analyze_range(sym)
-            if a: analyses.append(a)
-        except Exception as e:
-            log.exception(f"morning {sym}: {e}")
-        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if not analyses or not CHAT_ID: return
-    try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=build_range_report(analyses, "🌅 التقرير الصباحي"),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.error(f"send morning: {e}")
+        log.info(f"📤 {total} إشعار نطاق")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1554,7 +1439,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v3.3 (No Binance)")
+        self.wfile.write(b"OK - Unified Smart Bot v4.2")
 
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
@@ -1570,10 +1455,6 @@ def run_health():
 # ═══════════════════════════════════════════════════════════
 # 21) Main
 # ═══════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════
-# 21) Main
-# ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ TELEGRAM_REPORT_BOT_TOKEN و TELEGRAM_REPORT_CHAT_ID مطلوبان")
@@ -1581,27 +1462,18 @@ def main():
 
     threading.Thread(target=run_health, daemon=True).start()
 
-    th = get_thresholds()
-    print("🔀 Unified Smart Bot v3.3 (No Binance)")
+    # تحميل النطاقات اليدوية
+    n = _load_manual_ranges()
+    print(f"📌 تم تحميل {n} نطاق يدوي")
+
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
-    print(f"📊 إشارات: {len(SIG_SYMBOLS)} | نطاق: {len(RNG_SYMBOLS)} | مفاجئ: {len(SC_SYMBOLS)}")
-    print(f"📏 EMA {EMA_FAST}/{EMA_SLOW} | فريمات: {TIMEFRAMES}")
-    print(f"🎯 STRICTNESS = {STRICTNESS}")
-    print(f"   • Score ≥ {th['min_score']} | Vol ≥ {th['min_vol_ratio']}× | "
-          f"ADX ≥ {th['min_adx']} | ATR ≤ {th['max_atr_pct']}%")
-    print(f"📐 Range Width Multiplier = {RANGE_WIDTH_MULTIPLIER}")
-    print(f"🚨 Range Breakout: {'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌'}")
+    print(f"📊 رموز: {ALL_SYMBOLS}")
 
-    # ═══════════════════════════════════════════════════════
-    # Application + HTTPXRequest with timeouts (PTB v21+)
-    # ═══════════════════════════════════════════════════════
+    # PTB v21+ — HTTPXRequest
     from telegram.request import HTTPXRequest
-
     request = HTTPXRequest(
-        read_timeout=30.0,
-        write_timeout=30.0,
-        connect_timeout=30.0,
-        pool_timeout=30.0,
+        read_timeout=30.0, write_timeout=30.0,
+        connect_timeout=30.0, pool_timeout=30.0,
     )
 
     app = (
@@ -1612,75 +1484,36 @@ def main():
         .build()
     )
 
-    # ═══════════════════════════════════════════════════════
-    # Command Handlers
-    # ═══════════════════════════════════════════════════════
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
     app.add_handler(CommandHandler("cross1h", cmd_cross1h))
     app.add_handler(CommandHandler("checkprice", cmd_checkprice))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("range", cmd_report))
     app.add_handler(CommandHandler("ranges", cmd_ranges))
-    app.add_handler(CommandHandler("clearranges", cmd_clearranges))
-    app.add_handler(CommandHandler("symbols", cmd_symbols))
+    app.add_handler(CommandHandler("checkranges", cmd_checkranges))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_error_handler(error_handler)
 
-    # ═══════════════════════════════════════════════════════
-    # Job Queue
-    # ═══════════════════════════════════════════════════════
     if app.job_queue:
         app.job_queue.run_repeating(
-            crossover_job,
-            interval=JOB_INTERVAL_MIN * 60,
-            first=15,
-            name="cross",
+            crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross",
         )
         app.job_queue.run_repeating(
-            price_alert_job,
-            interval=PRICE_ALERT_INTERVAL_MIN * 60,
-            first=20,
-            name="price",
+            price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price",
         )
-
-        if RANGE_BREAKOUT_ENABLED:
+        if RANGE_BREAKOUT_ENABLED or RANGE_APPROACH_ENABLED:
             app.job_queue.run_repeating(
-                range_breakout_job,
-                interval=RANGE_BREAKOUT_INTERVAL_MIN * 60,
+                range_monitor_job,
+                interval=RANGE_MONITOR_INTERVAL_MIN * 60,
                 first=30,
-                name="range_breakout",
+                name="range_monitor",
             )
-            print(f"🚨 Range breakout: كل {RANGE_BREAKOUT_INTERVAL_MIN} دقيقة")
+            print(f"🚨 Range monitor: كل {RANGE_MONITOR_INTERVAL_MIN} دقيقة")
 
-        if MORNING_REPORT_ENABLED:
-            from datetime import time as dt_time
-            now_syr = datetime.now(SYRIA_TZ)
-            target_syr = now_syr.replace(
-                hour=MORNING_REPORT_HOUR,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-            target_utc = target_syr.astimezone(timezone.utc)
-            app.job_queue.run_daily(
-                morning_report_job,
-                time=dt_time(
-                    hour=target_utc.hour,
-                    minute=target_utc.minute,
-                    tzinfo=timezone.utc,
-                ),
-                name="morning",
-            )
-            print(f"🌅 التقرير الصباحي: {MORNING_REPORT_HOUR}:00 (سوريا)")
-
-    # ═══════════════════════════════════════════════════════
-    # Start Polling
-    # ═══════════════════════════════════════════════════════
     print("✅ جاهز — بدء polling")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
