@@ -1570,6 +1570,10 @@ def run_health():
 # ═══════════════════════════════════════════════════════════
 # 21) Main
 # ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+# 21) Main
+# ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ TELEGRAM_REPORT_BOT_TOKEN و TELEGRAM_REPORT_CHAT_ID مطلوبان")
@@ -1588,8 +1592,29 @@ def main():
     print(f"📐 Range Width Multiplier = {RANGE_WIDTH_MULTIPLIER}")
     print(f"🚨 Range Breakout: {'✅ كل ' + str(RANGE_BREAKOUT_INTERVAL_MIN) + ' د' if RANGE_BREAKOUT_ENABLED else '❌'}")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # ═══════════════════════════════════════════════════════
+    # Application + HTTPXRequest with timeouts (PTB v21+)
+    # ═══════════════════════════════════════════════════════
+    from telegram.request import HTTPXRequest
 
+    request = HTTPXRequest(
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0,
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(request)
+        .build()
+    )
+
+    # ═══════════════════════════════════════════════════════
+    # Command Handlers
+    # ═══════════════════════════════════════════════════════
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
@@ -1606,13 +1631,23 @@ def main():
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_error_handler(error_handler)
 
+    # ═══════════════════════════════════════════════════════
+    # Job Queue
+    # ═══════════════════════════════════════════════════════
     if app.job_queue:
         app.job_queue.run_repeating(
-            crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross",
+            crossover_job,
+            interval=JOB_INTERVAL_MIN * 60,
+            first=15,
+            name="cross",
         )
         app.job_queue.run_repeating(
-            price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price",
+            price_alert_job,
+            interval=PRICE_ALERT_INTERVAL_MIN * 60,
+            first=20,
+            name="price",
         )
+
         if RANGE_BREAKOUT_ENABLED:
             app.job_queue.run_repeating(
                 range_breakout_job,
@@ -1626,23 +1661,31 @@ def main():
             from datetime import time as dt_time
             now_syr = datetime.now(SYRIA_TZ)
             target_syr = now_syr.replace(
-                hour=MORNING_REPORT_HOUR, minute=0, second=0, microsecond=0
+                hour=MORNING_REPORT_HOUR,
+                minute=0,
+                second=0,
+                microsecond=0,
             )
             target_utc = target_syr.astimezone(timezone.utc)
             app.job_queue.run_daily(
                 morning_report_job,
-                time=dt_time(hour=target_utc.hour, minute=target_utc.minute,
-                             tzinfo=timezone.utc),
+                time=dt_time(
+                    hour=target_utc.hour,
+                    minute=target_utc.minute,
+                    tzinfo=timezone.utc,
+                ),
                 name="morning",
             )
+            print(f"🌅 التقرير الصباحي: {MORNING_REPORT_HOUR}:00 (سوريا)")
 
-    print("✅ جاهز")
+    # ═══════════════════════════════════════════════════════
+    # Start Polling
+    # ═══════════════════════════════════════════════════════
+    print("✅ جاهز — بدء polling")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
         bootstrap_retries=5,
-        read_timeout=30, write_timeout=30,
-        connect_timeout=30, pool_timeout=30,
     )
 
 
