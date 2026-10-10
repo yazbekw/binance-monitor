@@ -1,10 +1,9 @@
-python-binance==1.0.28
-python-dotenv==1.0.1
-pandas==2.1.4
-numpy==1.26.3
-Flask==3.0.0
-requests==2.31.0
-supabase==2.10.0
+# ═══════════════════════════════════════════════════════════
+# Unified Smart Bot v3.2 — Render Ready
+# ═══════════════════════════════════════════════════════════
+python-telegram-bot>=21.0.1
+ccxt>=4.3.0
+pandas>=2.1.4
+numpy>=1.26.0
+python-dotenv>=1.0.1
 tzdata>=2024.1
-ccxt>=4.2.0
-
