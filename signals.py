@@ -1,17 +1,19 @@
 """
-Unified Smart Bot v6.2 — Fixed SL + Safe Market + Session VWAP
-==============================================================
-  ✓ SL/TP مع حد أدنى حسب الإطار (إصلاح SL الضيق)
-  ✓ classify_market_safe مع HTF fallback (إصلاح ❓)
+Unified Smart Bot v6.3 — Signal Follow-up + Fixed Filters
+==========================================================
+  🆕 رسائل متابعة للإشارات (TP1/TP2/TP3/SL/Expired)
+  🆕 منع دايفرجنس ضد الترند بدون تأكيد MTF
+  🆕 إصلاح cache في SmartStrictness
+  ✓ SL/TP مع حد أدنى حسب الإطار
+  ✓ classify_market_safe مع HTF fallback
   ✓ VWAP بنظام الجلسة (day/week)
-  ✓ SmartStrictness مُعاد هيكلته
   ✓ 4 كواشف: EMA + RSI Div + BB Squeeze + S/R
   ✓ Multi-TF + Session Adjustments
-  ✓ 🌅 تقرير صباحي + /perf لتحليل الأداء
+  ✓ 🌅 تقرير صباحي 10:00 + /perf
 """
 import os, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone, timedelta, time as dt_time
+from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 from collections import deque, defaultdict
 
@@ -103,9 +105,16 @@ SWING_MAX_COUNT = 4
 
 SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
-
-# 🆕 الحد الأدنى لـ SL% حسب الإطار
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
+
+# 🆕 إعدادات المتابعة
+FOLLOWUP_ENABLED = True
+FOLLOWUP_ON_TP1 = True
+FOLLOWUP_ON_TP2 = True
+FOLLOWUP_ON_TP3 = True
+FOLLOWUP_ON_SL = True
+FOLLOWUP_ON_EXPIRE = True      # ⏰ أرسل للانتهاء
+FOLLOWUP_THROTTLE_SEC = 120    # لا رسالتين متتاليتين خلال دقيقتين
 
 
 # ═══════════════════════════════════════════════════════════
@@ -225,7 +234,7 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) محرك التشدد الذكي (مُعاد هيكلته)
+# 4) محرك التشدد الذكي (cache مُصلح)
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -236,7 +245,6 @@ STATIC_PROFILES = {
                  "block_against_htf": True, "score_15m_override": 75},
 }
 
-# 🆕 5m أصبح 1.20
 TF_PROFILES = {
     "5m":  {"score_mult": 1.20, "vol_mult": 1.25, "atr_max": 0.50, "min_hold_min": 5},
     "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 15},
@@ -254,16 +262,17 @@ SESSIONS = [
 
 
 class SmartStrictness:
-    """محرك تشدد يتعلّم من نتائج فعلية"""
     def __init__(self):
         self.history = deque(maxlen=200)
         self.results = deque(maxlen=200)
-        # 🆕 إحصائيات لكل مصدر
         self.source_stats = defaultdict(lambda: {"wins": 0, "losses": 0,
+                                                  "expired": 0,
                                                   "sent": 0, "filtered": 0})
         self._lock = threading.Lock()
         self._cached_profile = None
         self._cached_ts = 0.0
+        self._cached_atr = None
+        self._cached_adx = None
         self._cache_ttl = 120.0
 
     def record(self, passed, score, source="unknown"):
@@ -276,22 +285,29 @@ class SmartStrictness:
 
     def record_result(self, result, direction, source="unknown"):
         win = result.startswith("win")
+        expired = result == "expired"
         with self._lock:
             self.results.append({"win": win, "result": result,
                                  "direction": direction, "ts": _time.time(),
-                                 "source": source})
+                                 "source": source, "expired": expired})
             if win:
                 self.source_stats[source]["wins"] += 1
+            elif expired:
+                self.source_stats[source]["expired"] += 1
             else:
                 self.source_stats[source]["losses"] += 1
 
     def _feedback(self):
+        """يعتمد على النتائج الفعلية — Expired محايد"""
         with self._lock:
             results = list(self.results)[-50:]
             recent = list(self.history)[-50:]
-        if len(results) >= 15:
-            wins = sum(1 for r in results if r["win"])
-            ratio = wins / len(results); n = len(results)
+        # نُصفّي expired من النتائج (محايدة)
+        non_expired = [r for r in results if not r.get("expired")]
+        if len(non_expired) >= 15:
+            wins = sum(1 for r in non_expired if r["win"])
+            ratio = wins / len(non_expired)
+            n = len(non_expired)
         else:
             n = len(recent)
             if n < 20: return 0, None, 0
@@ -305,8 +321,14 @@ class SmartStrictness:
 
     def compute(self, atr_pct=None, adx=None):
         now = _time.time()
-        if self._cached_profile and (now - self._cached_ts) < self._cache_ttl:
+        # 🆕 cache فقط إذا كانت القيم متقاربة
+        if (self._cached_profile
+            and (now - self._cached_ts) < self._cache_ttl
+            and self._cached_atr is not None
+            and abs(self._cached_atr - (atr_pct or 0)) < 0.10
+            and abs(self._cached_adx - (adx or 0)) < 3.0):
             return self._cached_profile
+        
         if atr_pct is None or atr_pct <= 0: atr_pct = 0.5
         if atr_pct < 0.15:   base = 50
         elif atr_pct < 0.30: base = 55
@@ -329,17 +351,25 @@ class SmartStrictness:
                 "block_against_htf": final >= 55,
                 "score_15m_override": min(90, final + 10),
                 "_debug": {"base": base, "adx_delta": adx_delta,
-                           "fb_delta": fb_delta, "pass_ratio": pass_ratio}}
+                           "fb_delta": fb_delta, "pass_ratio": pass_ratio,
+                           "atr": atr_pct, "adx": adx}}
         self._cached_profile = prof
         self._cached_ts = now
+        self._cached_atr = atr_pct
+        self._cached_adx = adx
         return prof
 
     def stats(self):
         with self._lock:
             n = len(self.results)
-            if n == 0: return {"n": 0, "wr": 0, "wins": 0, "losses": 0}
+            if n == 0: return {"n": 0, "wr": 0, "wins": 0, "losses": 0, "expired": 0}
             wins = sum(1 for r in self.results if r["win"])
-        return {"n": n, "wr": round(wins/n*100, 1), "wins": wins, "losses": n - wins}
+            expired = sum(1 for r in self.results if r.get("expired"))
+            losses = n - wins - expired
+        # WR يعتمد على decisive فقط
+        decisive = wins + losses
+        wr = round(wins/decisive*100, 1) if decisive > 0 else 0
+        return {"n": n, "wr": wr, "wins": wins, "losses": losses, "expired": expired}
 
     def source_report(self):
         with self._lock:
@@ -352,6 +382,8 @@ class SmartStrictness:
             self.source_stats.clear()
         self._cached_profile = None
         self._cached_ts = 0.0
+        self._cached_atr = None
+        self._cached_adx = None
 
 
 _smart = SmartStrictness()
@@ -459,7 +491,6 @@ def calc_macd(s, f=12, sl=26, sig=9):
 
 
 def calc_vwap_session(df, session="day"):
-    """🆕 VWAP من بداية الجلسة (day/week)"""
     if df.empty: return df["c"]
     try:
         ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -542,11 +573,9 @@ def classify_market(df, curr_idx=-2):
 
 
 async def classify_market_safe(symbol, tf, df):
-    """🆕 يستخدم الإطار الحالي، وإن لم يكفِ يستخدم 15m"""
     if df is not None and len(df) >= 60:
         m = classify_market(df)
         if m != "UNKNOWN": return m
-    # fallback: نجلب 15m
     try:
         data = await fetch_ohlcv_cached(symbol, "15m", 80)
         if data and len(data) >= 60:
@@ -558,24 +587,19 @@ async def classify_market_safe(symbol, tf, df):
 
 
 def compute_levels(df, direction, curr_idx=-2, tf="15m"):
-    """🆕 مع فرض حد أدنى للـ SL حسب الإطار"""
     try:
         price = float(df["c"].iloc[curr_idx])
         atr = float(calc_atr(df).iloc[curr_idx])
         ema_slow = float(calc_ema(df["c"], EMA_SLOW).iloc[curr_idx])
-        
         min_sl_pct = MIN_SL_PCT.get(tf, 0.50)
-        
         lookback = min(20, len(df) + curr_idx - 1)
         if lookback < 2: return None
         recent_high = float(df["h"].iloc[curr_idx-lookback:curr_idx].max())
         recent_low = float(df["l"].iloc[curr_idx-lookback:curr_idx].min())
-        
         if direction == "bullish":
             sl_atr = price - atr * 1.5
             sl_struct = min(recent_low, ema_slow) * 0.998
             stop_loss = max(sl_atr, sl_struct)
-            # 🆕 فرض الحد الأدنى
             min_dist = price * (min_sl_pct / 100)
             if (price - stop_loss) < min_dist:
                 stop_loss = price - min_dist
@@ -590,12 +614,9 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
                 stop_loss = price + min_dist
             risk = stop_loss - price
             tp1, tp2, tp3 = price - risk, price - risk*2, price - risk*3
-        
         risk_pct = abs(price - stop_loss) / price * 100 if price else 0
-        # قبول النطاق المعقول
         if risk_pct < min_sl_pct * 0.9 or risk_pct > 6.0:
             return None
-        
         return {"entry": price, "stop_loss": stop_loss, "sl_pct": round(risk_pct, 2),
                 "tp1": tp1, "tp2": tp2, "tp3": tp3, "atr": atr}
     except Exception as e:
@@ -621,10 +642,11 @@ _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0, "filtered_adx": 0,
     "filtered_atr": 0, "filtered_htf": 0, "filtered_vwap": 0,
     "filtered_conflict": 0, "filtered_range": 0, "filtered_mtf": 0,
-    "filtered_session": 0, "filtered_other": 0,
+    "filtered_trend": 0, "filtered_other": 0,
     "range_breakouts": 0, "range_approaches": 0,
     "range_6pct_reports": 0, "morning_reports": 0, "signals_tracked": 0,
     "signals_divergence": 0, "signals_bb": 0, "signals_sr": 0,
+    "followups_sent": 0,
 }
 
 
@@ -689,7 +711,6 @@ async def get_mtf_alignment(symbol, direction):
 
 
 def check_vwap_slope(df, direction, thresholds, tf="15m"):
-    """🆕 VWAP بنظام الجلسة"""
     min_pct = thresholds.get("vwap_slope_pct", 0.05)
     if len(df) < VWAP_SLOPE_LOOKBACK + 1: return True, 0.0
     session = "week" if tf == "1h" else "day"
@@ -780,15 +801,14 @@ async def passes_filter(cross, htf_trend=None):
     if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
 
     df = cross.get("_df")
-    # 🆕 السوق محسوب مسبقاً في _make_cross
     market = cross.get("market") or "UNKNOWN"
     if market == "UNKNOWN":
         market = await classify_market_safe(cross["symbol"], tf, df)
         cross["market"] = market
 
-    # MTF alignment
     mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], cross["direction"])
     cross["mtf"] = mtf_desc
+    cross["mtf_bonus"] = mtf_bonus
     score += mtf_bonus
     s["score"] = score
 
@@ -804,6 +824,14 @@ async def passes_filter(cross, htf_trend=None):
         passed, reason, cat = False, f"ADX {adx} < {th['min_adx']}", "adx"
     elif atr > th["max_atr_pct"]:
         passed, reason, cat = False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
+    # 🆕 منع الدايفرجنس ضد الترند بدون MTF ≥ 2/3
+    elif cross.get("source") == "rsi_div":
+        d = cross["direction"]
+        if market == "TREND_DOWN" and d == "bullish" and mtf_bonus < 3:
+            passed, reason, cat = False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+        elif market == "TREND_UP" and d == "bearish" and mtf_bonus < 3:
+            passed, reason, cat = False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+    # منع تقاطعات EMA في الرينج
     elif market == "RANGE" and cross.get("source") == "ema" \
          and cross.get("alert_type") == "confirmed":
         passed, reason, cat = False, "سوق عرضي — تقاطع وهمي", "range"
@@ -826,7 +854,7 @@ async def passes_filter(cross, htf_trend=None):
 
 
 # ═══════════════════════════════════════════════════════════
-# 12) كواشف الإشارات — EMA
+# 12) كواشف الإشارات
 # ═══════════════════════════════════════════════════════════
 async def _df_for(symbol, tf, extra=60):
     data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
@@ -836,7 +864,6 @@ async def _df_for(symbol, tf, extra=60):
 
 async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
                      source="ema", extra=None):
-    """🆕 مع market محسوب مسبقاً + tf لـ compute_levels"""
     cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
     cts = int(df["ts"].iloc[curr])
     levels = compute_levels(df, direction, curr, tf=tf)
@@ -895,7 +922,6 @@ _TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "1d": 86
 
 async def detect_pre_crossover(symbol, tf):
     if not ENABLE_PRE_CROSS: return None
-    # 🆕 extra=60 بدل 10 — للحصول على بيانات كافية
     df = await _df_for(symbol, tf, extra=60)
     if df is None: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
@@ -921,9 +947,6 @@ async def detect_pre_crossover(symbol, tf):
     return await _make_cross(symbol, tf, df, d, "pre", "🔔 تقارب وشيك", curr)
 
 
-# ═══════════════════════════════════════════════════════════
-# 12b) RSI Divergence
-# ═══════════════════════════════════════════════════════════
 async def detect_rsi_divergence(symbol, tf):
     if not ENABLE_RSI_DIVERGENCE: return None
     df = await _df_for(symbol, tf, extra=RSI_DIV_LOOKBACK + 10)
@@ -963,9 +986,6 @@ async def detect_rsi_divergence(symbol, tf):
     return cross
 
 
-# ═══════════════════════════════════════════════════════════
-# 12c) BB Squeeze
-# ═══════════════════════════════════════════════════════════
 async def detect_bb_squeeze_breakout(symbol, tf):
     if not ENABLE_BB_SQUEEZE: return None
     df = await _df_for(symbol, tf, extra=80)
@@ -994,9 +1014,6 @@ async def detect_bb_squeeze_breakout(symbol, tf):
     return cross
 
 
-# ═══════════════════════════════════════════════════════════
-# 12d) S/R Breakout
-# ═══════════════════════════════════════════════════════════
 async def detect_sr_breakout(symbol, tf):
     if not ENABLE_SR_BREAKOUT: return None
     df = await _df_for(symbol, tf, extra=SR_BREAKOUT_LOOKBACK + 10)
@@ -1317,7 +1334,6 @@ def build_signal_message(cross):
         emoji, title = ("🚀" if bull else "🔻"), "إشارة مؤكدة"
         type_lbl = "✅ <b>مؤكد</b>"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
-    
     market_lbl = {"TREND_UP": "📈 ترند صاعد", "TREND_DOWN": "📉 ترند هابط",
                   "RANGE": "↔️ عرضي", "VOLATILE": "🌊 متقلب",
                   "UNKNOWN": "❓"}.get(market, market)
@@ -1329,8 +1345,7 @@ def build_signal_message(cross):
         f"{type_lbl} | {_source_label(source)}\n"
         f"📊 <b>{dir_lbl}</b>\n"
         f"🏛️ السوق: <b>{market_lbl}</b>\n"
-        f"🔗 MTF: <b>{mtf}</b>\n"
-    )
+        f"🔗 MTF: <b>{mtf}</b>\n")
     if source == "rsi_div" and cross.get("div_info"):
         di = cross["div_info"]
         msg += (
@@ -1343,7 +1358,6 @@ def build_signal_message(cross):
     elif source == "sr_breakout" and cross.get("sr_info"):
         si = cross["sr_info"]
         msg += f"🎯 المستوى المكسور: <b>{fmt_price(si['level'])}</b>\n"
-    
     msg += (
         f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
         f"🎯 <b>العلامة: {score}/100 {grade}</b>\n"
@@ -1351,8 +1365,7 @@ def build_signal_message(cross):
         f"• الحجم: {s.get('vol_ratio','?')}× ({s.get('vol_pts',0)}/30)\n"
         f"• ADX: {s.get('adx','?')} ({s.get('adx_pts',0)}/20)\n"
         f"• RSI: {s.get('rsi','?')} ({s.get('rsi_pts',0)}/10)\n"
-        f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n"
-    )
+        f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n")
     if levels:
         msg += (
             f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1361,13 +1374,11 @@ def build_signal_message(cross):
             f"• وقف الخسارة: <b>{fmt_price(levels['stop_loss'])}</b> (-{levels['sl_pct']}%)\n"
             f"• هدف 1 (1:1): {fmt_price(levels['tp1'])}\n"
             f"• هدف 2 (1:2): {fmt_price(levels['tp2'])}\n"
-            f"• هدف 3 (1:3): {fmt_price(levels['tp3'])}\n"
-        )
+            f"• هدف 3 (1:3): {fmt_price(levels['tp3'])}\n")
     msg += (
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"• السعر: {fmt_price(cross['price'])}\n"
-        f"• المصدر: {cross.get('exchange','?')} ({MARKET_TYPE})"
-    )
+        f"• المصدر: {cross.get('exchange','?')} ({MARKET_TYPE})")
     return msg
 
 
@@ -1402,7 +1413,91 @@ def build_ranges_report():
 
 
 # ═══════════════════════════════════════════════════════════
-# 18b) تتبّع الإشارات
+# 18b) 🆕 رسائل المتابعة
+# ═══════════════════════════════════════════════════════════
+def build_followup_msg(sig, result, price, age_min):
+    cross = sig["cross"]
+    sym = short(cross["symbol"]); tf = cross["timeframe"]
+    bull = sig["direction"] == "bullish"
+    entry = sig["levels"]["entry"]
+    lv = sig["levels"]
+    pnl_pct = ((price - entry) / entry * 100) * (1 if bull else -1)
+
+    if result == "win_tp3":
+        emoji, title, color = "🌟", "هدف 3 مُحقَّق! (1:3)", "🟢"
+    elif result == "win_tp2":
+        emoji, title, color = "✅", "هدف 2 مُحقَّق! (1:2)", "🟢"
+    elif result == "win_tp1":
+        emoji, title, color = "🎯", "هدف 1 مُحقَّق! (1:1)", "🟢"
+    elif result == "loss_sl":
+        emoji, title, color = "❌", "وقف الخسارة", "🔴"
+    elif result == "expired":
+        emoji, title, color = "⏰", "انتهت الصلاحية", "🟡"
+    else:
+        return None
+
+    msg = (
+        f"{emoji} <b>{title}</b>\n"
+        f"📌 متابعة: {sym} [{tf}]\n"
+        f"🇸🇾 {syria_now_str()}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"{color} {'🟢 صاعد' if bull else '🔴 هابط'} | "
+        f"{_source_label(cross.get('source','ema'))}\n"
+        f"💰 الدخول: <b>{fmt_price(entry)}</b>\n"
+        f"💵 الحالي: <b>{fmt_price(price)}</b>\n"
+        f"📊 الربح/الخسارة: <b>{pnl_pct:+.2f}%</b>\n"
+        f"⏱️ المدة: <b>{int(age_min)} دقيقة</b>\n")
+
+    if result.startswith("win"):
+        msg += (
+            f"\n🎯 <b>تقدم الأهداف:</b>\n"
+            f"• TP1 ({fmt_price(lv['tp1'])}): "
+            f"{'✅' if result in ('win_tp1','win_tp2','win_tp3') else '⏳'}\n"
+            f"• TP2 ({fmt_price(lv['tp2'])}): "
+            f"{'✅' if result in ('win_tp2','win_tp3') else '⏳'}\n"
+            f"• TP3 ({fmt_price(lv['tp3'])}): "
+            f"{'✅' if result == 'win_tp3' else '⏳'}\n")
+
+    if result == "win_tp1":
+        msg += "\n💡 <i>يُنصح بنقل SL إلى نقطة الدخول</i>"
+    elif result == "win_tp2":
+        msg += "\n💡 <i>يُنصح بنقل SL إلى TP1</i>"
+    elif result == "loss_sl":
+        msg += f"\n💡 <i>قد يكون الوقت غير مناسب — راجع /perf</i>"
+    elif result == "expired":
+        msg += f"\n💡 <i>لم يحرّك السعر بشكل كافٍ خلال {SIGNAL_TRACK_MAX_MIN} دقيقة</i>"
+    return msg
+
+
+async def send_followup(bot, sig, result, price, age_min):
+    """🆕 يُرسل متابعة مع throttle"""
+    if not FOLLOWUP_ENABLED: return
+    # فحص الأعلام
+    if result == "win_tp1" and not FOLLOWUP_ON_TP1: return
+    if result == "win_tp2" and not FOLLOWUP_ON_TP2: return
+    if result == "win_tp3" and not FOLLOWUP_ON_TP3: return
+    if result == "loss_sl" and not FOLLOWUP_ON_SL: return
+    if result == "expired" and not FOLLOWUP_ON_EXPIRE: return
+    
+    # throttle
+    now = _time.time()
+    last_sent = sig.get("last_followup_ts", 0)
+    if now - last_sent < FOLLOWUP_THROTTLE_SEC:
+        return
+    sig["last_followup_ts"] = now
+    
+    text = build_followup_msg(sig, result, price, age_min)
+    if not text: return
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        _filter_stats["followups_sent"] += 1
+        log.info(f"📬 متابعة: {short(sig['cross']['symbol'])} → {result}")
+    except Exception as e:
+        log.error(f"send_followup: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 18c) تتبّع الإشارات (مع متابعة)
 # ═══════════════════════════════════════════════════════════
 def register_signal_for_tracking(cross):
     levels = cross.get("levels")
@@ -1414,47 +1509,71 @@ def register_signal_for_tracking(cross):
         "direction": cross["direction"],
         "source": cross.get("source", "ema"),
         "checked": False, "result": None,
+        "max_favorable": levels["entry"],
+        "max_adverse": levels["entry"],
+        "last_followup_ts": 0.0,
     }
     _filter_stats["signals_tracked"] += 1
 
 
-async def evaluate_pending_signals():
+async def evaluate_pending_signals(bot=None):
     if not _pending_signals: return
     now = _time.time()
     for sid, sig in list(_pending_signals.items()):
         if sig["checked"]: continue
         age_min = (now - sig["entry_ts"]) / 60
         if age_min > SIGNAL_TRACK_MAX_MIN:
-            sig["checked"] = True; sig["result"] = "expired"
+            sig["checked"] = True
+            sig["result"] = "expired"
             _smart.record_result("expired", sig["direction"], sig.get("source", "unknown"))
+            if bot and CHAT_ID:
+                await send_followup(bot, sig, "expired",
+                                    sig["levels"]["entry"], age_min)
             continue
         try:
             data, _ = await _exchange.fetch_ohlcv(sig["cross"]["symbol"], "1m", 3)
             if not data: continue
             price = float(data[-1][4])
             lv = sig["levels"]
+            # تتبّع أعلى/أدنى
+            if sig["direction"] == "bullish":
+                sig["max_favorable"] = max(sig["max_favorable"], price)
+                sig["max_adverse"] = min(sig["max_adverse"], price)
+            else:
+                sig["max_favorable"] = min(sig["max_favorable"], price)
+                sig["max_adverse"] = max(sig["max_adverse"], price)
+            
+            new_result = None
             if sig["direction"] == "bullish":
                 if price <= lv["stop_loss"]:
-                    sig["checked"] = True; sig["result"] = "loss_sl"
+                    sig["checked"] = True; new_result = "loss_sl"
                 elif price >= lv["tp3"]:
-                    sig["checked"] = True; sig["result"] = "win_tp3"
-                elif price >= lv["tp2"] and not sig["result"]:
+                    sig["checked"] = True; new_result = "win_tp3"
+                elif price >= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
+                    new_result = "win_tp2"
                     sig["result"] = "win_tp2"
-                elif price >= lv["tp1"] and not sig["result"]:
+                elif price >= lv["tp1"] and not sig.get("result"):
+                    new_result = "win_tp1"
                     sig["result"] = "win_tp1"
             else:
                 if price >= lv["stop_loss"]:
-                    sig["checked"] = True; sig["result"] = "loss_sl"
+                    sig["checked"] = True; new_result = "loss_sl"
                 elif price <= lv["tp3"]:
-                    sig["checked"] = True; sig["result"] = "win_tp3"
-                elif price <= lv["tp2"] and not sig["result"]:
+                    sig["checked"] = True; new_result = "win_tp3"
+                elif price <= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
+                    new_result = "win_tp2"
                     sig["result"] = "win_tp2"
-                elif price <= lv["tp1"] and not sig["result"]:
+                elif price <= lv["tp1"] and not sig.get("result"):
+                    new_result = "win_tp1"
                     sig["result"] = "win_tp1"
-            if sig["checked"]:
-                _smart.record_result(sig["result"], sig["direction"],
-                                     sig.get("source", "unknown"))
-                log.info(f"🎯 نتيجة {sid}: {sig['result']}")
+            
+            if new_result:
+                if sig["checked"]:
+                    _smart.record_result(sig["result"], sig["direction"],
+                                         sig.get("source", "unknown"))
+                    log.info(f"🏁 نتيجة نهائية {sid}: {sig['result']}")
+                if bot and CHAT_ID:
+                    await send_followup(bot, sig, new_result, price, age_min)
         except Exception as e:
             log.warning(f"track {sid}: {e}")
     cutoff = now - 3600
@@ -1467,23 +1586,23 @@ async def evaluate_pending_signals():
 # 19) الأوامر
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update, context):
-    th = get_thresholds(tf="15m")
-    session_delta, session_name = get_session_info()
+    sd, sn = get_session_info()
     ranges_txt = "\n".join(
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.2</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.3</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
-        f"🕐 الجلسة: <b>{session_name}</b> ({session_delta:+d})\n\n"
+        f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
         f"<b>🎯 الكواشف:</b>\n"
         f"• EMA {'✅' if ENABLE_CONFIRMED else '❌'} | "
         f"RSI Div {'✅' if ENABLE_RSI_DIVERGENCE else '❌'} | "
         f"BB {'✅' if ENABLE_BB_SQUEEZE else '❌'} | "
         f"S/R {'✅' if ENABLE_SR_BREAKOUT else '❌'}\n"
-        f"• Multi-TF: {'✅' if MTF_ENABLED else '❌'}\n\n"
+        f"• Multi-TF: {'✅' if MTF_ENABLED else '❌'}\n"
+        f"• 📬 متابعة الإشارات: {'✅' if FOLLOWUP_ENABLED else '❌'}\n\n"
         f"<b>الأوامر:</b>\n"
         f"/sr /ref6 /ranges /checkranges /refresh\n"
         f"/cross /cross5 /cross15 /cross1h /checkprice\n"
@@ -1625,13 +1744,15 @@ async def cmd_status(update, context):
     jobs_n = len(jq.jobs()) if jq else 0
     sd, sn = get_session_info()
     st = _smart.stats()
+    active = len([s for s in _pending_signals.values() if not s["checked"]])
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.2</b>\n"
+        f"🤖 <b>الحالة v6.3</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
+        f"📬 متابعات: <b>{_filter_stats['followups_sent']}</b>\n"
         f"🔄 دايفرجنس: {_filter_stats['signals_divergence']}\n"
         f"💥 BB: {_filter_stats['signals_bb']}\n"
         f"🎯 S/R: {_filter_stats['signals_sr']}\n"
@@ -1639,10 +1760,11 @@ async def cmd_status(update, context):
         f"⚠️ اقتراب: {_filter_stats['range_approaches']}\n"
         f"🌅 صباح: {_filter_stats['morning_reports']}\n"
         f"🚫 محجوبة: {total}\n"
-        f"📈 WR: {st['wr']}% ({st['n']})\n"
+        f"📈 WR: <b>{st['wr']}%</b> "
+        f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📌 نطاقات: {len(_last_range)}\n"
-        f"⏳ نشطة: {len([s for s in _pending_signals.values() if not s['checked']])}",
+        f"⏳ إشارات نشطة: {active}",
         parse_mode="HTML")
 
 
@@ -1658,28 +1780,27 @@ async def cmd_stats(update, context):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📈 معدل النجاح: <b>{st['wr']}%</b>\n"
         f"<code>{bar}</code>\n"
-        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']} | ⏰ منتهية: {st['expired']}\n"
         f"📝 المجموع: {st['n']}",
         parse_mode="HTML")
 
 
 async def cmd_perf(update, context):
-    """🆕 أداء كل مصدر على حدة"""
     rep = _smart.source_report()
     if not rep:
         await update.message.reply_text("📊 لا بيانات بعد.")
         return
     lines = ["📊 <b>أداء المصادر</b>\n━━━━━━━━━━━━━━━━━━━"]
     for src, d in rep.items():
-        wr = 0
         total_res = d["wins"] + d["losses"]
-        if total_res > 0:
-            wr = round(d["wins"] / total_res * 100, 1)
+        wr = round(d["wins"] / total_res * 100, 1) if total_res > 0 else 0
         name = _source_label(src) if src != "unknown" else "—"
         lines.append(
             f"\n🔹 <b>{name}</b>\n"
             f"   📤 مُرسلة: {d['sent']} | 🚫 محجوبة: {d['filtered']}\n"
-            f"   ✅ {d['wins']} | ❌ {d['losses']} → <b>{wr}%</b>")
+            f"   ✅ {d['wins']} | ❌ {d['losses']} | ⏰ {d.get('expired',0)}\n"
+            f"   📈 WR: <b>{wr}%</b> (decisive)")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -1708,7 +1829,7 @@ async def cmd_strict(update, context):
         f"• Vol ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
-        f"• SL 5m: {MIN_SL_PCT['5m']}% | 15m: {MIN_SL_PCT['15m']}% | 1h: {MIN_SL_PCT['1h']}%",
+        f"• SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%",
         parse_mode="HTML")
 
 
@@ -1765,7 +1886,7 @@ async def crossover_job(context):
 async def signal_tracker_job(context):
     if not _exchange.ok(): return
     try:
-        await evaluate_pending_signals()
+        await evaluate_pending_signals(bot=context.bot)
     except Exception as e:
         log.exception(f"tracker: {e}")
 
@@ -1853,7 +1974,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.2")
+        self.wfile.write(b"OK - Unified Smart Bot v6.3")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -1881,8 +2002,8 @@ def main():
     print(f"📊 رموز: {ALL_SYMBOLS}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
     print(f"🔍 الكواشف: EMA + RSI Div + BB + S/R")
-    print(f"📏 الحد الأدنى SL: 5m={MIN_SL_PCT['5m']}% | "
-          f"15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
+    print(f"📏 SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
+    print(f"📬 متابعة الإشارات: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
     print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00 (سوريا)")
 
     from telegram.request import HTTPXRequest
@@ -1912,7 +2033,7 @@ def main():
     app.add_handler(CommandHandler("sr", cmd_sr))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("perf", cmd_perf))    # 🆕
+    app.add_handler(CommandHandler("perf", cmd_perf))
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
