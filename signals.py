@@ -1,12 +1,12 @@
 """
-Unified Smart Bot v6.4.2 — Score Fix + BB Confirmation
-=======================================================
-  🆕 حد أدنى مطلق Score = 55
-  🆕 BB Squeeze يحتاج Vol ≥ 1.0×
-  🆕 BB في RANGE يحتاج ADX ≥ 20
-  🆕 BB يحتاج تأكيد من مصدر آخر
-  🆕 إصلاح عرض Score النهائي (بعد MTF)
-  ✓ كل ميزات v6.4.1
+Unified Smart Bot v6.4.3 — Score 52 + /why Multi-Coin
+======================================================
+  🆕 ABS_MIN_SCORE = 52 (كان 55)
+  🆕 /why — فحص كل العملات
+  🆕 /why XRP — تفاصيل عملة
+  🆕 /last — آخر 5 إشارات
+  🆕 /pending — الإشارات النشطة
+  ✓ كل ميزات v6.4.2
 """
 import os, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -61,7 +61,7 @@ ENABLE_SR_BREAKOUT    = True
 RSI_DIV_LOOKBACK = 35
 RSI_DIV_COOLDOWN_MIN = 30
 BB_SQUEEZE_PCTL = 0.20
-BB_SQUEEZE_COOLDOWN_MIN = 30      # 🆕 كان 20
+BB_SQUEEZE_COOLDOWN_MIN = 30
 SR_BREAKOUT_LOOKBACK = 50
 SR_BREAKOUT_COOLDOWN_MIN = 30
 
@@ -104,9 +104,11 @@ SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
+LAST_SIGNALS_MAX = 20   # 🆕 عدد الإشارات المحفوظة للتاريخ
+
 
 # ═══════════════════════════════════════════════════════════
-# 🆕 v6.4.2 — إعدادات الفلترة النهائية
+# إعدادات الفلترة
 # ═══════════════════════════════════════════════════════════
 def _env_float(key, default):
     try: return float(os.getenv(key, default))
@@ -130,11 +132,11 @@ MIN_ADX_FOR_BB       = _env_float("MIN_ADX_FOR_BB", 8.0)
 SYMBOL_COOLDOWN_SEC  = _env_int("SYMBOL_COOLDOWN_SEC", 180)
 STRICTNESS_MAX_FINAL = _env_int("STRICTNESS_MAX_FINAL", 80)
 
-# 🆕 v6.4.2 — حدود صارمة
-ABS_MIN_SCORE        = _env_int("ABS_MIN_SCORE", 55)          # حد أدنى مطلق
-BB_MIN_VOL           = _env_float("BB_MIN_VOL", 1.0)          # BB يحتاج حجم
-BB_MIN_ADX_IN_RANGE  = _env_float("BB_MIN_ADX_IN_RANGE", 20)  # BB في رينج
-BB_CONFIRM_ENABLED   = True                                    # BB يحتاج تأكيد
+# 🆕 v6.4.3 — 52 بدل 55
+ABS_MIN_SCORE        = _env_int("ABS_MIN_SCORE", 52)
+BB_MIN_VOL           = _env_float("BB_MIN_VOL", 1.0)
+BB_MIN_ADX_IN_RANGE  = _env_float("BB_MIN_ADX_IN_RANGE", 20)
+BB_CONFIRM_ENABLED   = True
 
 FOLLOWUP_ENABLED = True
 FOLLOWUP_ON_TP1 = True
@@ -470,6 +472,22 @@ def fmt_price(v):
     return f"{v:.8f}"
 
 
+def find_symbol_by_name(name):
+    """🆕 يبحث عن عملة بالاسم (BTC, btc, BTC/USDT)"""
+    if not name: return None
+    name = name.upper().strip()
+    for sym in ALL_SYMBOLS:
+        if short(sym) == name: return sym
+    # بحث جزئي
+    for sym in ALL_SYMBOLS:
+        if name in sym.upper(): return sym
+    # بحث في العملات الإضافية (فقط إذا لم تكن في النطاقات)
+    if "/" not in name:
+        candidate = f"{name}/USDT:USDT"
+        return candidate
+    return None
+
+
 # ═══════════════════════════════════════════════════════════
 # 6) المؤشرات
 # ═══════════════════════════════════════════════════════════
@@ -660,6 +678,7 @@ _divergence_cache = {}
 _bb_cache = {}
 _sr_cache = {}
 _last_signal_time = {}
+_last_signals = deque(maxlen=LAST_SIGNALS_MAX)   # 🆕 تاريخ الإشارات
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_score_abs": 0,
@@ -827,7 +846,7 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) الفلتر v6.4.2 — نهائي
+# 11) الفلتر
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
@@ -841,90 +860,67 @@ async def passes_filter(cross, htf_trend=None):
     source = cross.get("source", "ema")
     direction = cross["direction"]
     
-    # 1) cooldown
     if SYMBOL_COOLDOWN_SEC > 0:
         ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
         if not ok_cooldown:
             return False, f"cooldown {remaining}s", "cooldown"
     
-    # 2) gap
     min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
     if gap_pct < min_gap and source == "ema":
         return False, f"فرق EMA {gap_pct:.3f}% < {min_gap}%", "ema_gap"
     
-    # 3) ATR منخفض
     min_atr = MIN_ATR_PCT.get(tf, 0.05)
     if atr < min_atr:
         return False, f"ATR {atr}% < {min_atr}%", "atr_low"
     
-    # 4) MTF
     mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
     cross["mtf"] = mtf_desc
     cross["mtf_bonus"] = mtf_bonus
     score = base_score + mtf_bonus
     s["score"] = score
-    cross["final_score"] = score   # 🆕
+    cross["final_score"] = score
     
-    # 5) MTF تعارض كامل
     if mtf_bonus <= -15:
         return False, mtf_desc, "mtf"
     
-    # 6) 🆕 الحد الأدنى المطلق للـ Score (قبل أي شيء آخر)
     if score < ABS_MIN_SCORE:
         return False, f"Score {score} < {ABS_MIN_SCORE} (مطلق)", "score_abs"
     
-    # 7) السوق
     df = cross.get("_df")
     market = cross.get("market") or "UNKNOWN"
     if market == "UNKNOWN":
         market = await classify_market_safe(cross["symbol"], tf, df)
         cross["market"] = market
     
-    # 8) العتبات الديناميكية
     th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
     min_score = th["min_score"]
     if tf == "15m":
         min_score = max(min_score, th.get("score_15m_override", min_score))
     
-    # 9) Score الديناميكي
     if score < min_score:
         return False, f"Score {score} < {min_score:.0f}", "score"
     
-    # 10) Volume
     if vol < th["min_vol_ratio"]:
         return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
     
-    # 11) ADX
     if adx < th["min_adx"]:
         return False, f"ADX {adx} < {th['min_adx']}", "adx"
     
-    # 12) ATR أعلى
     if atr > th["max_atr_pct"]:
         return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
     
-    # ═══════════════════════════════════════════════════════
-    # 🆕 13-16) فلاتر BB Squeeze الصارمة
-    # ═══════════════════════════════════════════════════════
     if source == "bb_squeeze":
-        # 13) ADX عام
         if adx < MIN_ADX_FOR_BB:
             return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
-        
-        # 14) حجم لا يقل عن المتوسط
         if vol < BB_MIN_VOL:
             return False, f"BB Vol {vol}× < {BB_MIN_VOL}×", "vol"
-        
-        # 15) في الرينج يحتاج ADX أعلى
         if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE:
             return False, f"BB في رينج يحتاج ADX ≥ {BB_MIN_ADX_IN_RANGE}", "range"
-        
-        # 16) 🆕 يحتاج تأكيد من مصدر آخر
         if BB_CONFIRM_ENABLED:
             confirmed = (mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)
             if not confirmed:
                 return False, "BB بدون تأكيد (MTF/ADX/Vol)", "bb_confirm"
     
-    # 17) منع EMA ضد الترند
     if source == "ema":
         if market == "TREND_DOWN" and direction == "bullish":
             if mtf_bonus < 5:
@@ -933,32 +929,27 @@ async def passes_filter(cross, htf_trend=None):
             if mtf_bonus < 5:
                 return False, "تقاطع هابط في ترند صاعد", "trend"
     
-    # 18) دايفرجنس ضد الترند
     if source == "rsi_div":
         if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 3:
             return False, "دايفرجنس ضد الترند", "trend"
         elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 3:
             return False, "دايفرجنس ضد الترند", "trend"
     
-    # 19) EMA في الرينج
     if market == "RANGE" and source == "ema" \
        and cross.get("alert_type") == "confirmed":
         return False, "سوق عرضي — تقاطع وهمي", "range"
     
-    # 20) HTF
     if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
         if direction == "bullish" and htf_trend == "DOWN":
             return False, "HTF=DOWN ضد LONG", "htf"
         elif direction == "bearish" and htf_trend == "UP":
             return False, "HTF=UP ضد SHORT", "htf"
     
-    # 21) VWAP
     if df is not None:
         ok, slope = check_vwap_slope(df, direction, th, tf=tf)
         if not ok:
             return False, f"VWAP {slope:+.2f}% ضد", "vwap"
     
-    # 22) تعارض
     if cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], direction):
             return False, "تعارض", "conflict"
@@ -991,10 +982,11 @@ async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
            "strength": strength, "alert_type": alert_type,
            "support": support,
            "base_score": support["score"],
-           "final_score": support["score"],   # 🆕 سيُحدَّث لاحقاً
+           "final_score": support["score"],
            "_df": df, "exchange": _exchange.primary_name,
            "levels": levels, "source": source,
-           "market": market}
+           "market": market,
+           "created_at": _time.time()}   # 🆕 للتاريخ
     if extra: out.update(extra)
     return out
 
@@ -1434,7 +1426,6 @@ def build_signal_message(cross):
     bull = cross["direction"] == "bullish"
     at = cross.get("alert_type", "confirmed")
     s = cross.get("support", {})
-    # 🆕 نستخدم final_score (بعد MTF)
     score = cross.get("final_score", s.get("score", 0))
     grade = s.get("grade", "?")
     market = cross.get("market", "?")
@@ -1640,6 +1631,7 @@ async def evaluate_pending_signals(bot=None):
             sig["checked"] = True
             sig["result"] = "expired"
             _smart.record_result("expired", sig["direction"], sig.get("source", "unknown"))
+            _record_history(sig, "expired", sig["levels"]["entry"], age_min)
             if bot and CHAT_ID:
                 await send_followup(bot, sig, "expired", sig["levels"]["entry"], age_min)
             continue
@@ -1679,6 +1671,7 @@ async def evaluate_pending_signals(bot=None):
                 if sig["checked"]:
                     _smart.record_result(sig["result"], sig["direction"],
                                          sig.get("source", "unknown"))
+                    _record_history(sig, sig["result"], price, age_min)
                 if bot and CHAT_ID:
                     await send_followup(bot, sig, new_result, price, age_min)
         except Exception as e:
@@ -1687,6 +1680,27 @@ async def evaluate_pending_signals(bot=None):
     for sid in [k for k, v in _pending_signals.items()
                 if v.get("checked") and v.get("entry_ts", 0) < cutoff]:
         _pending_signals.pop(sid, None)
+
+
+def _record_history(sig, result, price, age_min):
+    """🆕 يحفظ الإشارة في التاريخ"""
+    cross = sig["cross"]
+    entry = sig["levels"]["entry"]
+    bull = sig["direction"] == "bullish"
+    pnl = ((price - entry) / entry * 100) * (1 if bull else -1)
+    _last_signals.append({
+        "symbol": cross["symbol"],
+        "timeframe": cross["timeframe"],
+        "direction": cross["direction"],
+        "source": cross.get("source", "ema"),
+        "score": cross.get("final_score", 0),
+        "entry": entry,
+        "exit": price,
+        "result": result,
+        "pnl_pct": round(pnl, 2),
+        "duration_min": int(age_min),
+        "ts": _time.time(),
+    })
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1698,20 +1712,20 @@ async def cmd_start(update, context):
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.4.2</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.4.3</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
         f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🛡️ فلاتر v6.4.2:</b>\n"
+        f"<b>🛡️ فلاتر v6.4.3:</b>\n"
         f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
         f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%\n"
         f"• ATR: 5m≥{MIN_ATR_PCT['5m']}%\n"
-        f"• BB: Vol≥{BB_MIN_VOL}× | ADX≥{MIN_ADX_FOR_BB}\n"
-        f"• BB في رينج: ADX≥{BB_MIN_ADX_IN_RANGE}\n"
-        f"• BB تأكيد: MTF≥8 أو ADX>22 أو Vol>1.5\n\n"
+        f"• BB: Vol≥{BB_MIN_VOL}× | ADX≥{MIN_ADX_FOR_BB}\n\n"
         f"<b>الأوامر:</b>\n"
-        f"/why — تشخيص\n"
+        f"/why [عملة] — تشخيص\n"
+        f"/last — آخر الإشارات\n"
+        f"/pending — النشطة\n"
         f"/sr /ref6 /ranges /checkranges /refresh\n"
         f"/cross /cross5 /cross15 /cross1h /checkprice\n"
         f"/status /stats /perf /jobs /strict /clearcache",
@@ -1775,66 +1789,85 @@ async def cmd_cross15(u, c): await _run_cross(u, ["15m"])
 async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
 
 
-async def cmd_why(update, context):
-    if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    
-    target = "BTC/USDT:USDT"
-    if target not in ALL_SYMBOLS:
-        target = ALL_SYMBOLS[0]
-    
-    await update.message.reply_text(f"🔍 تشخيص {short(target)} ...")
-    
+# ═══════════════════════════════════════════════════════════
+# 🆕 /why — دالة مساعدة للحصول على تشخيص عملة واحدة
+# ═══════════════════════════════════════════════════════════
+async def _get_diagnosis(symbol, tf):
+    """يُعيد dict بتشخيص عملة واحدة على إطار واحد"""
+    try:
+        df = await _df_for(symbol, tf)
+        if df is None: return None
+        df["ef"] = calc_ema(df["c"], EMA_FAST)
+        df["es"] = calc_ema(df["c"], EMA_SLOW)
+        curr = -2
+        cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+        gap = abs(cf - cs) / cs * 100 if cs else 0
+        atr = float(calc_atr(df).iloc[curr])
+        price = float(df["c"].iloc[curr])
+        atr_pct = (atr / price) * 100 if price else 0
+        adx = float(calc_adx(df).iloc[curr])
+        rsi = float(calc_rsi(df["c"]).iloc[curr])
+        try:
+            vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
+        except: vol_ratio = 0
+        
+        th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
+        score_bull = compute_score(df, "bullish", curr)["score"]
+        score_bear = compute_score(df, "bearish", curr)["score"]
+        best_score = max(score_bull, score_bear)
+        
+        min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
+        min_atr = MIN_ATR_PCT.get(tf, 0.05)
+        
+        checks = {
+            "EMA gap":       gap >= min_gap,
+            "ATR":           atr_pct >= min_atr,
+            "ADX":           adx >= th["min_adx"],
+            "Volume":        vol_ratio >= th["min_vol_ratio"],
+            "Score مطلق":    best_score >= ABS_MIN_SCORE,
+            "Score ديناميكي": best_score >= th["min_score"],
+        }
+        values = {
+            "EMA gap":       f"{gap:.3f}%",
+            "ATR":           f"{atr_pct:.3f}%",
+            "ADX":           f"{adx:.1f}",
+            "Volume":        f"{vol_ratio:.2f}×",
+            "Score مطلق":    f"{best_score}",
+            "Score ديناميكي": f"{best_score}",
+        }
+        thresholds = {
+            "EMA gap":       f"{min_gap}%",
+            "ATR":           f"{min_atr}%",
+            "ADX":           f"{th['min_adx']:.1f}",
+            "Volume":        f"{th['min_vol_ratio']}×",
+            "Score مطلق":    f"{ABS_MIN_SCORE}",
+            "Score ديناميكي": f"{th['min_score']:.0f}",
+        }
+        return {
+            "symbol": symbol, "tf": tf, "score": best_score,
+            "checks": checks, "values": values, "thresholds": thresholds,
+            "price": price, "rsi": rsi,
+        }
+    except Exception as e:
+        log.warning(f"_get_diagnosis {symbol} {tf}: {e}")
+        return None
+
+
+async def _diagnose_coin(update, target):
+    """🆕 تشخيص كامل لعملة واحدة على 3 أطر"""
     lines = [f"📊 <b>تشخيص {short(target)}</b>", "━━━━━━━━━━━━━━━━━━━"]
     
     for tf in ["5m", "15m", "1h"]:
-        try:
-            df = await _df_for(target, tf)
-            if df is None:
-                lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
-            df["ef"] = calc_ema(df["c"], EMA_FAST)
-            df["es"] = calc_ema(df["c"], EMA_SLOW)
-            curr = -2
-            cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
-            gap = abs(cf - cs) / cs * 100 if cs else 0
-            atr = float(calc_atr(df).iloc[curr])
-            price = float(df["c"].iloc[curr])
-            atr_pct = (atr / price) * 100 if price else 0
-            adx = float(calc_adx(df).iloc[curr])
-            rsi = float(calc_rsi(df["c"]).iloc[curr])
-            vol_ratio = 0
-            try:
-                vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
-            except: pass
-            
-            th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
-            score_bull = compute_score(df, "bullish", curr)["score"]
-            score_bear = compute_score(df, "bearish", curr)["score"]
-            best_score = max(score_bull, score_bear)
-            
-            min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
-            min_atr = MIN_ATR_PCT.get(tf, 0.05)
-            
-            g_ok = "✅" if gap >= min_gap else "❌"
-            a_ok = "✅" if atr_pct >= min_atr else "❌"
-            s_abs_ok = "✅" if best_score >= ABS_MIN_SCORE else "❌"
-            s_ok = "✅" if best_score >= th["min_score"] else "❌"
-            v_ok = "✅" if vol_ratio >= th["min_vol_ratio"] else "❌"
-            x_ok = "✅" if adx >= th["min_adx"] else "❌"
-            
+        r = await _get_diagnosis(target, tf)
+        if r is None:
+            lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
+        
+        lines.append(f"\n<b>[{tf}]</b>  💰 {fmt_price(r['price'])}")
+        for k in r["checks"]:
+            ok = "✅" if r["checks"][k] else "❌"
             lines.append(
-                f"\n<b>[{tf}]</b>\n"
-                f"💰 السعر: {fmt_price(price)}\n"
-                f"📏 فرق EMA: <b>{gap:.3f}%</b> / {min_gap}% {g_ok}\n"
-                f"📊 ATR: <b>{atr_pct:.3f}%</b> / {min_atr}% {a_ok}\n"
-                f"📈 ADX: <b>{adx:.1f}</b> / {th['min_adx']:.1f} {x_ok}\n"
-                f"📊 Vol: <b>{vol_ratio:.2f}×</b> / {th['min_vol_ratio']}× {v_ok}\n"
-                f"🎯 Score مطلق: <b>{best_score}</b> / {ABS_MIN_SCORE} {s_abs_ok}\n"
-                f"🎯 Score ديناميكي: <b>{best_score}</b> / {th['min_score']:.0f} {s_ok}\n"
-                f"📉 RSI: {rsi:.1f}"
-            )
-        except Exception as e:
-            lines.append(f"\n<b>[{tf}]</b> ❌ {e}")
+                f"{ok} {k}: <b>{r['values'][k]}</b> / {r['thresholds'][k]}")
+        lines.append(f"📉 RSI: {r['rsi']:.1f}")
     
     ok_cd, rem = check_symbol_cooldown(target)
     cd_txt = "✅" if ok_cd else f"❌ متبقي {rem}s"
@@ -1842,6 +1875,164 @@ async def cmd_why(update, context):
     lines.append("━━━━━━━━━━━━━━━━━━━")
     lines.append("💡 <i>أي ❌ = فلتر يمنع الإشارة</i>")
     
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def _diagnose_all(update):
+    """🆕 تشخيص كل العملات + ترتيب بالأقرب للنجاح"""
+    if not _exchange.ok():
+        await update.message.reply_text("❌ لا منصة."); return
+    
+    await update.message.reply_text(
+        f"🔍 فحص شامل لـ {len(ALL_SYMBOLS)} عملة (15m) ...")
+    
+    results = []
+    for sym in ALL_SYMBOLS:
+        r = await _get_diagnosis(sym, "15m")
+        if r: results.append(r)
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    
+    if not results:
+        await update.message.reply_text("⚪ لا بيانات."); return
+    
+    # ترتيب: الأقرب للنجاح أولاً (عدد النجاحات - عدد الفشل)
+    def sort_key(r):
+        fails = sum(1 for v in r["checks"].values() if not v)
+        return (fails, -r["score"])
+    results.sort(key=sort_key)
+    
+    sd, sn = get_session_info()
+    lines = [f"📊 <b>تشخيص شامل ({len(results)})</b>",
+             f"🕐 {sn}",
+             "━━━━━━━━━━━━━━━━━━━"]
+    
+    for r in results:
+        fails = [k for k, v in r["checks"].items() if not v]
+        if not fails:
+            icon = "🌟"
+        elif len(fails) == 1:
+            icon = "⚠️"
+        elif len(fails) == 2:
+            icon = "❌"
+        else:
+            icon = "🚫"
+        
+        lines.append(
+            f"\n{icon} <b>{short(r['symbol'])}</b>  "
+            f"Score={r['score']}  💰{fmt_price(r['price'])}")
+        
+        if not fails:
+            lines.append("   ✅ كل الفلاتر مرّت")
+        else:
+            for k in fails:
+                lines.append(
+                    f"   ❌ {k}: {r['values'][k]} / {r['thresholds'][k]}")
+    
+    lines.append("\n━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💡 <code>/why BTC</code> لتفاصيل عملة محددة")
+    lines.append(f"🌟=جاهز | ⚠️=قريب | ❌=بعيد | 🚫=مستحيل")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_why(update, context):
+    """🆕 /why → كل العملات | /why BTC → BTC فقط"""
+    args = context.args or []
+    if args:
+        coin_name = args[0]
+        target = find_symbol_by_name(coin_name)
+        if not target:
+            await update.message.reply_text(
+                f"❌ <b>{coin_name}</b> غير معروف.\n"
+                f"المتاح: <code>{', '.join(short(s) for s in ALL_SYMBOLS)}</code>\n"
+                f"أو جرّب: <code>/why BTC</code>",
+                parse_mode="HTML")
+            return
+        await _diagnose_coin(update, target)
+    else:
+        await _diagnose_all(update)
+
+
+async def cmd_last(update, context):
+    """🆕 آخر الإشارات"""
+    if not _last_signals:
+        await update.message.reply_text(
+            "📭 لا إشارات بعد.\n"
+            "ستُحفظ الإشارات المُتابَعة هنا.", parse_mode="HTML")
+        return
+    
+    lines = ["📋 <b>آخر الإشارات</b>", "━━━━━━━━━━━━━━━━━━━"]
+    for s in reversed(list(_last_signals)):
+        icon = {"win_tp3": "🌟", "win_tp2": "✅", "win_tp1": "🎯",
+                "loss_sl": "❌", "expired": "⏰", None: "⏳"}.get(s["result"], "?")
+        ts_str = datetime.fromtimestamp(s["ts"], tz=SYRIA_TZ).strftime("%H:%M")
+        dir_icon = "🟢" if s["direction"] == "bullish" else "🔴"
+        lines.append(
+            f"\n{icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
+            f"{dir_icon} {_source_label(s['source'])}")
+        lines.append(
+            f"   🕐 {ts_str} | Score={s['score']}")
+        lines.append(
+            f"   💰 {fmt_price(s['entry'])} → {fmt_price(s['exit'])} "
+            f"<b>{s['pnl_pct']:+.2f}%</b>")
+        lines.append(
+            f"   ⏱️ {s['duration_min']} د | نتيجة: <b>{s['result']}</b>")
+    
+    lines.append("\n━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 المجموع: {len(_last_signals)} إشارة")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_pending(update, context):
+    """🆕 الإشارات النشطة"""
+    active = {sid: s for sid, s in _pending_signals.items() if not s["checked"]}
+    if not active:
+        await update.message.reply_text("📭 لا إشارات نشطة.")
+        return
+    
+    lines = [f"⏳ <b>إشارات نشطة ({len(active)})</b>", "━━━━━━━━━━━━━━━━━━━"]
+    now = _time.time()
+    
+    for sid, sig in active.items():
+        cross = sig["cross"]
+        sym = short(cross["symbol"])
+        tf = cross["timeframe"]
+        bull = sig["direction"] == "bullish"
+        lv = sig["levels"]
+        
+        # جلب السعر الحالي
+        try:
+            data, _ = await _exchange.fetch_ohlcv(cross["symbol"], "1m", 2)
+            price = float(data[-1][4]) if data else lv["entry"]
+        except Exception:
+            price = lv["entry"]
+        
+        pnl = ((price - lv["entry"]) / lv["entry"] * 100) * (1 if bull else -1)
+        age_min = int((now - sig["entry_ts"]) / 60)
+        
+        # حالة الأهداف
+        tp_status = []
+        if bull:
+            if price >= lv["tp1"]: tp_status.append("TP1 ✅")
+            if price >= lv["tp2"]: tp_status.append("TP2 ✅")
+            if price >= lv["tp3"]: tp_status.append("TP3 ✅")
+        else:
+            if price <= lv["tp1"]: tp_status.append("TP1 ✅")
+            if price <= lv["tp2"]: tp_status.append("TP2 ✅")
+            if price <= lv["tp3"]: tp_status.append("TP3 ✅")
+        tp_txt = " | ".join(tp_status) if tp_status else "لا هدف بعد"
+        
+        dir_icon = "🟢" if bull else "🔴"
+        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+        
+        lines.append(
+            f"\n{dir_icon} <b>{sym}</b> [{tf}] {_source_label(cross.get('source','ema'))}")
+        lines.append(f"   💰 دخول: {fmt_price(lv['entry'])} → حالي: {fmt_price(price)}")
+        lines.append(f"   {pnl_icon} P&L: <b>{pnl:+.2f}%</b> | ⏱️ {age_min} د")
+        lines.append(f"   🎯 {tp_txt}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    
+    lines.append("\n━━━━━━━━━━━━━━━━━━━")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -1928,7 +2119,7 @@ async def cmd_status(update, context):
     st = _smart.stats()
     active = len([s for s in _pending_signals.values() if not s["checked"]])
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.4.2</b>\n"
+        f"🤖 <b>الحالة v6.4.3</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
@@ -1943,12 +2134,11 @@ async def cmd_status(update, context):
         f"  • ema_gap: {_filter_stats['filtered_ema_gap']}\n"
         f"  • atr_low: {_filter_stats['filtered_atr_low']}\n"
         f"  • cooldown: {_filter_stats['filtered_cooldown']}\n"
-        f"  • mtf: {_filter_stats['filtered_mtf']}\n"
-        f"  • vol: {_filter_stats['filtered_vol']}\n"
         f"📈 WR: <b>{st['wr']}%</b> "
         f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ نشطة: {active}",
+        f"⏳ نشطة: {active}\n"
+        f"📝 تاريخ: {len(_last_signals)} إشارة",
         parse_mode="HTML")
 
 
@@ -2006,7 +2196,7 @@ async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
     sd, sn = get_session_info()
     await update.message.reply_text(
-        f"🎯 <b>التشدد v6.4.2</b>\n"
+        f"🎯 <b>التشدد v6.4.3</b>\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>ديناميكي (15m):</b>\n"
@@ -2015,7 +2205,7 @@ async def cmd_strict(update, context):
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🛡️ ثوابت v6.4.2:</b>\n"
+        f"<b>🛡️ ثوابت v6.4.3:</b>\n"
         f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
         f"• EMA gap: 5m={MIN_EMA_GAP_PCT['5m']}%\n"
         f"• ATR min: 5m={MIN_ATR_PCT['5m']}%\n"
@@ -2171,7 +2361,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.4.2")
+        self.wfile.write(b"OK - Unified Smart Bot v6.4.3")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -2198,7 +2388,7 @@ def main():
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 رموز: {ALL_SYMBOLS}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
-    print(f"🛡️ فلاتر v6.4.2:")
+    print(f"🛡️ فلاتر v6.4.3:")
     print(f"   • Score مطلق ≥ {ABS_MIN_SCORE}")
     print(f"   • EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%")
     print(f"   • ATR min: 5m≥{MIN_ATR_PCT['5m']}%")
@@ -2231,6 +2421,8 @@ def main():
     app.add_handler(CommandHandler("cross15", cmd_cross15))
     app.add_handler(CommandHandler("cross1h", cmd_cross1h))
     app.add_handler(CommandHandler("why", cmd_why))
+    app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("checkprice", cmd_checkprice))
     app.add_handler(CommandHandler("ranges", cmd_ranges))
     app.add_handler(CommandHandler("checkranges", cmd_checkranges))
