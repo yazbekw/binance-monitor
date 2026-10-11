@@ -666,14 +666,16 @@ class WebSocketManager:
 class PositionManager:
     def __init__(self, executor: BinanceExecutor, bot_getter):
         self.executor = executor
-        self.bot_getter = bot_getter        # callable → telegram bot
-        self.positions: Dict[str, dict] = {}   # symbol -> position dict
+        self.bot_getter = bot_getter
+        self.positions: Dict[str, dict] = {}
         self.closed_today = 0
         self.daily_pnl_usd = 0.0
         self.daily_reset_ts = _time.time()
         self.consecutive_losses = 0
         self.paused = False
+        self.ws_ref = None   # يُضبط من main
         self._lock = asyncio.Lock()
+        self._watchdog_fails: Dict[str, int] = {}   # symbol -> عدد مرات فشل الفحص المتتالية
 
     # ---------- HIGH-LEVEL ----------
     async def can_open_new(self) -> tuple[bool, str]:
@@ -681,7 +683,6 @@ class PositionManager:
         async with self._lock:
             if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
                 return False, f"وصلت للحد الأقصى ({MAX_CONCURRENT_POSITIONS})"
-        # daily loss reset
         if _time.time() - self.daily_reset_ts > 86400:
             self.daily_reset_ts = _time.time()
             self.daily_pnl_usd = 0.0
@@ -696,11 +697,9 @@ class PositionManager:
         return True, ""
 
     async def open_position(self, signal: dict) -> Optional[dict]:
-        """signal = cross dict بعد النجاح في الفلاتر"""
         sym = signal["symbol"]
         async with self._lock:
-            if sym in self.positions:
-                return None
+            if sym in self.positions: return None
         direction = signal["direction"]
         side = "buy" if direction == "bullish" else "sell"
         if direction == "bullish" and not ENABLE_LONG: return None
@@ -708,13 +707,13 @@ class PositionManager:
 
         lv = signal.get("levels")
         if not lv: return None
-        entry_ref = lv["entry"]; sl = lv["stop_loss"]; tp1, tp2, tp3 = lv["tp1"], lv["tp2"], lv["tp3"]
+        entry_ref = lv["entry"]; sl = lv["stop_loss"]
+        tp1, tp2, tp3 = lv["tp1"], lv["tp2"], lv["tp3"]
         sl_pct = abs(entry_ref - sl) / entry_ref * 100
         if sl_pct > MAX_SL_PCT:
             log.info(f"❌ {short(sym)} SL {sl_pct:.2f}% > {MAX_SL_PCT}%")
             return None
 
-        # calc qty
         try:
             m = self.executor.market(sym)
             qty_raw = POSITION_NOTIONAL_USD / entry_ref
@@ -722,51 +721,35 @@ class PositionManager:
             qty = float(qty_str)
             min_amt = m["limits"]["amount"]["min"] or 0
             if qty < min_amt:
-                log.warning(f"❌ {short(sym)} qty {qty} < min {min_amt}")
-                return None
+                log.warning(f"❌ {short(sym)} qty {qty} < min {min_amt}"); return None
             min_cost = m["limits"]["cost"]["min"] or 5
             if qty * entry_ref < min_cost:
-                log.warning(f"❌ {short(sym)} notional < min {min_cost}")
-                return None
+                log.warning(f"❌ {short(sym)} notional < min {min_cost}"); return None
         except Exception as e:
-            log.error(f"qty calc {sym}: {e}")
-            return None
+            log.error(f"qty calc {sym}: {e}"); return None
 
-        # set leverage + margin mode
-        try:
-            await self.executor.set_margin_mode(sym, MARGIN_MODE)
-        except Exception as e:
-            log.warning(f"margin mode {sym}: {e}")
-        try:
-            await self.executor.set_leverage(sym, LEVERAGE)
-        except Exception as e:
-            log.warning(f"leverage {sym}: {e}")
+        try: await self.executor.set_margin_mode(sym, MARGIN_MODE)
+        except Exception as e: log.warning(f"margin mode {sym}: {e}")
+        try: await self.executor.set_leverage(sym, LEVERAGE)
+        except Exception as e: log.warning(f"leverage {sym}: {e}")
 
-        # client order id
         cid_base = f"v7{int(_time.time())}{sym.split('/')[0][:6]}"[:32]
         entry_cid = f"{cid_base}_en"[:36]
 
-        # place market entry
         try:
             order = await self.executor.create_order(
-                sym, "market", side, qty, None,
-                {"newClientOrderId": entry_cid}
-            )
+                sym, "market", side, qty, None, {"newClientOrderId": entry_cid})
         except Exception as e:
-            log.error(f"❌ entry order {sym}: {e}")
-            return None
+            log.error(f"❌ entry order {sym}: {e}"); return None
 
-        # wait for fill
         filled_qty = 0.0; avg_price = 0.0
         for _ in range(10):
             try:
                 o = await self.executor.fetch_order(order["id"], sym)
                 filled_qty = float(o.get("filled") or 0)
                 avg_price = float(o.get("average") or 0)
-                if o.get("status") == "closed" and filled_qty > 0:
-                    break
-            except Exception:
-                pass
+                if o.get("status") == "closed" and filled_qty > 0: break
+            except Exception: pass
             await asyncio.sleep(0.5)
 
         if filled_qty <= 0:
@@ -776,17 +759,12 @@ class PositionManager:
             return None
 
         entry_price = avg_price or entry_ref
-        # recalc SL/TP if fill price drifted
         if direction == "bullish":
             risk = entry_price - sl
-            tp1 = entry_price + risk
-            tp2 = entry_price + risk * 2
-            tp3 = entry_price + risk * 3
+            tp1 = entry_price + risk; tp2 = entry_price + risk*2; tp3 = entry_price + risk*3
         else:
             risk = sl - entry_price
-            tp1 = entry_price - risk
-            tp2 = entry_price - risk * 2
-            tp3 = entry_price - risk * 3
+            tp1 = entry_price - risk; tp2 = entry_price - risk*2; tp3 = entry_price - risk*3
 
         pos = {
             "symbol": sym, "side": side, "direction": direction,
@@ -794,57 +772,66 @@ class PositionManager:
             "leverage": LEVERAGE, "notional": entry_price * filled_qty,
             "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
             "sl_pct": sl_pct, "score": signal.get("final_score", 0),
-            "source": signal.get("source", "ema"),
-            "tf": signal.get("timeframe", "?"),
-            "signal_id": cid_base,
-            "opened_at": _time.time(),
+            "source": signal.get("source", "ema"), "tf": signal.get("timeframe", "?"),
+            "signal_id": cid_base, "opened_at": _time.time(),
             "sl_order_id": None, "tp1_order_id": None,
             "tp2_order_id": None, "tp3_order_id": None,
             "tp1_filled": False, "tp2_filled": False, "tp3_filled": False,
-            "trailing_active": False,
-            "breakeven_moved": False,
+            "trailing_active": False, "breakeven_moved": False,
+            "sl_last_verified": 0.0,   # 🆕 آخر تحقق من SL
         }
         async with self._lock:
             self.positions[sym] = pos
 
-        # place SL (closePosition=True → closes any remaining qty)
+        # place SL — إلزامي
         sl_side = "sell" if direction == "bullish" else "buy"
-        try:
-            sl_order = await self.executor.create_order(
-                sym, "STOP_MARKET", sl_side, None, None,
-                {"stopPrice": self.executor.ex.price_to_precision(sym, sl),
-                 "closePosition": True, "workingType": "MARK_PRICE",
-                 "priceProtect": True,
-                 "newClientOrderId": f"{cid_base}_sl"[:36]}
-            )
-            pos["sl_order_id"] = sl_order.get("id")
-        except Exception as e:
-            log.error(f"❌ SL placement FAILED for {sym}: {e} → EMERGENCY CLOSE")
+        sl_ok = await self._place_sl(sym, pos, sl, tag="sl")
+        if not sl_ok:
+            log.error(f"❌ SL فشل لـ {sym} → إغلاق فوري")
             await self._emergency_close(sym)
             return None
 
-        # place TP1/TP2/TP3 as reduceOnly partial closes
-        async def place_tp(level_price, pct, tag):
-            q = float(self.executor.ex.amount_to_precision(sym, filled_qty * pct))
-            if q <= 0: return None
-            try:
-                o = await self.executor.create_order(
-                    sym, "TAKE_PROFIT_MARKET", sl_side, q, None,
-                    {"stopPrice": self.executor.ex.price_to_precision(sym, level_price),
-                     "reduceOnly": True, "workingType": "MARK_PRICE",
-                     "newClientOrderId": f"{cid_base}_{tag}"[:36]}
-                )
-                return o.get("id")
-            except Exception as e:
-                log.warning(f"TP {tag} {sym}: {e}")
-                return None
+        # place TPs
+        await self._place_tp(sym, pos, tp1, TP_SPLITS[0], "tp1")
+        await self._place_tp(sym, pos, tp2, TP_SPLITS[1], "tp2")
+        await self._place_tp(sym, pos, tp3, TP_SPLITS[2], "tp3")
 
-        pos["tp1_order_id"] = await place_tp(tp1, TP_SPLITS[0], "tp1")
-        pos["tp2_order_id"] = await place_tp(tp2, TP_SPLITS[1], "tp2")
-        pos["tp3_order_id"] = await place_tp(tp3, TP_SPLITS[2], "tp3")
-
+        pos["sl_last_verified"] = _time.time()
         log.info(f"✅ فتح {short(sym)} {direction} @ {entry_price} | SL={sl} | qty={filled_qty}")
         return pos
+
+    # ---------- HELPERS لـ SL/TP ----------
+    async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        try:
+            o = await self.executor.create_order(
+                symbol, "STOP_MARKET", sl_side, None, None,
+                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
+                 "closePosition": True, "workingType": "MARK_PRICE",
+                 "priceProtect": True,
+                 "newClientOrderId": f"{pos['signal_id']}_{tag}"[:36]})
+            pos["sl_order_id"] = o.get("id")
+            pos["sl_last_verified"] = _time.time()
+            return True
+        except Exception as e:
+            log.error(f"SL {symbol}: {e}")
+            return False
+
+    async def _place_tp(self, symbol, pos, price, pct, tag):
+        q = float(self.executor.ex.amount_to_precision(symbol, pos["qty_initial"] * pct))
+        if q <= 0: return None
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        try:
+            o = await self.executor.create_order(
+                symbol, "TAKE_PROFIT_MARKET", sl_side, q, None,
+                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
+                 "reduceOnly": True, "workingType": "MARK_PRICE",
+                 "newClientOrderId": f"{pos['signal_id']}_{tag}"[:36]})
+            pos[f"{tag}_order_id"] = o.get("id")
+            return o.get("id")
+        except Exception as e:
+            log.warning(f"TP {tag} {symbol}: {e}")
+            return None
 
     async def _emergency_close(self, symbol):
         async with self._lock:
@@ -863,36 +850,34 @@ class PositionManager:
         async with self._lock:
             pos = self.positions.get(symbol)
         if not pos: return False
-        try:
-            await self.executor.cancel_all_orders(symbol)
+        try: await self.executor.cancel_all_orders(symbol)
         except: pass
         try:
             side = "sell" if pos["direction"] == "bullish" else "buy"
             await self.executor.create_order(symbol, "market", side, pos["qty"], None, {"reduceOnly": True})
             log.info(f"🔒 إغلاق {short(symbol)} ({reason})")
         except Exception as e:
-            log.error(f"close {symbol}: {e}")
-            return False
+            log.error(f"close {symbol}: {e}"); return False
         async with self._lock:
             self.positions.pop(symbol, None)
         return True
 
     async def close_all(self, reason="closeall"):
-        syms = list(self.positions.keys())
-        for s in syms: await self.close_position(s, reason)
+        for s in list(self.positions.keys()):
+            await self.close_position(s, reason)
 
     # ---------- EVENT HANDLERS ----------
     async def on_order_update(self, o: dict):
-        ws_sym = o.get("s")  # BTCUSDT
+        ws_sym = o.get("s")
         if not ws_sym: return
         try:
-            ccxt_sym = self.ws_ref._to_ccxt_sym(ws_sym) if hasattr(self, "ws_ref") else f"{ws_sym[:-4]}/USDT:USDT"
+            ccxt_sym = self.ws_ref._to_ccxt_sym(ws_sym) if self.ws_ref else f"{ws_sym[:-4]}/USDT:USDT"
         except Exception:
             ccxt_sym = f"{ws_sym[:-4]}/USDT:USDT"
         async with self._lock:
             pos = self.positions.get(ccxt_sym)
         if not pos: return
-        status = o.get("X"); order_type = o.get("o"); cid = o.get("c") or ""
+        status = o.get("X"); cid = o.get("c") or ""
         if status != "FILLED": return
         if "_tp1" in cid and not pos["tp1_filled"]:
             pos["tp1_filled"] = True
@@ -907,28 +892,21 @@ class PositionManager:
             await self._after_close(ccxt_sym, pos, "loss_sl")
 
     async def _after_tp1(self, symbol, pos):
-        """breakeven: cancel static SL → new SL at entry"""
         if not BREAKEVEN_AFTER_TP1: return
         try: await self.executor.cancel_all_orders(symbol)
         except: pass
-        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
-        try:
-            new_sl = await self.executor.create_order(
-                symbol, "STOP_MARKET", sl_side, None, None,
-                {"stopPrice": self.executor.ex.price_to_precision(symbol, pos["entry"]),
-                 "closePosition": True, "workingType": "MARK_PRICE",
-                 "newClientOrderId": f"{pos['signal_id']}_sl_be"[:36]})
-            pos["sl_order_id"] = new_sl.get("id")
+        ok = await self._place_sl(symbol, pos, pos["entry"], tag="sl_be")
+        if ok:
             pos["breakeven_moved"] = True
             pos["sl"] = pos["entry"]
-        except Exception as e:
-            log.error(f"breakeven {symbol}: {e}")
-        # re-place TP2/TP3
-        await self._reopen_tp(symbol, pos, "tp2", pos["tp2"]); await self._reopen_tp(symbol, pos, "tp3", pos["tp3"])
+        else:
+            log.error(f"❌ breakeven SL فشل {symbol} → إغلاق طارئ")
+            await self._emergency_close(symbol); return
+        await self._place_tp(symbol, pos, pos["tp2"], TP_SPLITS[1], "tp2_r")
+        await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
         await self._notify(f"🎯 <b>TP1</b> {short(symbol)} | SL → Breakeven")
 
     async def _after_tp2(self, symbol, pos):
-        """trailing stop activation"""
         if not TRAIL_AFTER_TP2: return
         try: await self.executor.cancel_all_orders(symbol)
         except: pass
@@ -940,60 +918,166 @@ class PositionManager:
                  "workingType": "MARK_PRICE",
                  "newClientOrderId": f"{pos['signal_id']}_trail"[:36]})
             pos["sl_order_id"] = t.get("id"); pos["trailing_active"] = True
+            pos["sl_last_verified"] = _time.time()
         except Exception as e:
             log.error(f"trailing {symbol}: {e}")
-        await self._reopen_tp(symbol, pos, "tp3", pos["tp3"])
+            # fallback: SL ثابت عند TP1
+            await self._place_sl(symbol, pos, pos["tp1"], tag="sl_tp1")
+        await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
         await self._notify(f"✅ <b>TP2</b> {short(symbol)} | Trailing {TRAIL_CALLBACK_RATE}%")
-
-    async def _reopen_tp(self, symbol, pos, tag, price):
-        # for tp3 only after tp2, tp2/tp3 after tp1
-        remaining = pos["qty"]  # qty on exchange after partial fills
-        # Binance reports remaining in position. We use current qty from position update.
-        # Simplify: use fixed split of initial qty
-        pct = 0.20 if tag == "tp3" else 0.30
-        q = float(self.executor.ex.amount_to_precision(symbol, pos["qty_initial"] * pct))
-        if q <= 0: return
-        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
-        try:
-            o = await self.executor.create_order(
-                symbol, "TAKE_PROFIT_MARKET", sl_side, q, None,
-                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
-                 "reduceOnly": True, "workingType": "MARK_PRICE",
-                 "newClientOrderId": f"{pos['signal_id']}_{tag}_r"[:36]})
-            pos[f"{tag}_order_id"] = o.get("id")
-        except Exception as e:
-            log.warning(f"reopen {tag} {symbol}: {e}")
 
     async def _after_close(self, symbol, pos, result):
         async with self._lock:
             self.positions.pop(symbol, None)
-        # PnL from order event
         _smart.record_result(result, pos["direction"], pos.get("source", "unknown"))
         await self._notify(
             f"{'✅' if result.startswith('win') else '❌'} "
-            f"<b>{result.upper()}</b> {short(symbol)} | "
-            f"{'ربح' if result.startswith('win') else 'خسارة'}")
+            f"<b>{result.upper()}</b> {short(symbol)}")
 
     async def on_margin_call(self, ev):
         await self._notify("🚨 <b>MARGIN CALL</b> — راجع حسابك فوراً!")
 
+    # ---------- WATCHDOG 🆕 ----------
+    async def watchdog_check(self):
+        """
+        كل 3 دقائق:
+        - يتحقق من وجود SL/TP على Binance لكل صفقة
+        - يعيد وضعها إن فُقدت
+        - يغلق الصفقة طارئاً إذا فشل الفحص 3 مرات متتالية (9 دقائق)
+        """
+        if not self.positions: return
+        try:
+            all_orders = await self.executor.fetch_open_orders()
+        except Exception as e:
+            log.warning(f"⚠️ watchdog fetch: {e}")
+            return
+
+        # فهرسة الأوامر حسب الرمز
+        orders_by_sym: Dict[str, list] = defaultdict(list)
+        for o in all_orders:
+            orders_by_sym[o["symbol"]].append(o)
+
+        for sym, pos in list(self.positions.items()):
+            try:
+                await self._watchdog_one(sym, pos, orders_by_sym.get(sym, []))
+            except Exception as e:
+                log.exception(f"watchdog {sym}: {e}")
+            await asyncio.sleep(0.3)
+
+    async def _watchdog_one(self, symbol, pos, open_orders: list):
+        # 1) الصفقة ما زالت موجودة على Binance؟
+        try:
+            bpos = await self.executor.fetch_positions([symbol])
+        except Exception as e:
+            log.warning(f"⚠️ watchdog pos {symbol}: {e}")
+            self._bump_fail(symbol)
+            return
+        active = False
+        for p in bpos:
+            if abs(float(p.get("contracts") or 0)) > 1e-12:
+                active = True
+                # حدّث qty الحقيقي
+                pos["qty"] = abs(float(p["contracts"]))
+                break
+        if not active:
+            log.info(f"♻️ watchdog: {short(symbol)} اختفت من Binance → إزالة محلية")
+            async with self._lock:
+                self.positions.pop(symbol, None)
+            self._reset_fail(symbol)
+            return
+
+        # 2) فحص الأوامر المعلقة
+        has_sl = False; tp_ids_seen = set()
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        for o in open_orders:
+            otype = o.get("type") or ""
+            cid = o.get("clientOrderId") or ""
+            # SL: STOP_MARKET أو TRAILING_STOP_MARKET
+            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype) \
+               and "_sl" in cid or "_trail" in cid:
+                has_sl = True
+                pos["sl_order_id"] = o.get("id")
+            elif "TAKE_PROFIT" in otype:
+                if "_tp1" in cid: tp_ids_seen.add("tp1")
+                elif "_tp2" in cid: tp_ids_seen.add("tp2")
+                elif "_tp3" in cid: tp_ids_seen.add("tp3")
+
+        # 3) أعد وضع SL إن مفقود
+        if not has_sl:
+            log.warning(f"🛡️ watchdog: SL مفقود لـ {short(symbol)} → إعادة الوضع")
+            # اختر السعر المناسب حسب الحالة
+            if pos.get("trailing_active"):
+                sl_side_ = "sell" if pos["direction"] == "bullish" else "buy"
+                try:
+                    t = await self.executor.create_order(
+                        symbol, "TRAILING_STOP_MARKET", sl_side_, None, None,
+                        {"callbackRate": TRAIL_CALLBACK_RATE, "reduceOnly": True,
+                         "workingType": "MARK_PRICE",
+                         "newClientOrderId": f"{pos['signal_id']}_trail_r"[:36]})
+                    pos["sl_order_id"] = t.get("id")
+                    pos["sl_last_verified"] = _time.time()
+                    self._reset_fail(symbol)
+                    await self._notify(f"🛡️ إعادة Trailing SL لـ {short(symbol)}")
+                    return
+                except Exception as e:
+                    log.error(f"watchdog re-trail {symbol}: {e}")
+            elif pos.get("breakeven_moved"):
+                ok = await self._place_sl(symbol, pos, pos["entry"], tag="sl_be_r")
+                if ok:
+                    self._reset_fail(symbol)
+                    await self._notify(f"🛡️ إعادة SL Breakeven لـ {short(symbol)}")
+                    return
+            else:
+                ok = await self._place_sl(symbol, pos, pos["sl"], tag="sl_r")
+                if ok:
+                    self._reset_fail(symbol)
+                    await self._notify(f"🛡️ إعادة SL لـ {short(symbol)}")
+                    return
+            # فشل كل المحاولات
+            self._bump_fail(symbol)
+
+        # 4) أعد وضع TPs إن مفقودة
+        if "tp1" not in tp_ids_seen and not pos["tp1_filled"]:
+            await self._place_tp(symbol, pos, pos["tp1"], TP_SPLITS[0], "tp1_r")
+        if "tp2" not in tp_ids_seen and not pos["tp2_filled"] and pos["tp1_filled"]:
+            await self._place_tp(symbol, pos, pos["tp2"], TP_SPLITS[1], "tp2_r")
+        if "tp3" not in tp_ids_seen and not pos["tp3_filled"]:
+            await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
+
+        self._reset_fail(symbol)
+        pos["sl_last_verified"] = _time.time()
+
+    def _bump_fail(self, symbol):
+        n = self._watchdog_fails.get(symbol, 0) + 1
+        self._watchdog_fails[symbol] = n
+        log.warning(f"⚠️ watchdog فشل {short(symbol)} ({n}/3)")
+        if n >= 3:
+            log.error(f"🆘 watchdog: 3 فشل متتالية لـ {short(symbol)} → إغلاق طارئ")
+            asyncio.create_task(self._watchdog_kill(symbol))
+
+    async def _watchdog_kill(self, symbol):
+        await self._notify(f"🆘 <b>إغلاق طارئ</b> {short(symbol)} — فشل watchdog")
+        await self._emergency_close(symbol)
+        self._reset_fail(symbol)
+
+    def _reset_fail(self, symbol):
+        self._watchdog_fails.pop(symbol, None)
+
     # ---------- RECONCILE ----------
     async def reconcile(self):
-        """عند الإقلاع: طابق الحالة المحلية مع Binance"""
         try:
             positions = await self.executor.fetch_positions()
             open_orders = await self.executor.fetch_open_orders()
         except Exception as e:
-            log.error(f"reconcile fetch: {e}"); return
+            log.error(f"reconcile: {e}"); return
         binance_pos = {}
         for p in positions:
             contracts = float(p.get("contracts") or 0)
             if abs(contracts) < 1e-12: continue
             binance_pos[p["symbol"]] = p
-        # orphan positions (on Binance, not local)
         for sym, p in binance_pos.items():
             if sym in self.positions: continue
-            log.warning(f"⚠️ orphan {sym} → applying emergency SL")
+            log.warning(f"⚠️ orphan {sym} → SL طارئ")
             side = "sell" if p.get("side") == "long" else "buy"
             entry = float(p.get("entryPrice") or 0)
             sl_price = entry * (0.985 if p.get("side") == "long" else 1.015)
@@ -1002,22 +1086,19 @@ class PositionManager:
                     sym, "STOP_MARKET", side, None, None,
                     {"stopPrice": self.executor.ex.price_to_precision(sym, sl_price),
                      "closePosition": True, "workingType": "MARK_PRICE"})
-                log.info(f"🛡️ SL طارئ لـ {short(sym)} @ {sl_price}")
+                log.info(f"🛡️ SL طارئ {short(sym)} @ {sl_price}")
             except Exception as e:
                 log.error(f"emergency SL {sym}: {e}")
-        # local positions not on Binance
         for sym in list(self.positions.keys()):
             if sym not in binance_pos:
-                log.info(f"♻️ إزالة {short(sym)} (غير موجود على Binance)")
                 async with self._lock:
                     self.positions.pop(sym, None)
-        log.info(f"♻️ Reconcile: {len(self.positions)} محلية | {len(binance_pos)} على Binance")
+        log.info(f"♻️ Reconcile: {len(self.positions)} محلية | {len(binance_pos)} Binance")
 
     async def _get_balance_usd(self) -> float:
         try:
             b = await self.executor.fetch_balance()
-            usdt = b.get("USDT", {}).get("total") or 0
-            return float(usdt)
+            return float(b.get("USDT", {}).get("total") or 0)
         except: return 0.0
 
     async def _notify(self, text):
@@ -1717,6 +1798,15 @@ async def _startup_async(app: Application):
     await _ws_mgr.start()
     log.info("🚀 جاهز — Trading Engine يعمل")
 
+async def watchdog_job(context):
+    """job المراقبة: يتأكد من وجود SL/TP على Binance"""
+    if _positions_mgr is None: return
+    if not _positions_mgr.positions: return
+    try:
+        await _positions_mgr.watchdog_check()
+    except Exception as e:
+        log.exception(f"watchdog_job: {e}")
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ TELEGRAM_REPORT_BOT_TOKEN/CHAT_ID مطلوبة"); return
@@ -1766,6 +1856,10 @@ def main():
 
     # Trading loop كل 2 دقيقة
     app.job_queue.run_repeating(trading_loop, interval=120, first=30, name="trading")
+        # 🆕 Watchdog كل 3 دقائق
+    app.job_queue.run_repeating(
+        watchdog_job, interval=180, first=60, name="watchdog")
+    print("🛡️ Watchdog: كل 3 دقائق")
 
     print("✅ Start polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES,
