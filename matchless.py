@@ -996,10 +996,13 @@ class PositionManager:
         for o in open_orders:
             otype = o.get("type") or ""
             cid = o.get("clientOrderId") or ""
-            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype):
-                if "_sl" in cid or "_trail" in cid:
-                    has_sl = True; pos["sl_order_id"] = o.get("id")
-            elif "TAKE_PROFIT" in otype:
+            ctype = o.get("info", {}).get("type") or ""
+            # ✅ قبول أي STOP_MARKET أو TRAILING_STOP_MARKET كـ SL
+            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype
+                or ctype in ("STOP_MARKET", "TRAILING_STOP_MARKET")):
+                has_sl = True
+                pos["sl_order_id"] = o.get("id")
+            elif "TAKE_PROFIT" in otype or ctype == "TAKE_PROFIT_MARKET":
                 if "_tp1" in cid: tp_ids_seen.add("tp1")
                 elif "_tp2" in cid: tp_ids_seen.add("tp2")
                 elif "_tp3" in cid: tp_ids_seen.add("tp3")
