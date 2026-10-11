@@ -1463,4 +1463,314 @@ async def trading_loop(context):
                         text = (f"🚀 <b>تم الفتح — {short(sym)}</b> [{tf}]\n"
                                 f"{'🟢 LONG' if cross['direction']=='bullish' else '🔴 SHORT'}\n"
                                 f"━━━━━━━━━━━━━━━━━━━\n"
-                                f
+                                f"💰 Entry: <b>{fmt_price(pos['entry'])}</b>\n"
+                                f"📦 Qty: <b>{pos['qty']}</b> | Leverage: <b>{LEVERAGE}x</b>\n"
+                                f"💵 Margin: <b>${pos['notional']/LEVERAGE:.2f}</b>\n"
+                                f"🛑 SL: <b>{fmt_price(pos['sl'])}</b> (-{pos['sl_pct']}%)\n"
+                                f"🎯 TP1: {fmt_price(pos['tp1'])}\n"
+                                f"🎯 TP2: {fmt_price(pos['tp2'])}\n"
+                                f"🎯 TP3: {fmt_price(pos['tp3'])}")
+                        try:
+                            await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+                        except Exception as e:
+                            log.error(f"send: {e}")
+                except Exception as e:
+                    log.exception(f"trading {sym} {tf}: {e}")
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
+
+# ═══════════════════════════════════════════════════════════
+# 14) أوامر تيليجرام
+# ═══════════════════════════════════════════════════════════
+def _get_bot(): return _bot_ref[0] if _bot_ref[0] else None
+_bot_ref: list = [None]
+
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    sd, sn = get_session_info()
+    bal = await _positions_mgr._get_balance_usd() if _positions_mgr else 0
+    txt = (f"🤖 <b>Smart Trading Bot v7.0</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"💰 الرصيد: <b>${bal:.2f}</b>\n"
+           f"📊 Positions: <b>{len(_positions_mgr.positions) if _positions_mgr else 0}</b>/{MAX_CONCURRENT_POSITIONS}\n"
+           f"⚙️ Leverage: <b>{LEVERAGE}x ISOLATED</b>\n"
+           f"📏 Notional/trade: <b>${POSITION_NOTIONAL_USD}</b>\n"
+           f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n"
+           f"{'⏸️ <b>البوت موقوف</b>' if _positions_mgr and _positions_mgr.paused else '▶️ يعمل'}\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"<b>أوامر:</b>\n"
+           f"/positions — الصفقات المفتوحة\n"
+           f"/close SYM — إغلاق صفقة\n"
+           f"/closeall — إغلاق الكل\n"
+           f"/pause /resume — إيقاف/تشغيل\n"
+           f"/balance — الرصيد\n"
+           f"/why [SYM] — تشخيص\n"
+           f"/last — آخر الإشارات\n"
+           f"/status /stats /perf\n"
+           f"/strict /clearcache\n"
+           f"/emergency — 🆘 إغلاق كل شيء")
+    await u.message.reply_text(txt, parse_mode="HTML")
+
+async def cmd_positions(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not _positions_mgr or not _positions_mgr.positions:
+        await u.message.reply_text("📭 لا صفقات مفتوحة."); return
+    lines = [f"💼 <b>الصفقات المفتوحة ({len(_positions_mgr.positions)})</b>",
+             "━━━━━━━━━━━━━━━━━━━"]
+    for sym, pos in _positions_mgr.positions.items():
+        try:
+            data = await _executor.fetch_ohlcv(sym, "1m", 2)
+            price = float(data[-1][4]) if data else pos["entry"]
+        except: price = pos["entry"]
+        bull = pos["direction"] == "bullish"
+        pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) * (1 if bull else -1)
+        pnl_usd = (price - pos["entry"]) * pos["qty"] * (1 if bull else -1)
+        pnl_usd_lev = pnl_usd  # هامش * رافعة = (notional/lev) * (pnl/entry) * lev = same
+        lines.append(
+            f"\n{'🟢' if bull else '🔴'} <b>{short(sym)}</b> [{pos['tf']}]\n"
+            f"   Entry: {fmt_price(pos['entry'])} → {fmt_price(price)}\n"
+            f"   P&L: <b>{pnl_pct:+.2f}%</b> ({pnl_usd:+.2f}$) | Qty: {pos['qty']}\n"
+            f"   SL: {fmt_price(pos['sl'])} | TP: {fmt_price(pos['tp1'])}/{fmt_price(pos['tp2'])}/{fmt_price(pos['tp3'])}\n"
+            f"   {'✅TP1 ' if pos['tp1_filled'] else ''}"
+            f"{'✅TP2 ' if pos['tp2_filled'] else ''}"
+            f"{'✅TP3 ' if pos['tp3_filled'] else ''}"
+            f"{'🔄Trailing ' if pos.get('trailing_active') else ''}"
+            f"{'⚖️BE ' if pos.get('breakeven_moved') else ''}")
+    await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def cmd_close(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    args = c.args or []
+    if not args:
+        await u.message.reply_text("الاستخدام: /close BTC"); return
+    sym = find_symbol_by_name(args[0])
+    if not sym or sym not in _positions_mgr.positions:
+        await u.message.reply_text(f"❌ لا صفقة على {args[0]}"); return
+    await u.message.reply_text(f"⏳ إغلاق {short(sym)} ...")
+    ok = await _positions_mgr.close_position(sym, "manual")
+    await u.message.reply_text("✅ أُغلقت" if ok else "❌ فشل")
+
+async def cmd_closeall(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not _positions_mgr.positions:
+        await u.message.reply_text("📭 لا صفقات."); return
+    await u.message.reply_text(f"⚠️ إغلاق {len(_positions_mgr.positions)} صفقة ...")
+    await _positions_mgr.close_all()
+    await u.message.reply_text("✅ تم")
+
+async def cmd_emergency(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    _positions_mgr.paused = True
+    await u.message.reply_text("🆘 <b>إغلاق طارئ + إيقاف</b>", parse_mode="HTML")
+    await _positions_mgr.close_all("emergency")
+
+async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    _positions_mgr.paused = True
+    await u.message.reply_text("⏸️ موقوف (/resume للتشغيل)")
+
+async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    _positions_mgr.paused = False
+    _positions_mgr.consecutive_losses = 0
+    await u.message.reply_text("▶️ يعمل")
+
+async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    try:
+        b = await _executor.fetch_balance()
+        usdt = b.get("USDT", {})
+        txt = (f"💰 <b>الرصيد</b>\n"
+               f"• Total: <b>{usdt.get('total',0):.4f}</b> USDT\n"
+               f"• Free: <b>{usdt.get('free',0):.4f}</b> USDT\n"
+               f"• Used: <b>{usdt.get('used',0):.4f}</b> USDT")
+        await u.message.reply_text(txt, parse_mode="HTML")
+    except Exception as e:
+        await u.message.reply_text(f"❌ {e}")
+
+async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    sd, sn = get_session_info(); st = _smart.stats()
+    total = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
+    bal = await _positions_mgr._get_balance_usd()
+    jq = c.application.job_queue; jobs_n = len(jq.jobs()) if jq else 0
+    await u.message.reply_text(
+        f"🤖 <b>الحالة v7.0</b>\n"
+        f"🔌 Binance USDM\n"
+        f"💰 ${bal:.2f} | 📊 {len(_positions_mgr.positions)}/{MAX_CONCURRENT_POSITIONS}\n"
+        f"{'⏸️ موقوف' if _positions_mgr.paused else '▶️ يعمل'}\n"
+        f"🕐 {sn} ({sd:+d}) | Jobs: {jobs_n}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 إشارات: {_filter_stats['sent']}\n"
+        f"🚫 محجوبة: {total}\n"
+        f"📈 WR: <b>{st['wr']}%</b> (✅{st['wins']} ❌{st['losses']})\n"
+        f"📉 P&L اليوم: <b>{_positions_mgr.daily_pnl_usd:+.2f}$</b>\n"
+        f"❌ خسائر متتالية: {_positions_mgr.consecutive_losses}",
+        parse_mode="HTML")
+
+async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    st = _smart.stats()
+    if st["n"] == 0:
+        await u.message.reply_text("📊 لا نتائج بعد."); return
+    bar = "█" * int(st["wr"]/5) + "░" * (20 - int(st["wr"]/5))
+    await u.message.reply_text(
+        f"📊 <b>الأداء</b>\n<code>{bar}</code>\n"
+        f"📈 WR: <b>{st['wr']}%</b>\n"
+        f"✅ {st['wins']} | ❌ {st['losses']} | ⏰ {st['expired']}",
+        parse_mode="HTML")
+
+async def cmd_perf(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    rep = _smart.source_report()
+    if not rep: await u.message.reply_text("لا بيانات."); return
+    lines = ["📊 <b>أداء المصادر</b>"]
+    for src, d in rep.items():
+        tot = d["wins"] + d["losses"]
+        wr = round(d["wins"]/tot*100,1) if tot>0 else 0
+        lines.append(f"\n🔹 <b>{_source_label(src)}</b>\n   ✅{d['wins']} ❌{d['losses']} | WR {wr}%")
+    await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def cmd_last(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not _last_signals: await u.message.reply_text("📭 لا إشارات."); return
+    lines = ["📋 <b>آخر الإشارات</b>"]
+    for s in reversed(list(_last_signals)):
+        d_icon = "🟢" if s["direction"]=="bullish" else "🔴"
+        ts = datetime.fromtimestamp(s["ts"], tz=SYRIA_TZ).strftime("%H:%M")
+        lines.append(f"{d_icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
+                     f"{_source_label(s['source'])} | {ts} | Score={s['score']}")
+    await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+async def cmd_why(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    args = c.args or []
+    if args:
+        sym = find_symbol_by_name(args[0])
+        if not sym: await u.message.reply_text(f"❌ {args[0]}"); return
+        lines = [f"📊 <b>تشخيص {short(sym)}</b>"]
+        for tf in ["5m","15m","1h"]:
+            try:
+                df = await _df_for(sym, tf)
+                if df is None: lines.append(f"\n<b>[{tf}]</b> ❌"); continue
+                df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+                curr = -2
+                cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+                gap = abs(cf-cs)/cs*100; atr_p = float(calc_atr(df).iloc[curr])/float(df["c"].iloc[curr])*100
+                adx = float(calc_adx(df).iloc[curr]); rsi = float(calc_rsi(df["c"]).iloc[curr])
+                th = get_thresholds(atr_pct=atr_p, adx=adx, tf=tf)
+                lines.append(f"\n<b>[{tf}]</b> 💰{fmt_price(float(df['c'].iloc[curr]))}\n"
+                             f"EMA gap {gap:.3f}% | ATR {atr_p:.2f}% | ADX {adx:.1f} | RSI {rsi:.1f}")
+            except Exception as e:
+                lines.append(f"\n<b>[{tf}]</b> ❌ {e}")
+        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
+    else:
+        await u.message.reply_text("الاستخدام: /why BTC")
+
+async def cmd_strict(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    th = get_thresholds(tf="15m")
+    await u.message.reply_text(
+        f"🎯 <b>الإعدادات</b>\n"
+        f"• Leverage: <b>{LEVERAGE}x</b> ISOLATED\n"
+        f"• Notional: <b>${POSITION_NOTIONAL_USD}</b>\n"
+        f"• Max concurrent: <b>{MAX_CONCURRENT_POSITIONS}</b>\n"
+        f"• MAX_SL_PCT: <b>{MAX_SL_PCT}%</b>\n"
+        f"• Score مطلق ≥ <b>{ABS_MIN_SCORE}</b>\n"
+        f"• Score ديناميكي ≥ <b>{th['min_score']:.0f}</b>\n"
+        f"• Daily loss limit: <b>{MAX_DAILY_LOSS_PCT}%</b>\n"
+        f"• Max consecutive losses: <b>{MAX_CONSECUTIVE_LOSSES}</b>\n"
+        f"• TP splits: <b>{TP_SPLITS}</b>\n"
+        f"• Trailing after TP2: <b>{TRAIL_CALLBACK_RATE}%</b>",
+        parse_mode="HTML")
+
+async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    global _crossover_cache, _divergence_cache, _bb_cache, _sr_cache
+    _crossover_cache.clear(); _divergence_cache.clear()
+    _bb_cache.clear(); _sr_cache.clear()
+    _ohlcv_rest_cache.clear()
+    _smart.reset_feedback()
+    await u.message.reply_text("✅ تم")
+
+async def error_handler(u, c):
+    err = c.error
+    if isinstance(err, (NetworkError, TimedOut)): log.warning(f"⚠️ {err}"); return
+    log.error(f"❌ {err}", exc_info=err)
+
+# ═══════════════════════════════════════════════════════════
+# 15) Health
+# ═══════════════════════════════════════════════════════════
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8")
+        self.end_headers(); self.wfile.write(b"OK - v7.0")
+    def do_HEAD(self): self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+
+def run_health():
+    port = int(os.getenv("PORT","8080"))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+# ═══════════════════════════════════════════════════════════
+# 16) Main
+# ═══════════════════════════════════════════════════════════
+async def _startup_async(app: Application):
+    global _executor, _positions_mgr, _ws_mgr
+    _executor = BinanceExecutor()
+    _positions_mgr = PositionManager(_executor, _get_bot)
+    _ws_mgr = WebSocketManager(_executor, _positions_mgr)
+    _positions_mgr.ws_ref = _ws_mgr
+    await _positions_mgr.reconcile()
+    # initial ohlcv fetch
+    for sym in ALL_SYMBOLS:
+        for tf in TIMEFRAMES:
+            try:
+                await fetch_ohlcv_cached(sym, tf, 200)
+            except Exception as e:
+                log.warning(f"initial {sym} {tf}: {e}")
+    await _ws_mgr.start()
+    log.info("🚀 جاهز — Trading Engine يعمل")
+
+def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ TELEGRAM_REPORT_BOT_TOKEN/CHAT_ID مطلوبة"); return
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        print("❌ BINANCE_API_KEY/SECRET مطلوبة"); return
+
+    threading.Thread(target=run_health, daemon=True).start()
+
+    print(f"📊 Symbols: {ALL_SYMBOLS}")
+    print(f"⚙️ Leverage: {LEVERAGE}x ISOLATED | ${POSITION_NOTIONAL_USD}/trade")
+    print(f"🛡️ Max positions: {MAX_CONCURRENT_POSITIONS}")
+    print(f"🛡️ Max SL: {MAX_SL_PCT}% | Daily loss: {MAX_DAILY_LOSS_PCT}%")
+
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
+                           connect_timeout=30.0, pool_timeout=30.0)
+
+    app = (Application.builder().token(BOT_TOKEN)
+           .request(request).get_updates_request(request).build())
+
+    if app.job_queue is None:
+        raise RuntimeError("job_queue غير متوفر — pip install 'python-telegram-bot[job-queue]'")
+
+    # Handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("closeall", cmd_closeall))
+    app.add_handler(CommandHandler("emergency", cmd_emergency))
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("perf", cmd_perf))
+    app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("why", cmd_why))
+    app.add_handler(CommandHandler("strict", cmd_strict))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
+    app.add_error_handler(error_handler)
+
+    async def _post_init(app):
+        _bot_ref[0] = app.bot
+        await _startup_async(app)
+
+    app.post_init = _post_init
+
+    # Trading loop كل 2 دقيقة
+    app.job_queue.run_repeating(trading_loop, interval=120, first=30, name="trading")
+
+    print("✅ Start polling")
+    app.run_polling(allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True, bootstrap_retries=5)
+
+
+if __name__ == "__main__":
+    main()
