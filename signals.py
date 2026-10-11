@@ -1,15 +1,17 @@
 """
-Unified Smart Bot v6.3 — Signal Follow-up + Fixed Filters
-==========================================================
-  🆕 رسائل متابعة للإشارات (TP1/TP2/TP3/SL/Expired)
-  🆕 منع دايفرجنس ضد الترند بدون تأكيد MTF
-  🆕 إصلاح cache في SmartStrictness
+Unified Smart Bot v6.4 — Tight Filters + Fixed MTF
+==================================================
+  🆕 إصلاح MTF bonus المزدوج
+  🆕 cache أكثر صرامة (60 ثانية)
+  🆕 حد أدنى لفرق EMA
+  🆕 حد أدنى لـ ATR
+  🆕 منع EMA ضد الترند
+  🆕 منع BB Squeeze عندما ADX < 15
+  🆕 منع تكرار الإشارات لنفس العملة خلال 5 دقائق
+  ✓ رسائل متابعة للإشارات
   ✓ SL/TP مع حد أدنى حسب الإطار
-  ✓ classify_market_safe مع HTF fallback
-  ✓ VWAP بنظام الجلسة (day/week)
-  ✓ 4 كواشف: EMA + RSI Div + BB Squeeze + S/R
-  ✓ Multi-TF + Session Adjustments
-  ✓ 🌅 تقرير صباحي 10:00 + /perf
+  ✓ 4 كواشف: EMA + RSI Div + BB + S/R
+  ✓ Multi-TF + Sessions + Morning Report + /perf
 """
 import os, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -107,14 +109,20 @@ SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
-# 🆕 إعدادات المتابعة
+# 🆕 إعدادات v6.4
+MIN_EMA_GAP_PCT = {"5m": 0.03, "15m": 0.02, "1h": 0.01}   # حد أدنى لفرق EMA
+MIN_ATR_PCT     = {"5m": 0.15, "15m": 0.20, "1h": 0.30}   # حد أدنى لـ ATR
+MIN_ADX_FOR_BB  = 15.0                                     # BB Squeeze يحتاج ADX ≥
+SYMBOL_COOLDOWN_SEC = 300                                  # 5 دقائق بين إشارتين لنفس العملة
+SYMBOL_COOLDOWN_SOURCES = {"ema", "rsi_div", "bb_squeeze", "sr_breakout"}  # كلها
+
 FOLLOWUP_ENABLED = True
 FOLLOWUP_ON_TP1 = True
 FOLLOWUP_ON_TP2 = True
 FOLLOWUP_ON_TP3 = True
 FOLLOWUP_ON_SL = True
-FOLLOWUP_ON_EXPIRE = True      # ⏰ أرسل للانتهاء
-FOLLOWUP_THROTTLE_SEC = 120    # لا رسالتين متتاليتين خلال دقيقتين
+FOLLOWUP_ON_EXPIRE = True
+FOLLOWUP_THROTTLE_SEC = 120
 
 
 # ═══════════════════════════════════════════════════════════
@@ -234,7 +242,7 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) محرك التشدد الذكي (cache مُصلح)
+# 4) محرك التشدد الذكي (cache 60 ثانية)
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -273,7 +281,7 @@ class SmartStrictness:
         self._cached_ts = 0.0
         self._cached_atr = None
         self._cached_adx = None
-        self._cache_ttl = 120.0
+        self._cache_ttl = 60.0   # 🆕 60 ثانية بدل 120
 
     def record(self, passed, score, source="unknown"):
         with self._lock:
@@ -298,16 +306,13 @@ class SmartStrictness:
                 self.source_stats[source]["losses"] += 1
 
     def _feedback(self):
-        """يعتمد على النتائج الفعلية — Expired محايد"""
         with self._lock:
             results = list(self.results)[-50:]
             recent = list(self.history)[-50:]
-        # نُصفّي expired من النتائج (محايدة)
         non_expired = [r for r in results if not r.get("expired")]
         if len(non_expired) >= 15:
             wins = sum(1 for r in non_expired if r["win"])
-            ratio = wins / len(non_expired)
-            n = len(non_expired)
+            ratio = wins / len(non_expired); n = len(non_expired)
         else:
             n = len(recent)
             if n < 20: return 0, None, 0
@@ -321,12 +326,12 @@ class SmartStrictness:
 
     def compute(self, atr_pct=None, adx=None):
         now = _time.time()
-        # 🆕 cache فقط إذا كانت القيم متقاربة
+        # 🆕 cache 60 ثانية + فحص دقيق للقيم
         if (self._cached_profile
             and (now - self._cached_ts) < self._cache_ttl
             and self._cached_atr is not None
-            and abs(self._cached_atr - (atr_pct or 0)) < 0.10
-            and abs(self._cached_adx - (adx or 0)) < 3.0):
+            and abs(self._cached_atr - (atr_pct or 0)) < 0.05
+            and abs(self._cached_adx - (adx or 0)) < 2.0):
             return self._cached_profile
         
         if atr_pct is None or atr_pct <= 0: atr_pct = 0.5
@@ -351,8 +356,7 @@ class SmartStrictness:
                 "block_against_htf": final >= 55,
                 "score_15m_override": min(90, final + 10),
                 "_debug": {"base": base, "adx_delta": adx_delta,
-                           "fb_delta": fb_delta, "pass_ratio": pass_ratio,
-                           "atr": atr_pct, "adx": adx}}
+                           "fb_delta": fb_delta, "atr": atr_pct, "adx": adx}}
         self._cached_profile = prof
         self._cached_ts = now
         self._cached_atr = atr_pct
@@ -366,7 +370,6 @@ class SmartStrictness:
             wins = sum(1 for r in self.results if r["win"])
             expired = sum(1 for r in self.results if r.get("expired"))
             losses = n - wins - expired
-        # WR يعتمد على decisive فقط
         decisive = wins + losses
         wr = round(wins/decisive*100, 1) if decisive > 0 else 0
         return {"n": n, "wr": wr, "wins": wins, "losses": losses, "expired": expired}
@@ -637,12 +640,14 @@ _pending_signals = {}
 _divergence_cache = {}
 _bb_cache = {}
 _sr_cache = {}
+_last_signal_time = {}   # 🆕 symbol → آخر وقت إرسال
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0, "filtered_adx": 0,
-    "filtered_atr": 0, "filtered_htf": 0, "filtered_vwap": 0,
-    "filtered_conflict": 0, "filtered_range": 0, "filtered_mtf": 0,
-    "filtered_trend": 0, "filtered_other": 0,
+    "filtered_atr": 0, "filtered_atr_low": 0, "filtered_htf": 0,
+    "filtered_vwap": 0, "filtered_conflict": 0, "filtered_range": 0,
+    "filtered_mtf": 0, "filtered_trend": 0, "filtered_ema_gap": 0,
+    "filtered_cooldown": 0, "filtered_other": 0,
     "range_breakouts": 0, "range_approaches": 0,
     "range_6pct_reports": 0, "morning_reports": 0, "signals_tracked": 0,
     "signals_divergence": 0, "signals_bb": 0, "signals_sr": 0,
@@ -735,10 +740,24 @@ def record_signal(symbol, direction):
     _recent_signals[symbol] = (direction, _time.time())
 
 
+def check_symbol_cooldown(symbol):
+    """🆕 يمنع إرسال إشارتين لنفس العملة خلال SYMBOL_COOLDOWN_SEC"""
+    now = _time.time()
+    last = _last_signal_time.get(symbol, 0)
+    if now - last < SYMBOL_COOLDOWN_SEC:
+        return False, int(SYMBOL_COOLDOWN_SEC - (now - last))
+    return True, 0
+
+
+def mark_symbol_sent(symbol):
+    _last_signal_time[symbol] = _time.time()
+
+
 # ═══════════════════════════════════════════════════════════
-# 10) حساب Score
+# 10) حساب Score (بدون MTF — يُضاف لاحقاً مرة واحدة)
 # ═══════════════════════════════════════════════════════════
 def compute_score(df, direction, curr_idx=-2):
+    """يُعيد Score أساسي (بدون MTF — يُضاف في passes_filter)"""
     close = df["c"]; vol = df["v"]
     price = float(close.iloc[curr_idx])
     try:
@@ -789,68 +808,122 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) الفلتر
+# 11) الفلتر (مُشدّد — 12 فلتر)
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
     if not s: return False, "لا مؤشرات", "other"
     tf = cross["timeframe"]
-    vol, adx, atr, score = s.get("vol_ratio", 0), s.get("adx", 0), s.get("atr_pct", 0), s.get("score", 0)
-    th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
-    min_score = th["min_score"]
-    if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
-
+    vol = s.get("vol_ratio", 0)
+    adx = s.get("adx", 0)
+    atr = s.get("atr_pct", 0)
+    base_score = cross.get("base_score", s.get("score", 0))
+    gap_pct = s.get("gap_pct", 0)
+    source = cross.get("source", "ema")
+    direction = cross["direction"]
+    
+    # ⚙️ 1) فحص cooldown للعملة (قبل أي حساب)
+    ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
+    if not ok_cooldown:
+        return False, f"cooldown {remaining}s", "cooldown"
+    
+    # ⚙️ 2) حدود أدنى صارمة
+    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.03)
+    if gap_pct < min_gap and source == "ema":
+        return False, f"فرق EMA {gap_pct:.3f}% < {min_gap}%", "ema_gap"
+    
+    min_atr = MIN_ATR_PCT.get(tf, 0.15)
+    if atr < min_atr:
+        return False, f"ATR {atr}% < {min_atr}%", "atr_low"
+    
+    # ⚙️ 3) حساب MTF مرة واحدة
+    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
+    cross["mtf"] = mtf_desc
+    cross["mtf_bonus"] = mtf_bonus
+    score = base_score + mtf_bonus    # 🆕 Score نهائي (base + MTF مرة واحدة)
+    s["score"] = score
+    
+    # ⚙️ 4) رفض MTF تعارض كامل
+    if mtf_bonus <= -15:
+        return False, mtf_desc, "mtf"
+    
+    # ⚙️ 5) السوق
     df = cross.get("_df")
     market = cross.get("market") or "UNKNOWN"
     if market == "UNKNOWN":
         market = await classify_market_safe(cross["symbol"], tf, df)
         cross["market"] = market
-
-    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], cross["direction"])
-    cross["mtf"] = mtf_desc
-    cross["mtf_bonus"] = mtf_bonus
-    score += mtf_bonus
-    s["score"] = score
-
+    
+    # ⚙️ 6) العتبات
+    th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
+    min_score = th["min_score"]
+    if tf == "15m":
+        min_score = max(min_score, th.get("score_15m_override", min_score))
+    
     passed, reason, cat = True, "", ""
-    if mtf_bonus <= -15:
-        return False, mtf_desc, "mtf"
-
+    
+    # ⚙️ 7) فلتر Score
     if score < min_score:
-        passed, reason, cat = False, f"Score {score} < {min_score:.0f}", "score"
-    elif vol < th["min_vol_ratio"]:
-        passed, reason, cat = False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
-    elif adx < th["min_adx"]:
-        passed, reason, cat = False, f"ADX {adx} < {th['min_adx']}", "adx"
-    elif atr > th["max_atr_pct"]:
-        passed, reason, cat = False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
-    # 🆕 منع الدايفرجنس ضد الترند بدون MTF ≥ 2/3
-    elif cross.get("source") == "rsi_div":
-        d = cross["direction"]
-        if market == "TREND_DOWN" and d == "bullish" and mtf_bonus < 3:
-            passed, reason, cat = False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
-        elif market == "TREND_UP" and d == "bearish" and mtf_bonus < 3:
-            passed, reason, cat = False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
-    # منع تقاطعات EMA في الرينج
-    elif market == "RANGE" and cross.get("source") == "ema" \
-         and cross.get("alert_type") == "confirmed":
-        passed, reason, cat = False, "سوق عرضي — تقاطع وهمي", "range"
-    elif th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
-        d = cross["direction"]
-        if d == "bullish" and htf_trend == "DOWN":
-            passed, reason, cat = False, "HTF=DOWN ضد LONG", "htf"
-        elif d == "bearish" and htf_trend == "UP":
-            passed, reason, cat = False, "HTF=UP ضد SHORT", "htf"
-
-    if passed and df is not None:
-        ok, slope = check_vwap_slope(df, cross["direction"], th, tf=tf)
-        if not ok: passed, reason, cat = False, f"VWAP {slope:+.2f}% ضد", "vwap"
-    if passed and cross.get("alert_type") == "confirmed":
-        if has_conflicting_signal(cross["symbol"], cross["direction"]):
-            passed, reason, cat = False, "تعارض", "conflict"
+        return False, f"Score {score} < {min_score:.0f}", "score"
+    
+    # ⚙️ 8) فلتر Volume
+    if vol < th["min_vol_ratio"]:
+        return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
+    
+    # ⚙️ 9) فلتر ADX العام
+    if adx < th["min_adx"]:
+        return False, f"ADX {adx} < {th['min_adx']}", "adx"
+    
+    # ⚙️ 10) فلتر ATR الأعلى
+    if atr > th["max_atr_pct"]:
+        return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
+    
+    # ⚙️ 11) 🆕 فلتر ADX خاص بـ BB Squeeze
+    if source == "bb_squeeze" and adx < MIN_ADX_FOR_BB:
+        return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
+    
+    # ⚙️ 12) 🆕 منع EMA ضد الترند
+    if source == "ema":
+        if market == "TREND_DOWN" and direction == "bullish":
+            if mtf_bonus < 5:
+                return False, "تقاطع صاعد في ترند هابط", "trend"
+        elif market == "TREND_UP" and direction == "bearish":
+            if mtf_bonus < 5:
+                return False, "تقاطع هابط في ترند صاعد", "trend"
+    
+    # ⚙️ 13) منع دايفرجنس ضد الترند بدون MTF ≥ 2/3
+    if source == "rsi_div":
+        if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 3:
+            return False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+        elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 3:
+            return False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+    
+    # ⚙️ 14) رفض EMA في الرينج
+    if market == "RANGE" and source == "ema" \
+       and cross.get("alert_type") == "confirmed":
+        return False, "سوق عرضي — تقاطع وهمي", "range"
+    
+    # ⚙️ 15) HTF block
+    if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
+        if direction == "bullish" and htf_trend == "DOWN":
+            return False, "HTF=DOWN ضد LONG", "htf"
+        elif direction == "bearish" and htf_trend == "UP":
+            return False, "HTF=UP ضد SHORT", "htf"
+    
+    # ⚙️ 16) VWAP slope
+    if df is not None:
+        ok, slope = check_vwap_slope(df, direction, th, tf=tf)
+        if not ok:
+            return False, f"VWAP {slope:+.2f}% ضد", "vwap"
+    
+    # ⚙️ 17) تعارض
+    if cross.get("alert_type") == "confirmed":
+        if has_conflicting_signal(cross["symbol"], direction):
+            return False, "تعارض", "conflict"
+    
     if STRICTNESS == "auto":
-        _smart.record(passed, score, source=cross.get("source", "unknown"))
-    return passed, reason, cat
+        _smart.record(True, score, source=source)
+    return True, "", ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -868,12 +941,14 @@ async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
     cts = int(df["ts"].iloc[curr])
     levels = compute_levels(df, direction, curr, tf=tf)
     market = await classify_market_safe(symbol, tf, df)
+    support = compute_score(df, direction, curr)   # Score أساسي (بدون MTF)
     out = {"symbol": symbol, "timeframe": tf, "direction": direction,
            "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
            "gap_pct": round(abs(cf - cs) / cs * 100, 3) if cs else 0,
            "strength": strength, "alert_type": alert_type,
-           "support": compute_score(df, direction, curr),
+           "support": support,
+           "base_score": support["score"],   # 🆕 Score أساسي
            "_df": df, "exchange": _exchange.primary_name,
            "levels": levels, "source": source,
            "market": market}
@@ -1413,7 +1488,7 @@ def build_ranges_report():
 
 
 # ═══════════════════════════════════════════════════════════
-# 18b) 🆕 رسائل المتابعة
+# 18b) رسائل المتابعة
 # ═══════════════════════════════════════════════════════════
 def build_followup_msg(sig, result, price, age_min):
     cross = sig["cross"]
@@ -1463,29 +1538,23 @@ def build_followup_msg(sig, result, price, age_min):
     elif result == "win_tp2":
         msg += "\n💡 <i>يُنصح بنقل SL إلى TP1</i>"
     elif result == "loss_sl":
-        msg += f"\n💡 <i>قد يكون الوقت غير مناسب — راجع /perf</i>"
+        msg += f"\n💡 <i>راجع /perf للأداء</i>"
     elif result == "expired":
         msg += f"\n💡 <i>لم يحرّك السعر بشكل كافٍ خلال {SIGNAL_TRACK_MAX_MIN} دقيقة</i>"
     return msg
 
 
 async def send_followup(bot, sig, result, price, age_min):
-    """🆕 يُرسل متابعة مع throttle"""
     if not FOLLOWUP_ENABLED: return
-    # فحص الأعلام
     if result == "win_tp1" and not FOLLOWUP_ON_TP1: return
     if result == "win_tp2" and not FOLLOWUP_ON_TP2: return
     if result == "win_tp3" and not FOLLOWUP_ON_TP3: return
     if result == "loss_sl" and not FOLLOWUP_ON_SL: return
     if result == "expired" and not FOLLOWUP_ON_EXPIRE: return
-    
-    # throttle
     now = _time.time()
     last_sent = sig.get("last_followup_ts", 0)
-    if now - last_sent < FOLLOWUP_THROTTLE_SEC:
-        return
+    if now - last_sent < FOLLOWUP_THROTTLE_SEC: return
     sig["last_followup_ts"] = now
-    
     text = build_followup_msg(sig, result, price, age_min)
     if not text: return
     try:
@@ -1497,7 +1566,7 @@ async def send_followup(bot, sig, result, price, age_min):
 
 
 # ═══════════════════════════════════════════════════════════
-# 18c) تتبّع الإشارات (مع متابعة)
+# 18c) تتبّع الإشارات
 # ═══════════════════════════════════════════════════════════
 def register_signal_for_tracking(cross):
     levels = cross.get("levels")
@@ -1527,15 +1596,13 @@ async def evaluate_pending_signals(bot=None):
             sig["result"] = "expired"
             _smart.record_result("expired", sig["direction"], sig.get("source", "unknown"))
             if bot and CHAT_ID:
-                await send_followup(bot, sig, "expired",
-                                    sig["levels"]["entry"], age_min)
+                await send_followup(bot, sig, "expired", sig["levels"]["entry"], age_min)
             continue
         try:
             data, _ = await _exchange.fetch_ohlcv(sig["cross"]["symbol"], "1m", 3)
             if not data: continue
             price = float(data[-1][4])
             lv = sig["levels"]
-            # تتبّع أعلى/أدنى
             if sig["direction"] == "bullish":
                 sig["max_favorable"] = max(sig["max_favorable"], price)
                 sig["max_adverse"] = min(sig["max_adverse"], price)
@@ -1550,28 +1617,23 @@ async def evaluate_pending_signals(bot=None):
                 elif price >= lv["tp3"]:
                     sig["checked"] = True; new_result = "win_tp3"
                 elif price >= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
-                    new_result = "win_tp2"
-                    sig["result"] = "win_tp2"
+                    new_result = "win_tp2"; sig["result"] = "win_tp2"
                 elif price >= lv["tp1"] and not sig.get("result"):
-                    new_result = "win_tp1"
-                    sig["result"] = "win_tp1"
+                    new_result = "win_tp1"; sig["result"] = "win_tp1"
             else:
                 if price >= lv["stop_loss"]:
                     sig["checked"] = True; new_result = "loss_sl"
                 elif price <= lv["tp3"]:
                     sig["checked"] = True; new_result = "win_tp3"
                 elif price <= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
-                    new_result = "win_tp2"
-                    sig["result"] = "win_tp2"
+                    new_result = "win_tp2"; sig["result"] = "win_tp2"
                 elif price <= lv["tp1"] and not sig.get("result"):
-                    new_result = "win_tp1"
-                    sig["result"] = "win_tp1"
+                    new_result = "win_tp1"; sig["result"] = "win_tp1"
             
             if new_result:
                 if sig["checked"]:
                     _smart.record_result(sig["result"], sig["direction"],
                                          sig.get("source", "unknown"))
-                    log.info(f"🏁 نتيجة نهائية {sid}: {sig['result']}")
                 if bot and CHAT_ID:
                     await send_followup(bot, sig, new_result, price, age_min)
         except Exception as e:
@@ -1591,18 +1653,16 @@ async def cmd_start(update, context):
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.3</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.4</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
         f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🎯 الكواشف:</b>\n"
-        f"• EMA {'✅' if ENABLE_CONFIRMED else '❌'} | "
-        f"RSI Div {'✅' if ENABLE_RSI_DIVERGENCE else '❌'} | "
-        f"BB {'✅' if ENABLE_BB_SQUEEZE else '❌'} | "
-        f"S/R {'✅' if ENABLE_SR_BREAKOUT else '❌'}\n"
-        f"• Multi-TF: {'✅' if MTF_ENABLED else '❌'}\n"
-        f"• 📬 متابعة الإشارات: {'✅' if FOLLOWUP_ENABLED else '❌'}\n\n"
+        f"<b>🛡️ فلاتر v6.4:</b>\n"
+        f"• EMA gap ≥ {MIN_EMA_GAP_PCT['5m']}% (5m)\n"
+        f"• ATR ≥ {MIN_ATR_PCT['5m']}% (5m)\n"
+        f"• BB يحتاج ADX ≥ {MIN_ADX_FOR_BB}\n"
+        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n\n"
         f"<b>الأوامر:</b>\n"
         f"/sr /ref6 /ranges /checkranges /refresh\n"
         f"/cross /cross5 /cross15 /cross1h /checkprice\n"
@@ -1635,6 +1695,10 @@ async def _run_cross(update, tfs=None):
                     filtered += 1; continue
                 try:
                     await update.message.reply_text(build_signal_message(cross), parse_mode="HTML")
+                    mark_symbol_sent(sym)
+                    if cross["alert_type"] == "confirmed":
+                        record_signal(sym, cross["direction"])
+                        register_signal_for_tracking(cross)
                     found += 1
                 except Exception as e:
                     log.error(f"send {sym} {tf}: {e}")
@@ -1746,7 +1810,7 @@ async def cmd_status(update, context):
     st = _smart.stats()
     active = len([s for s in _pending_signals.values() if not s["checked"]])
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.3</b>\n"
+        f"🤖 <b>الحالة v6.4</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
@@ -1760,6 +1824,11 @@ async def cmd_status(update, context):
         f"⚠️ اقتراب: {_filter_stats['range_approaches']}\n"
         f"🌅 صباح: {_filter_stats['morning_reports']}\n"
         f"🚫 محجوبة: {total}\n"
+        f"  • trend: {_filter_stats['filtered_trend']}\n"
+        f"  • ema_gap: {_filter_stats['filtered_ema_gap']}\n"
+        f"  • atr_low: {_filter_stats['filtered_atr_low']}\n"
+        f"  • cooldown: {_filter_stats['filtered_cooldown']}\n"
+        f"  • mtf: {_filter_stats['filtered_mtf']}\n"
         f"📈 WR: <b>{st['wr']}%</b> "
         f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1823,19 +1892,28 @@ async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
     sd, sn = get_session_info()
     await update.message.reply_text(
-        f"🎯 <b>التشدد:</b> {STRICTNESS.upper()}\n"
+        f"🎯 <b>التشدد v6.4</b>\n"
         f"🕐 {sn} ({sd:+d})\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
         f"• Score ≥ {th['min_score']:.0f}\n"
         f"• Vol ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
-        f"• SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%",
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>حدود v6.4:</b>\n"
+        f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}% | "
+        f"15m≥{MIN_EMA_GAP_PCT['15m']}% | 1h≥{MIN_EMA_GAP_PCT['1h']}%\n"
+        f"• ATR: 5m≥{MIN_ATR_PCT['5m']}% | 15m≥{MIN_ATR_PCT['15m']}% | 1h≥{MIN_ATR_PCT['1h']}%\n"
+        f"• BB: ADX ≥ {MIN_ADX_FOR_BB}\n"
+        f"• SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%\n"
+        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s",
         parse_mode="HTML")
 
 
 async def cmd_clearcache(update, context):
     clear_caches()
     _smart.reset_feedback()
+    _last_signal_time.clear()
     await update.message.reply_text("✅ تم تفريغ الكاش.")
 
 
@@ -1872,6 +1950,7 @@ async def crossover_job(context):
                                 parse_mode="HTML")
                             total += 1
                             _filter_stats["sent"] += 1
+                            mark_symbol_sent(sym)
                             if cross["alert_type"] == "confirmed":
                                 record_signal(sym, cross["direction"])
                                 register_signal_for_tracking(cross)
@@ -1974,7 +2053,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.3")
+        self.wfile.write(b"OK - Unified Smart Bot v6.4")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -2001,10 +2080,16 @@ def main():
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 رموز: {ALL_SYMBOLS}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
-    print(f"🔍 الكواشف: EMA + RSI Div + BB + S/R")
-    print(f"📏 SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
-    print(f"📬 متابعة الإشارات: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
-    print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00 (سوريا)")
+    print(f"🛡️ فلاتر v6.4:")
+    print(f"   • EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}% | "
+          f"15m≥{MIN_EMA_GAP_PCT['15m']}% | 1h≥{MIN_EMA_GAP_PCT['1h']}%")
+    print(f"   • ATR min: 5m≥{MIN_ATR_PCT['5m']}% | "
+          f"15m≥{MIN_ATR_PCT['15m']}% | 1h≥{MIN_ATR_PCT['1h']}%")
+    print(f"   • BB يحتاج ADX ≥ {MIN_ADX_FOR_BB}")
+    print(f"   • cooldown: {SYMBOL_COOLDOWN_SEC}s")
+    print(f"📏 SL min: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
+    print(f"📬 متابعة: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
+    print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
