@@ -1,10 +1,11 @@
 """
-Unified Smart Bot v5.1 — Manual Ranges + 6% Reference Report
+Unified Smart Bot v5.1.1 — Manual Ranges + 6% Reference Report
 =============================================================
   ✓ متغيّرات النطاقات اليدوية للمراقبة (XRP_LOWER/XRP_UPPER ...)
   ✓ تقرير 6% مرجعي عند التشغيل + كل 4 ساعات
   ✓ إشعارات اقتراب + خروج + إشارات EMA + تنبيهات مفاجئة
   ✓ بدون Binance
+  🆕 إصلاح: التحقق الصريح من job_queue (كان يفشل بصمت إذا لم يُثبَّت الـ extra)
 """
 import os, re, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 from collections import deque
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-for _n in ("httpx", "telegram", "telegram.ext", "ccxt"):
+for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("unified")
 
@@ -33,9 +34,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_REPORT_CHAT_ID")
 
-RANGE_PCT = 6.0                        # نسبة النطاق المرجعي
-RANGE_REPORT_INTERVAL_HOURS = 4        # كل 4 ساعات
-SEND_STARTUP_REPORT = True             # إرسال التقرير عند التشغيل
+RANGE_PCT = 6.0
+RANGE_REPORT_INTERVAL_HOURS = 4
+SEND_STARTUP_REPORT = True
 
 PRIMARY_EXCHANGE = "bybit"
 FALLBACK_EXCHANGES = ["okx", "kucoin", "bitget", "mexc", "gate"]
@@ -370,7 +371,7 @@ _crossover_cache = {}
 _price_state = {}
 _recent_signals = {}
 _last_range = {}
-_last_6pct_report = {}   # symbol → {price, lower, upper, ts}
+_last_6pct_report = {}
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0, "filtered_adx": 0,
@@ -676,7 +677,7 @@ def _load_manual_ranges():
 
 
 # ═══════════════════════════════════════════════════════════
-# 15) 🆕 حساب نطاق 6% المرجعي
+# 15) حساب نطاق 6% المرجعي
 # ═══════════════════════════════════════════════════════════
 async def _get_current_price(symbol):
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 2)
@@ -685,13 +686,9 @@ async def _get_current_price(symbol):
 
 
 async def compute_6pct_ranges():
-    """
-    يحسب نطاق 6% لكل عملة (السعر ± 3%)
-    يُخزّن النتيجة في _last_6pct_report
-    """
     global _last_6pct_report
     results = []
-    half = RANGE_PCT / 200.0  # 6% → 0.03
+    half = RANGE_PCT / 200.0
 
     for symbol in ALL_SYMBOLS:
         try:
@@ -723,7 +720,6 @@ async def compute_6pct_ranges():
 
 
 def build_6pct_report(results, title="📊 نطاقات 6% المرجعية"):
-    """يبني رسالة تقرير 6% بتنسيق يسهل نسخه لـ Render"""
     if not results:
         return f"{title}\n📭 لا بيانات."
 
@@ -758,7 +754,7 @@ def build_6pct_report(results, title="📊 نطاقات 6% المرجعية"):
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) مراقبة النطاق اليدوي: اقتراب + خروج
+# 16) مراقبة النطاق اليدوي
 # ═══════════════════════════════════════════════════════════
 async def check_range_breakout(symbol):
     if not RANGE_BREAKOUT_ENABLED: return None
@@ -875,7 +871,6 @@ def build_approach_msg(a):
     emoji = "⚠️" if up else "🔔"
     title = "اقتراب من الحد الأعلى 🔺" if up else "اقتراب من الحد الأدنى 🔻"
     arrow = "⬆️" if up else "⬇️"
-    shift_sign = "+" if a["shift"] > 0 else ""
     return (
         f"{emoji} <b>اقتراب من النطاق — {short(a['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
@@ -994,7 +989,7 @@ async def cmd_start(update, context):
         for s, r in _last_range.items()
     ) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v5.1</b>\n"
+        f"🔀 <b>Unified Smart Bot v5.1.1</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 الأساسية: <b>{_exchange.primary_name}</b>\n"
         f"🔁 البدائل: {', '.join(_exchange.chain_names[1:]) or '—'}\n\n"
@@ -1008,7 +1003,7 @@ async def cmd_start(update, context):
         f"/ranges /checkranges /refresh\n"
         f"/ref6 — تقرير 6% فوري\n"
         f"/cross /cross5 /cross15 /cross1h\n"
-        f"/checkprice /status /strict /clearcache",
+        f"/checkprice /status /strict /clearcache /jobs",
         parse_mode="HTML",
     )
 
@@ -1086,7 +1081,6 @@ async def cmd_refresh(update, context):
 
 
 async def cmd_ref6(update, context):
-    """تقرير 6% فوري"""
     if not _exchange.ok():
         await update.message.reply_text("❌ لا منصة."); return
     await update.message.reply_text("🔍 حساب نطاقات 6% ...")
@@ -1123,10 +1117,13 @@ async def cmd_checkranges(update, context):
 
 async def cmd_status(update, context):
     total = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
+    jq = context.application.job_queue
+    jobs_n = len(jq.jobs()) if jq else 0
     await update.message.reply_text(
         f"🤖 <b>الحالة</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
+        f"⚙️ Jobs مُسجّلة: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
         f"🚨 خروج نطاق: <b>{_filter_stats['range_breakouts']}</b>\n"
@@ -1138,6 +1135,29 @@ async def cmd_status(update, context):
         f"📌 نطاقات مُراقَبة: {len(_last_range)}",
         parse_mode="HTML",
     )
+
+
+async def cmd_jobs(update, context):
+    """🆕 عرض المهام المجدولة — للتشخيص"""
+    jq = context.application.job_queue
+    if jq is None:
+        await update.message.reply_text(
+            "❌ <b>job_queue غير متوفر!</b>\n"
+            "ثبّت: <code>pip install 'python-telegram-bot[job-queue]'</code>",
+            parse_mode="HTML",
+        )
+        return
+    jobs = jq.jobs()
+    if not jobs:
+        await update.message.reply_text("⚠️ لا مهام مسجّلة.")
+        return
+    lines = [f"⚙️ <b>Jobs ({len(jobs)}):</b>\n"]
+    now = datetime.now(timezone.utc)
+    for j in jobs:
+        nxt = getattr(j, "next_t", None)
+        nxt_str = nxt.strftime("%H:%M:%S UTC") if nxt else "—"
+        lines.append(f"• <b>{j.name or 'unnamed'}</b> → next: {nxt_str}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_strict(update, context):
@@ -1252,7 +1272,6 @@ async def range_monitor_job(context):
 
 
 async def six_pct_report_job(context):
-    """يُرسل تقرير 6% المرجعي"""
     if not _exchange.ok() or not CHAT_ID: return
     results = await compute_6pct_ranges()
     if not results: return
@@ -1275,7 +1294,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v5.1")
+        self.wfile.write(b"OK - Unified Smart Bot v5.1.1")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -1309,6 +1328,15 @@ def main():
     app = (Application.builder().token(BOT_TOKEN)
            .request(request).get_updates_request(request).build())
 
+    # 🆕 فحص صريح لـ job_queue — يفشل بصوت عالٍ بدل الصمت
+    if app.job_queue is None:
+        raise RuntimeError(
+            "❌ job_queue غير متوفر!\n"
+            "   السبب: python-telegram-bot مثبّت بدون extra الـ job-queue.\n"
+            "   الحل: pip install 'python-telegram-bot[job-queue]'"
+        )
+    print("✅ job_queue متوفر")
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
@@ -1320,30 +1348,31 @@ def main():
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("ref6", cmd_ref6))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("jobs", cmd_jobs))    # 🆕
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_error_handler(error_handler)
 
-    if app.job_queue:
-        app.job_queue.run_repeating(crossover_job, interval=JOB_INTERVAL_MIN * 60,
-                                     first=15, name="cross")
-        app.job_queue.run_repeating(price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60,
-                                     first=20, name="price")
-        app.job_queue.run_repeating(range_monitor_job, interval=RANGE_MONITOR_INTERVAL_MIN * 60,
-                                     first=30, name="range_monitor")
+    # 🆕 تسجيل المهام مباشرة (بدون `if app.job_queue:`)
+    app.job_queue.run_repeating(
+        crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
+    app.job_queue.run_repeating(
+        price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price")
+    app.job_queue.run_repeating(
+        range_monitor_job, interval=RANGE_MONITOR_INTERVAL_MIN * 60, first=30,
+        name="range_monitor")
 
-        # 🆕 تقرير 6% — عند التشغيل ثم كل 4 ساعات
-        if SEND_STARTUP_REPORT:
-            app.job_queue.run_once(six_pct_report_job, when=45, name="six_pct_startup")
-            print(f"📊 تقرير 6% عند التشغيل: بعد 45 ثانية")
+    if SEND_STARTUP_REPORT:
+        app.job_queue.run_once(six_pct_report_job, when=45, name="six_pct_startup")
+        print("📊 تقرير 6% عند التشغيل: بعد 45 ثانية")
 
-        app.job_queue.run_repeating(
-            six_pct_report_job,
-            interval=RANGE_REPORT_INTERVAL_HOURS * 3600,
-            first=RANGE_REPORT_INTERVAL_HOURS * 3600,
-            name="six_pct_periodic",
-        )
-        print(f"📊 تقرير 6% دوري: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات")
+    app.job_queue.run_repeating(
+        six_pct_report_job,
+        interval=RANGE_REPORT_INTERVAL_HOURS * 3600,
+        first=RANGE_REPORT_INTERVAL_HOURS * 3600,
+        name="six_pct_periodic",
+    )
+    print(f"📊 تقرير 6% دوري: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات")
 
     print("✅ جاهز — بدء polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES,
