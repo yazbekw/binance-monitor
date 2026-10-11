@@ -1,14 +1,18 @@
 """
-Unified Smart Trading Bot v7.0 — Binance USDT-M Futures Auto-Trader
+Unified Smart Trading Bot v7.1 — Binance USDT-M Futures Auto-Trader
 ====================================================================
-Strategy  : EMA cross + RSI div + BB squeeze + S/R breakout (v6.4.3)
-Execution : Binance USDT-M Futures | 40x ISOLATED | $400 notional/trade
-Limits    : Max 5 concurrent positions | SL обязат | Daily loss limit
-Data      : WebSocket klines + user data stream (FREE, no rate limit)
-REST      : Orders only | weight-aware + exponential backoff
-Safety    : Auto SL/TP (50/30/20) + Breakeven + Trailing | Reconcile on boot
+FIXED v7.1:
+  ✅ fetch_open_orders per-symbol (تجنب IP ban من Binance)
+  ✅ IP ban detection + graceful handling
+  ✅ Startup delay 30s + inter-symbol delay 1.5s
+  ✅ Reconcile بدون fetch_open_orders(بدون symbol)
+  ✅ Watchdog per-symbol + تأخير بين الرموز
+Strategy  : EMA cross + RSI div + BB squeeze + S/R breakout
+Execution : Binance USDT-M Futures | 40x ISOLATED | $400 notional
+Limits    : Max 5 positions | SL إلزامي | Daily loss limit
 """
 import os, sys, json, hmac, hashlib, asyncio, logging, threading, time as _time
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
@@ -24,8 +28,8 @@ import ccxt
 import pandas as pd
 import websockets
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import NetworkError, TimedOut
 
 load_dotenv()
@@ -38,26 +42,22 @@ CHAT_ID   = os.getenv("TELEGRAM_REPORT_CHAT_ID")
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Trading
 LEVERAGE                = int(os.getenv("LEVERAGE", "40"))
 POSITION_NOTIONAL_USD   = float(os.getenv("POSITION_NOTIONAL_USD", "400"))
 MAX_CONCURRENT_POSITIONS= int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
 MARGIN_MODE             = os.getenv("MARGIN_MODE", "isolated")
-MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "1.0"))      # 40x → SL ≤1% = max 40% margin loss
-MIN_SL_PCT_ORDER        = float(os.getenv("MIN_SL_PCT_ORDER", "0.15")) # Binance min distance
+MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "1.0"))
 TRADE_ON_CONFIRMED_ONLY = os.getenv("TRADE_ON_CONFIRMED_ONLY", "true").lower() == "true"
 ENABLE_LONG             = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT            = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 
-# Risk
-MAX_DAILY_LOSS_PCT       = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))    # % of balance
+MAX_DAILY_LOSS_PCT       = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
 MAX_CONSECUTIVE_LOSSES   = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-TP_SPLITS                = [0.50, 0.30, 0.20]   # TP1/TP2/TP3
+TP_SPLITS                = [0.50, 0.30, 0.20]
 TRAIL_AFTER_TP2          = True
-TRAIL_CALLBACK_RATE      = float(os.getenv("TRAIL_CALLBACK_RATE", "0.4"))  # 0.4%
+TRAIL_CALLBACK_RATE      = float(os.getenv("TRAIL_CALLBACK_RATE", "0.4"))
 BREAKEVEN_AFTER_TP1      = True
 
-# Timeframes / Strategy
 TIMEFRAMES = ["5m", "15m", "1h"]
 EMA_FAST, EMA_SLOW = 7, 25
 ENABLE_PRE_CROSS  = True
@@ -84,7 +84,6 @@ VWAP_SLOPE_LOOKBACK = 5
 STRICTNESS = "auto"
 STRICTNESS_OVERRIDE: dict = {}
 
-# Filters
 MIN_EMA_GAP_PCT = {"5m": 0.02, "15m": 0.015, "1h": 0.01}
 MIN_ATR_PCT     = {"5m": 0.05, "15m": 0.10, "1h": 0.20}
 MIN_ADX_FOR_BB       = 8.0
@@ -96,8 +95,12 @@ BB_MIN_ADX_IN_RANGE  = 20
 BB_CONFIRM_ENABLED   = True
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 SIGNAL_TRACK_MAX_MIN = 90
-SIGNAL_TRACK_INTERVAL_MIN = 2
 LAST_SIGNALS_MAX = 20
+
+# 🆕 Rate limit safety
+STARTUP_DELAY_SEC       = int(os.getenv("STARTUP_DELAY_SEC", "30"))
+INTER_SYMBOL_DELAY_SEC  = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "1.5"))
+WATCHDOG_INTERVAL_SEC   = int(os.getenv("WATCHDOG_INTERVAL_SEC", "180"))
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
@@ -115,13 +118,7 @@ _syms_env = os.getenv("TRADING_SYMBOLS", "").strip()
 if _syms_env:
     ALL_SYMBOLS = [_norm_sym(s) for s in _syms_env.split(",") if s.strip()]
 else:
-    # Backward compat: derive from _UPPER vars
-    _from_ranges = []
-    for k in os.environ:
-        if k.upper().endswith("_UPPER"):
-            coin = k[:-6].strip().upper()
-            _from_ranges.append(f"{coin}/USDT:USDT")
-    ALL_SYMBOLS = _from_ranges or ["XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT"]
+    ALL_SYMBOLS = ["XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT"]
 
 log.info(f"📊 الرموز: {ALL_SYMBOLS}")
 
@@ -232,9 +229,8 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
             tp1, tp2, tp3 = price - risk, price - risk*2, price - risk*3
         risk_pct = abs(price - stop_loss) / price * 100 if price else 0
         if risk_pct < min_sl_pct * 0.9: return None
-        # Hard reject: on 40x, SL must be ≤ MAX_SL_PCT
         if risk_pct > MAX_SL_PCT:
-            log.info(f"❌ SL {risk_pct:.2f}% > MAX_SL_PCT {MAX_SL_PCT}% (rejected for {tf})")
+            log.info(f"❌ SL {risk_pct:.2f}% > {MAX_SL_PCT}% ({tf})")
             return None
         return {"entry": price, "stop_loss": stop_loss, "sl_pct": round(risk_pct, 2),
                 "tp1": tp1, "tp2": tp2, "tp3": tp3, "atr": atr}
@@ -243,7 +239,7 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
         return None
 
 # ═══════════════════════════════════════════════════════════
-# 5) SmartStrictness (كما هو من v6.4.3)
+# 5) SmartStrictness
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -254,9 +250,9 @@ STATIC_PROFILES = {
                  "block_against_htf": True, "score_15m_override": 75},
 }
 TF_PROFILES = {
-    "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 5},
-    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90, "min_hold_min": 15},
-    "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80, "min_hold_min": 60},
+    "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70},
+    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90},
+    "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80},
 }
 SESSIONS = [
     (0, 6,  "🌏 آسيا",       +8),
@@ -384,41 +380,50 @@ def get_thresholds(atr_pct=None, adx=None, tf="15m"):
     return prof
 
 # ═══════════════════════════════════════════════════════════
-# 6) BinanceExecutor — REST للتنفيذ فقط
+# 6) BinanceExecutor — FIXED v7.1
 # ═══════════════════════════════════════════════════════════
 class BinanceExecutor:
-    """ccxt.binanceusdm — REST مُحكَم بـ weight tracking + backoff"""
     def __init__(self):
         opts = {
             "apiKey": BINANCE_API_KEY,
             "secret": BINANCE_API_SECRET,
             "enableRateLimit": True,
             "timeout": 20000,
-            "options": {"defaultType": "future", "adjustForTimeDifference": True},
+            "options": {
+                "defaultType": "future",
+                "adjustForTimeDifference": True,
+                "warnOnFetchOpenOrdersWithoutSymbol": False,   # ✅ يكتم التحذير
+                "recvWindow": 10000,
+            },
         }
         self.ex = ccxt.binanceusdm(opts)
         self.ex.load_markets()
-        self._weight_used = 0
-        self._weight_reset = _time.time() + 60
-        self._lock = asyncio.Lock()
         log.info(f"✅ Binance USDM متصل | {len(self.ex.markets)} سوق")
 
     async def _call(self, method_name, *args, **kwargs):
-        """REST call with exponential backoff + jitter"""
-        delays = [0.5, 1, 2, 4, 8]
+        """REST with ban detection + adaptive backoff"""
+        delays = [1, 2, 4, 8, 15, 30]
+        last_err = None
         for i, d in enumerate(delays):
             try:
                 m = getattr(self.ex, method_name)
                 return await asyncio.to_thread(m, *args, **kwargs)
             except ccxt.RateLimitExceeded as e:
-                import random
-                wait = d + random.uniform(0, 0.5)
+                last_err = e
+                wait = d + random.uniform(0.5, 2.0)
                 log.warning(f"⚠️ RateLimit {method_name}, wait {wait:.1f}s")
                 await asyncio.sleep(wait)
             except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as e:
-                import random
-                wait = d + random.uniform(0, 0.5)
-                log.warning(f"⚠️ Network {method_name}, wait {wait:.1f}s: {e}")
+                last_err = e
+                err_str = str(e)
+                # 🆕 IP ban detection
+                if "418" in err_str or "-1003" in err_str or "banned" in err_str.lower():
+                    log.error(f"🚫 IP BANNED → {method_name}")
+                    log.error(f"   الانتظار 5 دقائق قبل المحاولة التالية")
+                    await asyncio.sleep(300)
+                    continue
+                wait = d + random.uniform(0.5, 2.0)
+                log.warning(f"⚠️ Network {method_name}, wait {wait:.1f}s")
                 await asyncio.sleep(wait)
             except ccxt.ExchangeError as e:
                 log.error(f"❌ Exchange {method_name}: {e}")
@@ -426,7 +431,7 @@ class BinanceExecutor:
             except Exception as e:
                 log.exception(f"❌ {method_name}: {e}")
                 raise
-        raise ccxt.NetworkError(f"{method_name} failed after retries")
+        raise ccxt.NetworkError(f"{method_name} failed: {last_err}")
 
     async def fetch_ohlcv(self, symbol, tf, limit=200):
         return await self._call("fetch_ohlcv", symbol, tf, None, limit)
@@ -438,6 +443,7 @@ class BinanceExecutor:
         return await self._call("fetch_positions", symbols)
 
     async def fetch_open_orders(self, symbol=None):
+        # ✅ دائماً مع symbol
         return await self._call("fetch_open_orders", symbol)
 
     async def set_leverage(self, symbol, lev):
@@ -469,15 +475,14 @@ class BinanceExecutor:
     async def fetch_order(self, order_id, symbol):
         return await self._call("fetch_order", order_id, symbol)
 
-    async def amount_to_precision(self, symbol, amount):
+    def amount_to_precision(self, symbol, amount):
         return self.ex.amount_to_precision(symbol, amount)
 
-    async def price_to_precision(self, symbol, price):
+    def price_to_precision(self, symbol, price):
         return self.ex.price_to_precision(symbol, price)
 
     def market(self, symbol): return self.ex.market(symbol)
 
-    # Listen key for user data stream
     async def create_listen_key(self):
         return await self._call("fapiPrivatePostListenKey")
 
@@ -492,16 +497,19 @@ async def fetch_ohlcv_cached(symbol, tf, limit=200):
     c = _ohlcv_rest_cache.get(key)
     if c and (now - c["ts"]) < 90: return c["data"]
     if _executor is None: return None
-    data = await _executor.fetch_ohlcv(symbol, tf, limit)
+    try:
+        data = await _executor.fetch_ohlcv(symbol, tf, limit)
+    except Exception as e:
+        log.warning(f"ohlcv {symbol} {tf}: {e}")
+        return c["data"] if c else None
     if data:
         _ohlcv_rest_cache[key] = {"data": data, "ts": now}
     return data
 
 # ═══════════════════════════════════════════════════════════
-# 7) WebSocketManager — klines + user data stream
+# 7) WebSocketManager
 # ═══════════════════════════════════════════════════════════
 class WebSocketManager:
-    """يستخدم websockets المجاني: klines لتحديث الكاش، user data للأوامر"""
     FAPI_WS_BASE = "wss://fstream.binance.com"
 
     def __init__(self, executor: BinanceExecutor, positions_mgr):
@@ -512,23 +520,24 @@ class WebSocketManager:
         self._user_ws = None
         self._listen_key = None
         self._tasks: List[asyncio.Task] = []
-        self._binance_sym_cache = {}   # "BTCUSDT" -> "BTC/USDT:USDT"
+        self._binance_sym_cache = {}
 
     def _to_ws_sym(self, ccxt_sym: str) -> str:
-        # "BTC/USDT:USDT" -> "btcusdt"
         base = ccxt_sym.split("/")[0].lower()
         quote = ccxt_sym.split("/")[1].split(":")[0].lower()
         return f"{base}{quote}"
 
     def _to_ccxt_sym(self, ws_sym: str) -> str:
-        # "BTCUSDT" -> "BTC/USDT:USDT"
         ws_sym = ws_sym.upper()
         if ws_sym in self._binance_sym_cache:
             return self._binance_sym_cache[ws_sym]
-        for m in self.executor.ex.markets.values():
-            if m.get("id") == ws_sym and m.get("swap"):
-                self._binance_sym_cache[ws_sym] = m["symbol"]
-                return m["symbol"]
+        try:
+            for m in self.executor.ex.markets.values():
+                if m.get("id") == ws_sym and m.get("swap"):
+                    self._binance_sym_cache[ws_sym] = m["symbol"]
+                    return m["symbol"]
+        except Exception:
+            pass
         return f"{ws_sym[:-4]}/USDT:USDT"
 
     def _build_streams(self) -> str:
@@ -567,20 +576,19 @@ class WebSocketManager:
                         if not self._running: break
                         try:
                             self._handle_kline(json.loads(raw))
-                        except Exception as e:
-                            log.debug(f"kline parse: {e}")
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                log.warning(f"⚠️ Kline WS: {type(e).__name__}: {e} → retry in {backoff}s")
+                log.warning(f"⚠️ Kline WS: {type(e).__name__} → retry in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(60, backoff * 2)
 
     def _handle_kline(self, msg):
         data = msg.get("data") or msg
         k = data.get("k")
-        if not k: return
-        if not k.get("x"): return   # فقط الشموع المُغلقة
+        if not k or not k.get("x"): return
         ws_sym = k.get("s"); tf = k.get("i")
         ccxt_sym = self._to_ccxt_sym(ws_sym)
         candle = [int(k["t"]), float(k["o"]), float(k["h"]),
@@ -603,34 +611,40 @@ class WebSocketManager:
         while self._running:
             try:
                 if not self._listen_key:
-                    resp = await self.executor.create_listen_key()
-                    self._listen_key = resp.get("listenKey") or resp.get("listen_key")
+                    try:
+                        resp = await self.executor.create_listen_key()
+                        self._listen_key = resp.get("listenKey") or resp.get("listen_key")
+                    except Exception as e:
+                        log.warning(f"⚠️ listenKey فشل: {e} → retry in {backoff}s")
+                        await asyncio.sleep(backoff)
+                        backoff = min(120, backoff * 2)
+                        continue
                     if not self._listen_key:
-                        raise Exception("no listenKey returned")
-                    log.info(f"🔑 listenKey جديد: {self._listen_key[:12]}...")
+                        await asyncio.sleep(backoff); continue
+                    log.info(f"🔑 listenKey جديد")
+                    backoff = 5
                 url = f"{self.FAPI_WS_BASE}/ws/{self._listen_key}"
                 async with websockets.connect(url, ping_interval=180, ping_timeout=60,
                                               close_timeout=10) as ws:
                     self._user_ws = ws
                     log.info("🟢 User WS متصل")
-                    backoff = 5
                     ka_task = asyncio.create_task(self._listen_key_keepalive())
                     try:
                         async for raw in ws:
                             if not self._running: break
                             try:
                                 await self._handle_user_event(json.loads(raw))
-                            except Exception as e:
-                                log.debug(f"user parse: {e}")
+                            except Exception:
+                                pass
                     finally:
                         ka_task.cancel()
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                log.warning(f"⚠️ User WS: {type(e).__name__}: {e} → retry in {backoff}s")
+                log.warning(f"⚠️ User WS: {type(e).__name__} → retry in {backoff}s")
                 self._listen_key = None
                 await asyncio.sleep(backoff)
-                backoff = min(60, backoff * 2)
+                backoff = min(120, backoff * 2)
 
     async def _listen_key_keepalive(self):
         try:
@@ -638,7 +652,6 @@ class WebSocketManager:
                 await asyncio.sleep(25 * 60)
                 try:
                     await self.executor.keepalive_listen_key()
-                    log.debug("🔑 listenKey keepalive OK")
                 except Exception as e:
                     log.warning(f"⚠️ keepalive: {e}")
                     self._listen_key = None
@@ -649,11 +662,7 @@ class WebSocketManager:
     async def _handle_user_event(self, ev):
         etype = ev.get("e")
         if etype == "ORDER_TRADE_UPDATE":
-            o = ev.get("o", {})
-            await self.positions_mgr.on_order_update(o)
-        elif etype == "ACCOUNT_UPDATE":
-            # يمكن استخدامها لتحديث الرصيد، لكن fetch_balance كافٍ
-            pass
+            await self.positions_mgr.on_order_update(ev.get("o", {}))
         elif etype == "MARGIN_CALL":
             await self.positions_mgr.on_margin_call(ev)
         elif etype == "listenKeyExpired":
@@ -661,28 +670,26 @@ class WebSocketManager:
             self._listen_key = None
 
 # ═══════════════════════════════════════════════════════════
-# 8) PositionManager
+# 8) PositionManager — FIXED v7.1
 # ═══════════════════════════════════════════════════════════
 class PositionManager:
     def __init__(self, executor: BinanceExecutor, bot_getter):
         self.executor = executor
         self.bot_getter = bot_getter
         self.positions: Dict[str, dict] = {}
-        self.closed_today = 0
         self.daily_pnl_usd = 0.0
         self.daily_reset_ts = _time.time()
         self.consecutive_losses = 0
         self.paused = False
-        self.ws_ref = None   # يُضبط من main
+        self.ws_ref = None
         self._lock = asyncio.Lock()
-        self._watchdog_fails: Dict[str, int] = {}   # symbol -> عدد مرات فشل الفحص المتتالية
+        self._watchdog_fails: Dict[str, int] = {}
 
-    # ---------- HIGH-LEVEL ----------
     async def can_open_new(self) -> tuple[bool, str]:
-        if self.paused: return False, "البوت موقوف (/resume)"
+        if self.paused: return False, "البوت موقوف"
         async with self._lock:
             if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
-                return False, f"وصلت للحد الأقصى ({MAX_CONCURRENT_POSITIONS})"
+                return False, f"وصلت للحد ({MAX_CONCURRENT_POSITIONS})"
         if _time.time() - self.daily_reset_ts > 86400:
             self.daily_reset_ts = _time.time()
             self.daily_pnl_usd = 0.0
@@ -690,7 +697,7 @@ class PositionManager:
         if self.daily_pnl_usd < 0:
             bal = await self._get_balance_usd()
             if bal > 0 and abs(self.daily_pnl_usd) / bal * 100 >= MAX_DAILY_LOSS_PCT:
-                return False, f"حد الخسارة اليومي ({MAX_DAILY_LOSS_PCT}%)"
+                return False, f"حد الخسارة اليومي"
         if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             self.paused = True
             return False, f"{MAX_CONSECUTIVE_LOSSES} خسائر متتالية → إيقاف"
@@ -717,7 +724,7 @@ class PositionManager:
         try:
             m = self.executor.market(sym)
             qty_raw = POSITION_NOTIONAL_USD / entry_ref
-            qty_str = self.executor.ex.amount_to_precision(sym, qty_raw)
+            qty_str = self.executor.amount_to_precision(sym, qty_raw)
             qty = float(qty_str)
             min_amt = m["limits"]["amount"]["min"] or 0
             if qty < min_amt:
@@ -730,27 +737,30 @@ class PositionManager:
 
         try: await self.executor.set_margin_mode(sym, MARGIN_MODE)
         except Exception as e: log.warning(f"margin mode {sym}: {e}")
+        await asyncio.sleep(0.3)
         try: await self.executor.set_leverage(sym, LEVERAGE)
         except Exception as e: log.warning(f"leverage {sym}: {e}")
+        await asyncio.sleep(0.3)
 
         cid_base = f"v7{int(_time.time())}{sym.split('/')[0][:6]}"[:32]
-        entry_cid = f"{cid_base}_en"[:36]
 
         try:
             order = await self.executor.create_order(
-                sym, "market", side, qty, None, {"newClientOrderId": entry_cid})
+                sym, "market", side, qty, None,
+                {"newClientOrderId": f"{cid_base}_en"[:36]})
         except Exception as e:
             log.error(f"❌ entry order {sym}: {e}"); return None
 
+        # wait for fill
         filled_qty = 0.0; avg_price = 0.0
-        for _ in range(10):
+        for _ in range(8):
             try:
                 o = await self.executor.fetch_order(order["id"], sym)
                 filled_qty = float(o.get("filled") or 0)
                 avg_price = float(o.get("average") or 0)
                 if o.get("status") == "closed" and filled_qty > 0: break
             except Exception: pass
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.6)
 
         if filled_qty <= 0:
             log.error(f"❌ {sym} لم تُملأ")
@@ -778,35 +788,37 @@ class PositionManager:
             "tp2_order_id": None, "tp3_order_id": None,
             "tp1_filled": False, "tp2_filled": False, "tp3_filled": False,
             "trailing_active": False, "breakeven_moved": False,
-            "sl_last_verified": 0.0,   # 🆕 آخر تحقق من SL
+            "sl_last_verified": 0.0,
         }
         async with self._lock:
             self.positions[sym] = pos
 
-        # place SL — إلزامي
-        sl_side = "sell" if direction == "bullish" else "buy"
+        await asyncio.sleep(0.5)
+
+        # SL إلزامي
         sl_ok = await self._place_sl(sym, pos, sl, tag="sl")
         if not sl_ok:
             log.error(f"❌ SL فشل لـ {sym} → إغلاق فوري")
             await self._emergency_close(sym)
             return None
 
-        # place TPs
+        await asyncio.sleep(0.4)
         await self._place_tp(sym, pos, tp1, TP_SPLITS[0], "tp1")
+        await asyncio.sleep(0.4)
         await self._place_tp(sym, pos, tp2, TP_SPLITS[1], "tp2")
+        await asyncio.sleep(0.4)
         await self._place_tp(sym, pos, tp3, TP_SPLITS[2], "tp3")
 
         pos["sl_last_verified"] = _time.time()
         log.info(f"✅ فتح {short(sym)} {direction} @ {entry_price} | SL={sl} | qty={filled_qty}")
         return pos
 
-    # ---------- HELPERS لـ SL/TP ----------
     async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         try:
             o = await self.executor.create_order(
                 symbol, "STOP_MARKET", sl_side, None, None,
-                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
+                {"stopPrice": self.executor.price_to_precision(symbol, price),
                  "closePosition": True, "workingType": "MARK_PRICE",
                  "priceProtect": True,
                  "newClientOrderId": f"{pos['signal_id']}_{tag}"[:36]})
@@ -818,13 +830,13 @@ class PositionManager:
             return False
 
     async def _place_tp(self, symbol, pos, price, pct, tag):
-        q = float(self.executor.ex.amount_to_precision(symbol, pos["qty_initial"] * pct))
+        q = float(self.executor.amount_to_precision(symbol, pos["qty_initial"] * pct))
         if q <= 0: return None
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         try:
             o = await self.executor.create_order(
                 symbol, "TAKE_PROFIT_MARKET", sl_side, q, None,
-                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
+                {"stopPrice": self.executor.price_to_precision(symbol, price),
                  "reduceOnly": True, "workingType": "MARK_PRICE",
                  "newClientOrderId": f"{pos['signal_id']}_{tag}"[:36]})
             pos[f"{tag}_order_id"] = o.get("id")
@@ -865,6 +877,7 @@ class PositionManager:
     async def close_all(self, reason="closeall"):
         for s in list(self.positions.keys()):
             await self.close_position(s, reason)
+            await asyncio.sleep(0.5)
 
     # ---------- EVENT HANDLERS ----------
     async def on_order_update(self, o: dict):
@@ -893,23 +906,28 @@ class PositionManager:
 
     async def _after_tp1(self, symbol, pos):
         if not BREAKEVEN_AFTER_TP1: return
+        await asyncio.sleep(1)   # let binance settle
         try: await self.executor.cancel_all_orders(symbol)
         except: pass
+        await asyncio.sleep(0.5)
         ok = await self._place_sl(symbol, pos, pos["entry"], tag="sl_be")
         if ok:
-            pos["breakeven_moved"] = True
-            pos["sl"] = pos["entry"]
+            pos["breakeven_moved"] = True; pos["sl"] = pos["entry"]
         else:
-            log.error(f"❌ breakeven SL فشل {symbol} → إغلاق طارئ")
+            log.error(f"❌ breakeven فشل {symbol} → إغلاق طارئ")
             await self._emergency_close(symbol); return
+        await asyncio.sleep(0.4)
         await self._place_tp(symbol, pos, pos["tp2"], TP_SPLITS[1], "tp2_r")
+        await asyncio.sleep(0.4)
         await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
         await self._notify(f"🎯 <b>TP1</b> {short(symbol)} | SL → Breakeven")
 
     async def _after_tp2(self, symbol, pos):
         if not TRAIL_AFTER_TP2: return
+        await asyncio.sleep(1)
         try: await self.executor.cancel_all_orders(symbol)
         except: pass
+        await asyncio.sleep(0.5)
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         try:
             t = await self.executor.create_order(
@@ -921,8 +939,8 @@ class PositionManager:
             pos["sl_last_verified"] = _time.time()
         except Exception as e:
             log.error(f"trailing {symbol}: {e}")
-            # fallback: SL ثابت عند TP1
             await self._place_sl(symbol, pos, pos["tp1"], tag="sl_tp1")
+        await asyncio.sleep(0.4)
         await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
         await self._notify(f"✅ <b>TP2</b> {short(symbol)} | Trailing {TRAIL_CALLBACK_RATE}%")
 
@@ -937,75 +955,59 @@ class PositionManager:
     async def on_margin_call(self, ev):
         await self._notify("🚨 <b>MARGIN CALL</b> — راجع حسابك فوراً!")
 
-    # ---------- WATCHDOG 🆕 ----------
+    # ---------- WATCHDOG (per-symbol) ----------
     async def watchdog_check(self):
-        """
-        كل 3 دقائق:
-        - يتحقق من وجود SL/TP على Binance لكل صفقة
-        - يعيد وضعها إن فُقدت
-        - يغلق الصفقة طارئاً إذا فشل الفحص 3 مرات متتالية (9 دقائق)
-        """
         if not self.positions: return
-        try:
-            all_orders = await self.executor.fetch_open_orders()
-        except Exception as e:
-            log.warning(f"⚠️ watchdog fetch: {e}")
-            return
-
-        # فهرسة الأوامر حسب الرمز
-        orders_by_sym: Dict[str, list] = defaultdict(list)
-        for o in all_orders:
-            orders_by_sym[o["symbol"]].append(o)
-
         for sym, pos in list(self.positions.items()):
             try:
-                await self._watchdog_one(sym, pos, orders_by_sym.get(sym, []))
+                await self._watchdog_one(sym, pos)
             except Exception as e:
                 log.exception(f"watchdog {sym}: {e}")
-            await asyncio.sleep(0.3)
+                self._bump_fail(sym)
+            await asyncio.sleep(1.0)   # ✅ تأخير بين الرموز
 
-    async def _watchdog_one(self, symbol, pos, open_orders: list):
-        # 1) الصفقة ما زالت موجودة على Binance؟
+    async def _watchdog_one(self, symbol, pos):
+        # 1) هل الصفقة ما زالت موجودة؟
         try:
-            bpos = await self.executor.fetch_positions([symbol])
+            bpos_list = await self.executor.fetch_positions([symbol])
         except Exception as e:
             log.warning(f"⚠️ watchdog pos {symbol}: {e}")
-            self._bump_fail(symbol)
-            return
-        active = False
-        for p in bpos:
-            if abs(float(p.get("contracts") or 0)) > 1e-12:
-                active = True
-                # حدّث qty الحقيقي
-                pos["qty"] = abs(float(p["contracts"]))
-                break
+            self._bump_fail(symbol); return
+        active = False; real_qty = 0.0
+        for p in bpos_list:
+            c = abs(float(p.get("contracts") or 0))
+            if c > 1e-12:
+                active = True; real_qty = c; break
         if not active:
-            log.info(f"♻️ watchdog: {short(symbol)} اختفت من Binance → إزالة محلية")
+            log.info(f"♻️ watchdog: {short(symbol)} اختفت → إزالة")
             async with self._lock:
                 self.positions.pop(symbol, None)
-            self._reset_fail(symbol)
-            return
+            self._reset_fail(symbol); return
+        pos["qty"] = real_qty
 
-        # 2) فحص الأوامر المعلقة
+        # 2) الأوامر المعلقة لهذا الرمز فقط
+        try:
+            open_orders = await self.executor.fetch_open_orders(symbol)
+        except Exception as e:
+            log.warning(f"⚠️ watchdog orders {symbol}: {e}")
+            self._bump_fail(symbol); return
+
         has_sl = False; tp_ids_seen = set()
-        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         for o in open_orders:
             otype = o.get("type") or ""
             cid = o.get("clientOrderId") or ""
-            # SL: STOP_MARKET أو TRAILING_STOP_MARKET
-            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype) \
-               and "_sl" in cid or "_trail" in cid:
-                has_sl = True
-                pos["sl_order_id"] = o.get("id")
+            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype):
+                if "_sl" in cid or "_trail" in cid:
+                    has_sl = True; pos["sl_order_id"] = o.get("id")
             elif "TAKE_PROFIT" in otype:
                 if "_tp1" in cid: tp_ids_seen.add("tp1")
                 elif "_tp2" in cid: tp_ids_seen.add("tp2")
                 elif "_tp3" in cid: tp_ids_seen.add("tp3")
 
-        # 3) أعد وضع SL إن مفقود
+        # 3) أعد SL إن مفقود
         if not has_sl:
-            log.warning(f"🛡️ watchdog: SL مفقود لـ {short(symbol)} → إعادة الوضع")
-            # اختر السعر المناسب حسب الحالة
+            log.warning(f"🛡️ watchdog: SL مفقود لـ {short(symbol)} → إعادة")
+            placed = False
             if pos.get("trailing_active"):
                 sl_side_ = "sell" if pos["direction"] == "bullish" else "buy"
                 try:
@@ -1016,31 +1018,27 @@ class PositionManager:
                          "newClientOrderId": f"{pos['signal_id']}_trail_r"[:36]})
                     pos["sl_order_id"] = t.get("id")
                     pos["sl_last_verified"] = _time.time()
-                    self._reset_fail(symbol)
+                    placed = True
                     await self._notify(f"🛡️ إعادة Trailing SL لـ {short(symbol)}")
-                    return
                 except Exception as e:
                     log.error(f"watchdog re-trail {symbol}: {e}")
-            elif pos.get("breakeven_moved"):
-                ok = await self._place_sl(symbol, pos, pos["entry"], tag="sl_be_r")
-                if ok:
-                    self._reset_fail(symbol)
-                    await self._notify(f"🛡️ إعادة SL Breakeven لـ {short(symbol)}")
-                    return
-            else:
-                ok = await self._place_sl(symbol, pos, pos["sl"], tag="sl_r")
-                if ok:
-                    self._reset_fail(symbol)
+            if not placed:
+                if pos.get("breakeven_moved"):
+                    placed = await self._place_sl(symbol, pos, pos["entry"], tag="sl_be_r")
+                else:
+                    placed = await self._place_sl(symbol, pos, pos["sl"], tag="sl_r")
+                if placed:
                     await self._notify(f"🛡️ إعادة SL لـ {short(symbol)}")
-                    return
-            # فشل كل المحاولات
-            self._bump_fail(symbol)
+            if not placed:
+                self._bump_fail(symbol); return
 
-        # 4) أعد وضع TPs إن مفقودة
+        # 4) أعد TPs إن مفقودة
         if "tp1" not in tp_ids_seen and not pos["tp1_filled"]:
             await self._place_tp(symbol, pos, pos["tp1"], TP_SPLITS[0], "tp1_r")
+            await asyncio.sleep(0.3)
         if "tp2" not in tp_ids_seen and not pos["tp2_filled"] and pos["tp1_filled"]:
             await self._place_tp(symbol, pos, pos["tp2"], TP_SPLITS[1], "tp2_r")
+            await asyncio.sleep(0.3)
         if "tp3" not in tp_ids_seen and not pos["tp3_filled"]:
             await self._place_tp(symbol, pos, pos["tp3"], TP_SPLITS[2], "tp3_r")
 
@@ -1052,7 +1050,7 @@ class PositionManager:
         self._watchdog_fails[symbol] = n
         log.warning(f"⚠️ watchdog فشل {short(symbol)} ({n}/3)")
         if n >= 3:
-            log.error(f"🆘 watchdog: 3 فشل متتالية لـ {short(symbol)} → إغلاق طارئ")
+            log.error(f"🆘 watchdog: 3 فشل → إغلاق طارئ {short(symbol)}")
             asyncio.create_task(self._watchdog_kill(symbol))
 
     async def _watchdog_kill(self, symbol):
@@ -1063,34 +1061,38 @@ class PositionManager:
     def _reset_fail(self, symbol):
         self._watchdog_fails.pop(symbol, None)
 
-    # ---------- RECONCILE ----------
+    # ---------- RECONCILE (بدون fetch_open_orders بدون symbol) ----------
     async def reconcile(self):
         try:
             positions = await self.executor.fetch_positions()
-            open_orders = await self.executor.fetch_open_orders()
         except Exception as e:
-            log.error(f"reconcile: {e}"); return
+            log.error(f"reconcile fetch_positions: {e}"); return
         binance_pos = {}
         for p in positions:
             contracts = float(p.get("contracts") or 0)
             if abs(contracts) < 1e-12: continue
             binance_pos[p["symbol"]] = p
+
         for sym, p in binance_pos.items():
             if sym in self.positions: continue
             log.warning(f"⚠️ orphan {sym} → SL طارئ")
             side = "sell" if p.get("side") == "long" else "buy"
             entry = float(p.get("entryPrice") or 0)
+            if entry <= 0: continue
             sl_price = entry * (0.985 if p.get("side") == "long" else 1.015)
             try:
                 await self.executor.create_order(
                     sym, "STOP_MARKET", side, None, None,
-                    {"stopPrice": self.executor.ex.price_to_precision(sym, sl_price),
+                    {"stopPrice": self.executor.price_to_precision(sym, sl_price),
                      "closePosition": True, "workingType": "MARK_PRICE"})
                 log.info(f"🛡️ SL طارئ {short(sym)} @ {sl_price}")
             except Exception as e:
                 log.error(f"emergency SL {sym}: {e}")
+            await asyncio.sleep(0.5)
+
         for sym in list(self.positions.keys()):
             if sym not in binance_pos:
+                log.info(f"♻️ إزالة {short(sym)} — غير موجودة")
                 async with self._lock:
                     self.positions.pop(sym, None)
         log.info(f"♻️ Reconcile: {len(self.positions)} محلية | {len(binance_pos)} Binance")
@@ -1111,29 +1113,17 @@ _positions_mgr: Optional[PositionManager] = None
 _ws_mgr: Optional[WebSocketManager] = None
 
 # ═══════════════════════════════════════════════════════════
-# 9) Strategy — كواشف (منقولة من v6.4.3)
+# 9) Strategy Detectors
 # ═══════════════════════════════════════════════════════════
+_crossover_cache = {}; _divergence_cache = {}; _bb_cache = {}; _sr_cache = {}
+_recent_signals = {}; _last_signal_time = {}
+_last_signals = deque(maxlen=LAST_SIGNALS_MAX)
+_filter_stats = defaultdict(int)
+
 async def _df_for(symbol, tf, extra=60):
     data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
     if not data or len(data) < EMA_SLOW + 5: return None
     return pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
-
-async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr, source="ema", extra=None):
-    cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
-    cts = int(df["ts"].iloc[curr])
-    levels = compute_levels(df, direction, curr, tf=tf)
-    support = compute_score(df, direction, curr)
-    out = {"symbol": symbol, "timeframe": tf, "direction": direction,
-           "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
-           "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
-           "gap_pct": round(abs(cf-cs)/cs*100, 3) if cs else 0,
-           "strength": strength, "alert_type": alert_type,
-           "support": support, "base_score": support["score"],
-           "final_score": support["score"], "_df": df,
-           "levels": levels, "source": source,
-           "created_at": _time.time()}
-    if extra: out.update(extra)
-    return out
 
 def compute_score(df, direction, curr_idx=-2):
     close = df["c"]; vol = df["v"]
@@ -1238,80 +1228,6 @@ def check_vwap_slope(df, direction, thresholds, tf="15m"):
     if direction == "bearish" and slope > min_pct: return False, slope
     return True, slope
 
-# ═══════════════════════════════════════════════════════════
-# 10) فلتر
-# ═══════════════════════════════════════════════════════════
-async def passes_filter(cross, htf_trend=None):
-    s = cross.get("support", {})
-    if not s: return False, "لا مؤشرات", "other"
-    tf = cross["timeframe"]; vol = s.get("vol_ratio", 0); adx = s.get("adx", 0)
-    atr = s.get("atr_pct", 0); base_score = cross.get("base_score", 0)
-    gap_pct = s.get("gap_pct", 0); source = cross.get("source", "ema")
-    direction = cross["direction"]
-
-    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
-    if gap_pct < min_gap and source == "ema":
-        return False, f"gap {gap_pct:.3f}% < {min_gap}%", "ema_gap"
-    min_atr = MIN_ATR_PCT.get(tf, 0.05)
-    if atr < min_atr: return False, f"ATR {atr}% < {min_atr}%", "atr_low"
-
-    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
-    cross["mtf"] = mtf_desc; cross["mtf_bonus"] = mtf_bonus
-    score = base_score + mtf_bonus
-    cross["final_score"] = score
-    if mtf_bonus <= -15: return False, mtf_desc, "mtf"
-    if score < ABS_MIN_SCORE: return False, f"Score {score} < {ABS_MIN_SCORE}", "score_abs"
-
-    th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
-    min_score = th["min_score"]
-    if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
-    if score < min_score: return False, f"Score {score} < {min_score:.0f}", "score"
-    if vol < th["min_vol_ratio"]: return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
-    if adx < th["min_adx"]: return False, f"ADX {adx} < {th['min_adx']}", "adx"
-    if atr > th["max_atr_pct"]: return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
-
-    df = cross.get("_df"); market = cross.get("market") or "UNKNOWN"
-    if market == "UNKNOWN" and df is not None:
-        market = classify_market(df); cross["market"] = market
-
-    if source == "bb_squeeze":
-        if adx < MIN_ADX_FOR_BB: return False, f"BB ADX {adx} < {MIN_ADX_FOR_BB}", "adx"
-        if vol < BB_MIN_VOL: return False, f"BB Vol {vol}× < {BB_MIN_VOL}×", "vol"
-        if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE:
-            return False, f"BB في رينج ADX < {BB_MIN_ADX_IN_RANGE}", "range"
-        if BB_CONFIRM_ENABLED and not ((mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)):
-            return False, "BB بدون تأكيد", "bb_confirm"
-
-    if source == "ema":
-        if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 5:
-            return False, "تقاطع صاعد ضد الترند", "trend"
-        if market == "TREND_UP" and direction == "bearish" and mtf_bonus < 5:
-            return False, "تقاطع هابط ضد الترند", "trend"
-
-    if market == "RANGE" and source == "ema" and cross.get("alert_type") == "confirmed":
-        return False, "سوق عرضي", "range"
-
-    if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
-        if direction == "bullish" and htf_trend == "DOWN":
-            return False, "HTF=DOWN ضد LONG", "htf"
-        if direction == "bearish" and htf_trend == "UP":
-            return False, "HTF=UP ضد SHORT", "htf"
-
-    if df is not None:
-        ok, slope = check_vwap_slope(df, direction, th, tf=tf)
-        if not ok: return False, f"VWAP {slope:+.2f}%", "vwap"
-
-    if STRICTNESS == "auto": _smart.record(True, score, source=source)
-    return True, "", ""
-
-# ═══════════════════════════════════════════════════════════
-# 11) Detectors
-# ═══════════════════════════════════════════════════════════
-_crossover_cache = {}; _divergence_cache = {}; _bb_cache = {}; _sr_cache = {}
-_recent_signals = {}; _last_signal_time = {}
-_last_signals = deque(maxlen=LAST_SIGNALS_MAX)
-_filter_stats = defaultdict(int)
-
 def has_conflicting_signal(sym, direction):
     prev = _recent_signals.get(sym)
     if not prev: return False
@@ -1328,6 +1244,23 @@ def check_symbol_cooldown(sym):
 
 def mark_symbol_sent(sym): _last_signal_time[sym] = _time.time()
 
+async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr, source="ema", extra=None):
+    cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+    cts = int(df["ts"].iloc[curr])
+    levels = compute_levels(df, direction, curr, tf=tf)
+    support = compute_score(df, direction, curr)
+    out = {"symbol": symbol, "timeframe": tf, "direction": direction,
+           "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
+           "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
+           "gap_pct": round(abs(cf-cs)/cs*100, 3) if cs else 0,
+           "strength": strength, "alert_type": alert_type,
+           "support": support, "base_score": support["score"],
+           "final_score": support["score"], "_df": df,
+           "levels": levels, "source": source,
+           "created_at": _time.time()}
+    if extra: out.update(extra)
+    return out
+
 async def detect_crossover(symbol, tf):
     if not ENABLE_CONFIRMED: return None
     df = await _df_for(symbol, tf)
@@ -1339,8 +1272,7 @@ async def detect_crossover(symbol, tf):
     bull = (cf > cs) and (pf <= ps); bear = (cf < cs) and (pf >= ps)
     if not (bull or bear): return None
     d = "bullish" if bull else "bearish"; cts = int(df["ts"].iloc[curr])
-    key = (symbol, tf)
-    last = _crossover_cache.get(key)
+    key = (symbol, tf); last = _crossover_cache.get(key)
     if last and last.get("candle_ts") == cts and last.get("direction") == d: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": d}
     return await _make_cross(symbol, tf, df, d, "confirmed", "✅ مؤكد", curr)
@@ -1364,7 +1296,7 @@ async def detect_pre_crossover(symbol, tf):
     key = (symbol, tf, "pre"); last = _crossover_cache.get(key)
     if last and cts - last.get("candle_ts", 0) < 900_000 * PRE_CROSS_COOLDOWN: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": d}
-    return await _make_cross(symbol, tf, df, d, "pre", "🔔 تقارب وشيك", curr)
+    return await _make_cross(symbol, tf, df, d, "pre", "🔔 تقارب", curr)
 
 async def detect_live_crossover(symbol, tf):
     if not ENABLE_LIVE_CROSS: return None
@@ -1408,7 +1340,7 @@ async def detect_rsi_divergence(symbol, tf):
     d = best["dir"]
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _divergence_cache[key] = _time.time()
-    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🔄 دايفرجنس RSI", curr, source="rsi_div")
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🔄 دايفرجنس", curr, source="rsi_div")
     cross["div_info"] = {"r1":round(best["r1"],1),"r2":round(best["r2"],1)}
     return cross
 
@@ -1428,8 +1360,8 @@ async def detect_bb_squeeze_breakout(symbol, tf):
     else: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _bb_cache[key] = _time.time()
-    cross = await _make_cross(symbol, tf, df, d, "confirmed", "💥 كسر BB", curr, source="bb_squeeze")
-    cross["bb_info"] = {"width":round(float(bb["width"].iloc[curr]),2),"upper":up,"lower":lo}
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "💥 BB", curr, source="bb_squeeze")
+    cross["bb_info"] = {"width":round(float(bb["width"].iloc[curr]),2)}
     return cross
 
 async def detect_sr_breakout(symbol, tf):
@@ -1449,7 +1381,7 @@ async def detect_sr_breakout(symbol, tf):
     else: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _sr_cache[key] = _time.time()
-    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🎯 كسر S/R", curr, source="sr_breakout")
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🎯 S/R", curr, source="sr_breakout")
     cross["sr_info"] = {"level":level}
     return cross
 
@@ -1464,44 +1396,74 @@ def _get_detectors():
     return dets
 
 # ═══════════════════════════════════════════════════════════
-# 12) رسائل
+# 10) Filter
 # ═══════════════════════════════════════════════════════════
-def _source_label(src):
-    return {"ema":"📈 EMA","rsi_div":"🔄 RSI Div","bb_squeeze":"💥 BB",
-            "sr_breakout":"🎯 S/R"}.get(src, "—")
+async def passes_filter(cross, htf_trend=None):
+    s = cross.get("support", {})
+    if not s: return False, "no-ind", "other"
+    tf = cross["timeframe"]; vol = s.get("vol_ratio", 0); adx = s.get("adx", 0)
+    atr = s.get("atr_pct", 0); base_score = cross.get("base_score", 0)
+    gap_pct = s.get("gap_pct", 0); source = cross.get("source", "ema")
+    direction = cross["direction"]
 
-def build_signal_msg(cross):
-    sym = short(cross["symbol"]); tf = cross["timeframe"]
-    bull = cross["direction"] == "bullish"
-    s = cross.get("support", {}); score = cross.get("final_score", 0)
-    lv = cross.get("levels")
-    dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
-    msg = (f"🎯 <b>إشارة — {sym} [{tf}]</b>\n"
-           f"🇸🇾 {syria_now_str()}\n"
-           f"━━━━━━━━━━━━━━━━━━━\n"
-           f"{_source_label(cross.get('source','ema'))} | {dir_lbl}\n"
-           f"📊 Score: <b>{score}/100</b> | MTF: {cross.get('mtf','—')}\n")
-    if lv:
-        msg += (f"💰 الدخول: <b>{fmt_price(lv['entry'])}</b>\n"
-                f"🛑 SL: {fmt_price(lv['stop_loss'])} (-{lv['sl_pct']}%)\n"
-                f"🎯 TP1: {fmt_price(lv['tp1'])} | TP2: {fmt_price(lv['tp2'])} | TP3: {fmt_price(lv['tp3'])}")
-    return msg
+    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
+    if gap_pct < min_gap and source == "ema":
+        return False, f"gap {gap_pct:.3f}%", "ema_gap"
+    min_atr = MIN_ATR_PCT.get(tf, 0.05)
+    if atr < min_atr: return False, f"ATR {atr}%", "atr_low"
 
-def build_position_msg(pos):
-    sym = short(pos["symbol"]); bull = pos["direction"] == "bullish"
-    return (f"{'🟢' if bull else '🔴'} <b>{sym}</b> [{pos['tf']}] {_source_label(pos.get('source','ema'))}\n"
-            f"   💰 Entry: {fmt_price(pos['entry'])} | Qty: {pos['qty']}\n"
-            f"   🛑 SL: {fmt_price(pos['sl'])} | TP1: {fmt_price(pos['tp1'])}\n"
-            f"   🎯 TP2: {fmt_price(pos['tp2'])} | TP3: {fmt_price(pos['tp3'])}\n"
-            f"   {'✅TP1 ' if pos['tp1_filled'] else ''}"
-            f"{'✅TP2 ' if pos['tp2_filled'] else ''}"
-            f"{'🔄TRAIL ' if pos.get('trailing_active') else ''}")
+    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
+    cross["mtf"] = mtf_desc; cross["mtf_bonus"] = mtf_bonus
+    score = base_score + mtf_bonus
+    cross["final_score"] = score
+    if mtf_bonus <= -15: return False, mtf_desc, "mtf"
+    if score < ABS_MIN_SCORE: return False, f"Score {score}", "score_abs"
+
+    th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
+    min_score = th["min_score"]
+    if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
+    if score < min_score: return False, f"Score {score}<{min_score:.0f}", "score"
+    if vol < th["min_vol_ratio"]: return False, f"Vol {vol}×", "vol"
+    if adx < th["min_adx"]: return False, f"ADX {adx}", "adx"
+    if atr > th["max_atr_pct"]: return False, f"ATR {atr}%", "atr"
+
+    df = cross.get("_df"); market = cross.get("market") or "UNKNOWN"
+    if market == "UNKNOWN" and df is not None:
+        market = classify_market(df); cross["market"] = market
+
+    if source == "bb_squeeze":
+        if adx < MIN_ADX_FOR_BB: return False, "BB ADX", "adx"
+        if vol < BB_MIN_VOL: return False, "BB Vol", "vol"
+        if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE: return False, "BB RANGE", "range"
+        if BB_CONFIRM_ENABLED and not ((mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)):
+            return False, "BB no-confirm", "bb_confirm"
+
+    if source == "ema":
+        if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 5:
+            return False, "ضد الترند", "trend"
+        if market == "TREND_UP" and direction == "bearish" and mtf_bonus < 5:
+            return False, "ضد الترند", "trend"
+
+    if market == "RANGE" and source == "ema" and cross.get("alert_type") == "confirmed":
+        return False, "سوق عرضي", "range"
+
+    if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
+        if direction == "bullish" and htf_trend == "DOWN":
+            return False, "HTF ضد LONG", "htf"
+        if direction == "bearish" and htf_trend == "UP":
+            return False, "HTF ضد SHORT", "htf"
+
+    if df is not None:
+        ok, slope = check_vwap_slope(df, direction, th, tf=tf)
+        if not ok: return False, f"VWAP {slope:+.2f}%", "vwap"
+
+    if STRICTNESS == "auto": _smart.record(True, score, source=source)
+    return True, "", ""
 
 # ═══════════════════════════════════════════════════════════
-# 13) Trading Engine
+# 11) Trading Loop
 # ═══════════════════════════════════════════════════════════
 async def trading_loop(context):
-    """job كل 2 دقيقة: يفحص الإشارات وينفذ"""
     if _executor is None or _positions_mgr is None: return
     if _positions_mgr.paused: return
     detectors = _get_detectors()
@@ -1511,27 +1473,19 @@ async def trading_loop(context):
                 try:
                     cross = await det(sym, tf)
                     if not cross: continue
-                    # فقط confirmed للتنفيذ
                     if TRADE_ON_CONFIRMED_ONLY and cross.get("alert_type") != "confirmed":
                         continue
-                    # cooldown
                     ok_cd, rem = check_symbol_cooldown(sym)
                     if not ok_cd: continue
-                    # existing position for symbol?
                     if sym in _positions_mgr.positions: continue
-                    # can open?
                     ok, why = await _positions_mgr.can_open_new()
-                    if not ok:
-                        log.info(f"⏸️ لا يمكن فتح صفقة: {why}")
-                        continue
-                    # filters
+                    if not ok: continue
                     htf = await get_htf_trend(sym)
                     passed, reason, cat = await passes_filter(cross, htf)
                     if not passed:
                         _filter_stats[f"filtered_{cat}"] += 1
                         continue
                     if not cross.get("levels"): continue
-                    # ===== EXECUTE =====
                     pos = await _positions_mgr.open_position(cross)
                     if pos:
                         mark_symbol_sent(sym); record_signal(sym, cross["direction"])
@@ -1539,13 +1493,12 @@ async def trading_loop(context):
                         _last_signals.append({
                             "symbol": sym, "timeframe": tf, "direction": cross["direction"],
                             "source": cross.get("source","ema"), "score": cross.get("final_score",0),
-                            "entry": pos["entry"], "ts": _time.time(),
-                        })
+                            "entry": pos["entry"], "ts": _time.time()})
                         text = (f"🚀 <b>تم الفتح — {short(sym)}</b> [{tf}]\n"
                                 f"{'🟢 LONG' if cross['direction']=='bullish' else '🔴 SHORT'}\n"
                                 f"━━━━━━━━━━━━━━━━━━━\n"
                                 f"💰 Entry: <b>{fmt_price(pos['entry'])}</b>\n"
-                                f"📦 Qty: <b>{pos['qty']}</b> | Leverage: <b>{LEVERAGE}x</b>\n"
+                                f"📦 Qty: <b>{pos['qty']}</b> | {LEVERAGE}x\n"
                                 f"💵 Margin: <b>${pos['notional']/LEVERAGE:.2f}</b>\n"
                                 f"🛑 SL: <b>{fmt_price(pos['sl'])}</b> (-{pos['sl_pct']}%)\n"
                                 f"🎯 TP1: {fmt_price(pos['tp1'])}\n"
@@ -1560,35 +1513,41 @@ async def trading_loop(context):
             await asyncio.sleep(0.2)
         await asyncio.sleep(0.3)
 
+async def watchdog_job(context):
+    if _positions_mgr is None or not _positions_mgr.positions: return
+    try:
+        await _positions_mgr.watchdog_check()
+    except Exception as e:
+        log.exception(f"watchdog_job: {e}")
+
 # ═══════════════════════════════════════════════════════════
-# 14) أوامر تيليجرام
+# 12) Telegram Commands
 # ═══════════════════════════════════════════════════════════
 def _get_bot(): return _bot_ref[0] if _bot_ref[0] else None
 _bot_ref: list = [None]
 
+def _source_label(src):
+    return {"ema":"📈 EMA","rsi_div":"🔄 RSI Div","bb_squeeze":"💥 BB",
+            "sr_breakout":"🎯 S/R"}.get(src, "—")
+
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     sd, sn = get_session_info()
     bal = await _positions_mgr._get_balance_usd() if _positions_mgr else 0
-    txt = (f"🤖 <b>Smart Trading Bot v7.0</b>\n"
+    txt = (f"🤖 <b>Smart Trading Bot v7.1</b>\n"
            f"━━━━━━━━━━━━━━━━━━━\n"
            f"💰 الرصيد: <b>${bal:.2f}</b>\n"
            f"📊 Positions: <b>{len(_positions_mgr.positions) if _positions_mgr else 0}</b>/{MAX_CONCURRENT_POSITIONS}\n"
            f"⚙️ Leverage: <b>{LEVERAGE}x ISOLATED</b>\n"
-           f"📏 Notional/trade: <b>${POSITION_NOTIONAL_USD}</b>\n"
-           f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n"
-           f"{'⏸️ <b>البوت موقوف</b>' if _positions_mgr and _positions_mgr.paused else '▶️ يعمل'}\n"
+           f"📏 Notional: <b>${POSITION_NOTIONAL_USD}</b>\n"
+           f"🕐 {sn} ({sd:+d})\n"
+           f"{'⏸️ موقوف' if _positions_mgr and _positions_mgr.paused else '▶️ يعمل'}\n"
            f"━━━━━━━━━━━━━━━━━━━\n"
            f"<b>أوامر:</b>\n"
-           f"/positions — الصفقات المفتوحة\n"
-           f"/close SYM — إغلاق صفقة\n"
-           f"/closeall — إغلاق الكل\n"
-           f"/pause /resume — إيقاف/تشغيل\n"
-           f"/balance — الرصيد\n"
-           f"/why [SYM] — تشخيص\n"
-           f"/last — آخر الإشارات\n"
-           f"/status /stats /perf\n"
-           f"/strict /clearcache\n"
-           f"/emergency — 🆘 إغلاق كل شيء")
+           f"/positions /close /closeall\n"
+           f"/pause /resume /emergency\n"
+           f"/balance /status /stats /perf\n"
+           f"/last /why [SYM]\n"
+           f"/strict /clearcache")
     await u.message.reply_text(txt, parse_mode="HTML")
 
 async def cmd_positions(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1604,7 +1563,6 @@ async def cmd_positions(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bull = pos["direction"] == "bullish"
         pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) * (1 if bull else -1)
         pnl_usd = (price - pos["entry"]) * pos["qty"] * (1 if bull else -1)
-        pnl_usd_lev = pnl_usd  # هامش * رافعة = (notional/lev) * (pnl/entry) * lev = same
         lines.append(
             f"\n{'🟢' if bull else '🔴'} <b>{short(sym)}</b> [{pos['tf']}]\n"
             f"   Entry: {fmt_price(pos['entry'])} → {fmt_price(price)}\n"
@@ -1613,14 +1571,14 @@ async def cmd_positions(u: Update, c: ContextTypes.DEFAULT_TYPE):
             f"   {'✅TP1 ' if pos['tp1_filled'] else ''}"
             f"{'✅TP2 ' if pos['tp2_filled'] else ''}"
             f"{'✅TP3 ' if pos['tp3_filled'] else ''}"
-            f"{'🔄Trailing ' if pos.get('trailing_active') else ''}"
+            f"{'🔄Trail ' if pos.get('trailing_active') else ''}"
             f"{'⚖️BE ' if pos.get('breakeven_moved') else ''}")
+        await asyncio.sleep(0.3)
     await u.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_close(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = c.args or []
-    if not args:
-        await u.message.reply_text("الاستخدام: /close BTC"); return
+    if not args: await u.message.reply_text("الاستخدام: /close BTC"); return
     sym = find_symbol_by_name(args[0])
     if not sym or sym not in _positions_mgr.positions:
         await u.message.reply_text(f"❌ لا صفقة على {args[0]}"); return
@@ -1637,12 +1595,12 @@ async def cmd_closeall(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_emergency(u: Update, c: ContextTypes.DEFAULT_TYPE):
     _positions_mgr.paused = True
-    await u.message.reply_text("🆘 <b>إغلاق طارئ + إيقاف</b>", parse_mode="HTML")
+    await u.message.reply_text("🆘 إغلاق طارئ + إيقاف")
     await _positions_mgr.close_all("emergency")
 
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
     _positions_mgr.paused = True
-    await u.message.reply_text("⏸️ موقوف (/resume للتشغيل)")
+    await u.message.reply_text("⏸️ موقوف")
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
     _positions_mgr.paused = False
@@ -1653,11 +1611,12 @@ async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         b = await _executor.fetch_balance()
         usdt = b.get("USDT", {})
-        txt = (f"💰 <b>الرصيد</b>\n"
-               f"• Total: <b>{usdt.get('total',0):.4f}</b> USDT\n"
-               f"• Free: <b>{usdt.get('free',0):.4f}</b> USDT\n"
-               f"• Used: <b>{usdt.get('used',0):.4f}</b> USDT")
-        await u.message.reply_text(txt, parse_mode="HTML")
+        await u.message.reply_text(
+            f"💰 <b>الرصيد</b>\n"
+            f"• Total: <b>{usdt.get('total',0):.4f}</b> USDT\n"
+            f"• Free: <b>{usdt.get('free',0):.4f}</b>\n"
+            f"• Used: <b>{usdt.get('used',0):.4f}</b>",
+            parse_mode="HTML")
     except Exception as e:
         await u.message.reply_text(f"❌ {e}")
 
@@ -1667,28 +1626,26 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     bal = await _positions_mgr._get_balance_usd()
     jq = c.application.job_queue; jobs_n = len(jq.jobs()) if jq else 0
     await u.message.reply_text(
-        f"🤖 <b>الحالة v7.0</b>\n"
-        f"🔌 Binance USDM\n"
+        f"🤖 <b>الحالة v7.1</b>\n"
         f"💰 ${bal:.2f} | 📊 {len(_positions_mgr.positions)}/{MAX_CONCURRENT_POSITIONS}\n"
         f"{'⏸️ موقوف' if _positions_mgr.paused else '▶️ يعمل'}\n"
         f"🕐 {sn} ({sd:+d}) | Jobs: {jobs_n}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: {_filter_stats['sent']}\n"
         f"🚫 محجوبة: {total}\n"
-        f"📈 WR: <b>{st['wr']}%</b> (✅{st['wins']} ❌{st['losses']})\n"
-        f"📉 P&L اليوم: <b>{_positions_mgr.daily_pnl_usd:+.2f}$</b>\n"
-        f"❌ خسائر متتالية: {_positions_mgr.consecutive_losses}",
+        f"📈 WR: <b>{st['wr']}%</b>\n"
+        f"📉 P&L: <b>{_positions_mgr.daily_pnl_usd:+.2f}$</b>",
         parse_mode="HTML")
 
 async def cmd_stats(u: Update, c: ContextTypes.DEFAULT_TYPE):
     st = _smart.stats()
     if st["n"] == 0:
-        await u.message.reply_text("📊 لا نتائج بعد."); return
+        await u.message.reply_text("📊 لا نتائج."); return
     bar = "█" * int(st["wr"]/5) + "░" * (20 - int(st["wr"]/5))
     await u.message.reply_text(
         f"📊 <b>الأداء</b>\n<code>{bar}</code>\n"
         f"📈 WR: <b>{st['wr']}%</b>\n"
-        f"✅ {st['wins']} | ❌ {st['losses']} | ⏰ {st['expired']}",
+        f"✅ {st['wins']} | ❌ {st['losses']}",
         parse_mode="HTML")
 
 async def cmd_perf(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1713,46 +1670,44 @@ async def cmd_last(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_why(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = c.args or []
-    if args:
-        sym = find_symbol_by_name(args[0])
-        if not sym: await u.message.reply_text(f"❌ {args[0]}"); return
-        lines = [f"📊 <b>تشخيص {short(sym)}</b>"]
-        for tf in ["5m","15m","1h"]:
-            try:
-                df = await _df_for(sym, tf)
-                if df is None: lines.append(f"\n<b>[{tf}]</b> ❌"); continue
-                df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
-                curr = -2
-                cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
-                gap = abs(cf-cs)/cs*100; atr_p = float(calc_atr(df).iloc[curr])/float(df["c"].iloc[curr])*100
-                adx = float(calc_adx(df).iloc[curr]); rsi = float(calc_rsi(df["c"]).iloc[curr])
-                th = get_thresholds(atr_pct=atr_p, adx=adx, tf=tf)
-                lines.append(f"\n<b>[{tf}]</b> 💰{fmt_price(float(df['c'].iloc[curr]))}\n"
-                             f"EMA gap {gap:.3f}% | ATR {atr_p:.2f}% | ADX {adx:.1f} | RSI {rsi:.1f}")
-            except Exception as e:
-                lines.append(f"\n<b>[{tf}]</b> ❌ {e}")
-        await u.message.reply_text("\n".join(lines), parse_mode="HTML")
-    else:
-        await u.message.reply_text("الاستخدام: /why BTC")
+    if not args: await u.message.reply_text("الاستخدام: /why BTC"); return
+    sym = find_symbol_by_name(args[0])
+    if not sym: await u.message.reply_text(f"❌ {args[0]}"); return
+    lines = [f"📊 <b>تشخيص {short(sym)}</b>"]
+    for tf in ["5m","15m","1h"]:
+        try:
+            df = await _df_for(sym, tf)
+            if df is None: lines.append(f"\n<b>[{tf}]</b> ❌"); continue
+            df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+            curr = -2
+            cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+            gap = abs(cf-cs)/cs*100
+            atr_p = float(calc_atr(df).iloc[curr])/float(df["c"].iloc[curr])*100
+            adx = float(calc_adx(df).iloc[curr]); rsi = float(calc_rsi(df["c"]).iloc[curr])
+            lines.append(f"\n<b>[{tf}]</b> 💰{fmt_price(float(df['c'].iloc[curr]))}\n"
+                         f"EMA gap {gap:.3f}% | ATR {atr_p:.2f}% | ADX {adx:.1f} | RSI {rsi:.1f}")
+        except Exception as e:
+            lines.append(f"\n<b>[{tf}]</b> ❌ {e}")
+    await u.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_strict(u: Update, c: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds(tf="15m")
     await u.message.reply_text(
-        f"🎯 <b>الإعدادات</b>\n"
-        f"• Leverage: <b>{LEVERAGE}x</b> ISOLATED\n"
+        f"🎯 <b>الإعدادات v7.1</b>\n"
+        f"• Leverage: <b>{LEVERAGE}x ISOLATED</b>\n"
         f"• Notional: <b>${POSITION_NOTIONAL_USD}</b>\n"
         f"• Max concurrent: <b>{MAX_CONCURRENT_POSITIONS}</b>\n"
         f"• MAX_SL_PCT: <b>{MAX_SL_PCT}%</b>\n"
         f"• Score مطلق ≥ <b>{ABS_MIN_SCORE}</b>\n"
         f"• Score ديناميكي ≥ <b>{th['min_score']:.0f}</b>\n"
-        f"• Daily loss limit: <b>{MAX_DAILY_LOSS_PCT}%</b>\n"
-        f"• Max consecutive losses: <b>{MAX_CONSECUTIVE_LOSSES}</b>\n"
+        f"• Daily loss: <b>{MAX_DAILY_LOSS_PCT}%</b>\n"
+        f"• Max consec losses: <b>{MAX_CONSECUTIVE_LOSSES}</b>\n"
         f"• TP splits: <b>{TP_SPLITS}</b>\n"
-        f"• Trailing after TP2: <b>{TRAIL_CALLBACK_RATE}%</b>",
+        f"• Trailing: <b>{TRAIL_CALLBACK_RATE}%</b>\n"
+        f"• Watchdog: كل <b>{WATCHDOG_INTERVAL_SEC}s</b>",
         parse_mode="HTML")
 
 async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    global _crossover_cache, _divergence_cache, _bb_cache, _sr_cache
     _crossover_cache.clear(); _divergence_cache.clear()
     _bb_cache.clear(); _sr_cache.clear()
     _ohlcv_rest_cache.clear()
@@ -1765,12 +1720,12 @@ async def error_handler(u, c):
     log.error(f"❌ {err}", exc_info=err)
 
 # ═══════════════════════════════════════════════════════════
-# 15) Health
+# 13) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8")
-        self.end_headers(); self.wfile.write(b"OK - v7.0")
+        self.end_headers(); self.wfile.write(b"OK - v7.1")
     def do_HEAD(self): self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
 
@@ -1779,7 +1734,7 @@ def run_health():
     HTTPServer(("0.0.0.0", port), _Health).serve_forever()
 
 # ═══════════════════════════════════════════════════════════
-# 16) Main
+# 14) Main
 # ═══════════════════════════════════════════════════════════
 async def _startup_async(app: Application):
     global _executor, _positions_mgr, _ws_mgr
@@ -1787,25 +1742,26 @@ async def _startup_async(app: Application):
     _positions_mgr = PositionManager(_executor, _get_bot)
     _ws_mgr = WebSocketManager(_executor, _positions_mgr)
     _positions_mgr.ws_ref = _ws_mgr
+
+    # ✅ تأخير 30 ثانية قبل الاتصال بـ Binance
+    log.info(f"⏳ انتظار {STARTUP_DELAY_SEC}s قبل مزامنة Binance ...")
+    await asyncio.sleep(STARTUP_DELAY_SEC)
+
     await _positions_mgr.reconcile()
-    # initial ohlcv fetch
+    await asyncio.sleep(2)
+
+    # جلب بيانات أولية مع تأخير
+    log.info("📊 جلب بيانات أولية ...")
     for sym in ALL_SYMBOLS:
         for tf in TIMEFRAMES:
             try:
                 await fetch_ohlcv_cached(sym, tf, 200)
+                await asyncio.sleep(INTER_SYMBOL_DELAY_SEC)
             except Exception as e:
                 log.warning(f"initial {sym} {tf}: {e}")
+
     await _ws_mgr.start()
     log.info("🚀 جاهز — Trading Engine يعمل")
-
-async def watchdog_job(context):
-    """job المراقبة: يتأكد من وجود SL/TP على Binance"""
-    if _positions_mgr is None: return
-    if not _positions_mgr.positions: return
-    try:
-        await _positions_mgr.watchdog_check()
-    except Exception as e:
-        log.exception(f"watchdog_job: {e}")
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -1819,6 +1775,8 @@ def main():
     print(f"⚙️ Leverage: {LEVERAGE}x ISOLATED | ${POSITION_NOTIONAL_USD}/trade")
     print(f"🛡️ Max positions: {MAX_CONCURRENT_POSITIONS}")
     print(f"🛡️ Max SL: {MAX_SL_PCT}% | Daily loss: {MAX_DAILY_LOSS_PCT}%")
+    print(f"⏱️  Startup delay: {STARTUP_DELAY_SEC}s")
+    print(f"🛡️ Watchdog: كل {WATCHDOG_INTERVAL_SEC}s")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
@@ -1828,9 +1786,8 @@ def main():
            .request(request).get_updates_request(request).build())
 
     if app.job_queue is None:
-        raise RuntimeError("job_queue غير متوفر — pip install 'python-telegram-bot[job-queue]'")
+        raise RuntimeError("job_queue غير متوفر")
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("positions", cmd_positions))
     app.add_handler(CommandHandler("close", cmd_close))
@@ -1854,12 +1811,10 @@ def main():
 
     app.post_init = _post_init
 
-    # Trading loop كل 2 دقيقة
-    app.job_queue.run_repeating(trading_loop, interval=120, first=30, name="trading")
-        # 🆕 Watchdog كل 3 دقائق
-    app.job_queue.run_repeating(
-        watchdog_job, interval=180, first=60, name="watchdog")
-    print("🛡️ Watchdog: كل 3 دقائق")
+    # Jobs — تأخير أول تشغيل لتفادي burst
+    app.job_queue.run_repeating(trading_loop, interval=120, first=180, name="trading")
+    app.job_queue.run_repeating(watchdog_job, interval=WATCHDOG_INTERVAL_SEC,
+                                first=300, name="watchdog")
 
     print("✅ Start polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES,
