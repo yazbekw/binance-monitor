@@ -1,30 +1,31 @@
 """
-Unified Smart Bot v7.1 — WebSocket + Binance Execution
-=======================================================
-  🆕 Binance Futures WebSocket (bookTicker)
-  🆕 FairPrice: WS → REST → Median (تدريجي)
-  🆕 SL/TP تُحسب من سعر التنفيذ الفعلي
-  🆕 Webshare Proxy (اختياري للـ WS، إلزامي للـ REST)
-  ✓ استراتيجية v6.4.3 كما هي
-  ✓ Risk Manager (4 صفقات، Kill-switch)
+Unified Smart Trading Bot v7.0 — Binance USDT-M Futures Auto-Trader
+====================================================================
+Strategy  : EMA cross + RSI div + BB squeeze + S/R breakout (v6.4.3)
+Execution : Binance USDT-M Futures | 40x ISOLATED | $400 notional/trade
+Limits    : Max 5 concurrent positions | SL обязат | Daily loss limit
+Data      : WebSocket klines + user data stream (FREE, no rate limit)
+REST      : Orders only | weight-aware + exponential backoff
+Safety    : Auto SL/TP (50/30/20) + Breakeven + Trailing | Reconcile on boot
 """
-import os, asyncio, logging, threading, time as _time, json
+import os, sys, json, hmac, hashlib, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 from collections import deque, defaultdict
+from typing import Optional, Dict, Any, List
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "websockets"):
+for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler", "websockets"):
     logging.getLogger(_n).setLevel(logging.WARNING)
-log = logging.getLogger("unified")
+log = logging.getLogger("bot")
 
 import ccxt
 import pandas as pd
 import websockets
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.error import NetworkError, TimedOut
 
 load_dotenv()
@@ -34,33 +35,37 @@ load_dotenv()
 # ═══════════════════════════════════════════════════════════
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_REPORT_CHAT_ID")
-PROXY_URL = os.getenv("PROXY_URL") or None
-WS_USE_PROXY = os.getenv("WS_USE_PROXY", "0") == "1"
-
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-EXECUTION_ENABLED        = os.getenv("EXECUTION_ENABLED", "1") == "1"
-TRADE_MARGIN_USD         = float(os.getenv("TRADE_MARGIN_USD", "400"))
-LEVERAGE                 = int(os.getenv("LEVERAGE", "50"))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT", "4"))
-MAX_DAILY_LOSS_USD       = float(os.getenv("MAX_DAILY_LOSS_USD", "600"))
-MAX_PRICE_DIVERGENCE_PCT = float(os.getenv("MAX_PRICE_DIV", "0.20"))
+# Trading
+LEVERAGE                = int(os.getenv("LEVERAGE", "40"))
+POSITION_NOTIONAL_USD   = float(os.getenv("POSITION_NOTIONAL_USD", "400"))
+MAX_CONCURRENT_POSITIONS= int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
+MARGIN_MODE             = os.getenv("MARGIN_MODE", "isolated")
+MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "1.0"))      # 40x → SL ≤1% = max 40% margin loss
+MIN_SL_PCT_ORDER        = float(os.getenv("MIN_SL_PCT_ORDER", "0.15")) # Binance min distance
+TRADE_ON_CONFIRMED_ONLY = os.getenv("TRADE_ON_CONFIRMED_ONLY", "true").lower() == "true"
+ENABLE_LONG             = os.getenv("ENABLE_LONG", "true").lower() == "true"
+ENABLE_SHORT            = os.getenv("ENABLE_SHORT", "true").lower() == "true"
 
-PRIMARY_EXCHANGE = "bybit"
-FALLBACK_EXCHANGES = ["okx", "kucoin", "bitget"]
-MARKET_TYPE = "swap"
+# Risk
+MAX_DAILY_LOSS_PCT       = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))    # % of balance
+MAX_CONSECUTIVE_LOSSES   = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+TP_SPLITS                = [0.50, 0.30, 0.20]   # TP1/TP2/TP3
+TRAIL_AFTER_TP2          = True
+TRAIL_CALLBACK_RATE      = float(os.getenv("TRAIL_CALLBACK_RATE", "0.4"))  # 0.4%
+BREAKEVEN_AFTER_TP1      = True
+
+# Timeframes / Strategy
 TIMEFRAMES = ["5m", "15m", "1h"]
 EMA_FAST, EMA_SLOW = 7, 25
-JOB_INTERVAL_MIN = 2
-
 ENABLE_PRE_CROSS  = True
 ENABLE_LIVE_CROSS = True
 ENABLE_CONFIRMED  = True
 PRE_CROSS_GAP = 0.05
 PRE_CROSS_LOOKBACK = 3
 PRE_CROSS_COOLDOWN = 3
-
 ENABLE_RSI_DIVERGENCE = True
 ENABLE_BB_SQUEEZE     = True
 ENABLE_SR_BREAKOUT    = True
@@ -70,305 +75,175 @@ BB_SQUEEZE_PCTL = 0.20
 BB_SQUEEZE_COOLDOWN_MIN = 30
 SR_BREAKOUT_LOOKBACK = 50
 SR_BREAKOUT_COOLDOWN_MIN = 30
-
 MTF_ENABLED = True
 SESSION_ADJUST_ENABLED = True
-OHLCV_CACHE_SECONDS = 120
-CONFLICT_WINDOW_SEC = 300
 HTF_ENABLED = True
 HTF_TIMEFRAME = "1h"
 HTF_BLOCK_OPPOSITE = True
 VWAP_SLOPE_LOOKBACK = 5
 STRICTNESS = "auto"
 STRICTNESS_OVERRIDE: dict = {}
-SYMBOL_DELAY_MS = 200
-SYRIA_TZ = ZoneInfo("Asia/Damascus")
-SIGNAL_TRACK_MAX_MIN = 90
-SIGNAL_TRACK_INTERVAL_MIN = 1
+
+# Filters
+MIN_EMA_GAP_PCT = {"5m": 0.02, "15m": 0.015, "1h": 0.01}
+MIN_ATR_PCT     = {"5m": 0.05, "15m": 0.10, "1h": 0.20}
+MIN_ADX_FOR_BB       = 8.0
+SYMBOL_COOLDOWN_SEC  = 180
+STRICTNESS_MAX_FINAL = 80
+ABS_MIN_SCORE        = 52
+BB_MIN_VOL           = 1.0
+BB_MIN_ADX_IN_RANGE  = 20
+BB_CONFIRM_ENABLED   = True
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
+SIGNAL_TRACK_MAX_MIN = 90
+SIGNAL_TRACK_INTERVAL_MIN = 2
 LAST_SIGNALS_MAX = 20
 
-def _env_float(k, d):
-    try: return float(os.getenv(k, d))
-    except: return d
-def _env_int(k, d):
-    try: return int(os.getenv(k, d))
-    except: return d
+SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
-MIN_EMA_GAP_PCT = {"5m": _env_float("MIN_EMA_GAP_5M", 0.02),
-                   "15m": _env_float("MIN_EMA_GAP_15M", 0.015),
-                   "1h": _env_float("MIN_EMA_GAP_1H", 0.01)}
-MIN_ATR_PCT = {"5m": _env_float("MIN_ATR_5M", 0.05),
-               "15m": _env_float("MIN_ATR_15M", 0.10),
-               "1h": _env_float("MIN_ATR_1H", 0.20)}
-MIN_ADX_FOR_BB       = _env_float("MIN_ADX_FOR_BB", 8.0)
-SYMBOL_COOLDOWN_SEC  = _env_int("SYMBOL_COOLDOWN_SEC", 180)
-STRICTNESS_MAX_FINAL = _env_int("STRICTNESS_MAX_FINAL", 80)
-ABS_MIN_SCORE        = _env_int("ABS_MIN_SCORE", 52)
-BB_MIN_VOL           = _env_float("BB_MIN_VOL", 1.0)
-BB_MIN_ADX_IN_RANGE  = _env_float("BB_MIN_ADX_IN_RANGE", 20)
-BB_CONFIRM_ENABLED   = True
-
-
-def _to_ws_sym(symbol):
-    """BTC/USDT:USDT → btcusdt (لـ Binance Futures WS)"""
-    return symbol.split(":")[0].replace("/", "").lower()
-
-
-def _normalize_symbol(name):
+# ═══════════════════════════════════════════════════════════
+# 2) الرموز
+# ═══════════════════════════════════════════════════════════
+def _norm_sym(name: str) -> str:
     name = name.strip().upper()
-    if "/" in name: return name
-    if name.endswith("_USDT"): name = name[:-5]
+    if "/" in name and ":" in name: return name
+    if "/" in name: return f"{name}:USDT"
+    if name.endswith("USDT"): return f"{name[:-4]}/USDT:USDT"
     return f"{name}/USDT:USDT"
 
+_syms_env = os.getenv("TRADING_SYMBOLS", "").strip()
+if _syms_env:
+    ALL_SYMBOLS = [_norm_sym(s) for s in _syms_env.split(",") if s.strip()]
+else:
+    # Backward compat: derive from _UPPER vars
+    _from_ranges = []
+    for k in os.environ:
+        if k.upper().endswith("_UPPER"):
+            coin = k[:-6].strip().upper()
+            _from_ranges.append(f"{coin}/USDT:USDT")
+    ALL_SYMBOLS = _from_ranges or ["XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT"]
 
-def _detect_manual_ranges():
-    env = dict(os.environ); out = {}
-    for key, upper_val in env.items():
-        if not key.upper().endswith("_UPPER"): continue
-        coin = key[:-6]
-        lower_val = env.get(f"{coin}_LOWER") or env.get(f"{coin}_LOWER".upper())
-        if lower_val is None: continue
-        try:
-            u, l = float(str(upper_val).strip()), float(str(lower_val).strip())
-        except: continue
-        if u <= l: continue
-        out[_normalize_symbol(coin)] = {"lower": l, "upper": u}
-    return out
-
-
-_MANUAL_RANGES = _detect_manual_ranges()
-ALL_SYMBOLS = list(_MANUAL_RANGES.keys()) if _MANUAL_RANGES else \
-              ["BTC/USDT:USDT", "ETH/USDT:USDT", "XRP/USDT:USDT"]
-log.info(f"✅ {len(ALL_SYMBOLS)} رمز: {[s.split('/')[0] for s in ALL_SYMBOLS]}")
-
+log.info(f"📊 الرموز: {ALL_SYMBOLS}")
 
 # ═══════════════════════════════════════════════════════════
-# 2) MultiExchange (بيانات من Bybit/OKX — بدون Proxy)
+# 3) أدوات
 # ═══════════════════════════════════════════════════════════
-_EXCHANGE_NAMES = ["bybit", "okx", "kucoin", "kraken", "gate",
-                   "bitget", "mexc", "htx", "coinex", "bitmart"]
-_EXCHANGE_CLASSES = {n: getattr(ccxt, n) for n in _EXCHANGE_NAMES if hasattr(ccxt, n)}
+def short(symbol): return symbol.split("/")[0].split(":")[0].upper()
 
+def syria_now_str():
+    now = datetime.now(SYRIA_TZ)
+    days_ar = {"Monday":"الاثنين","Tuesday":"الثلاثاء","Wednesday":"الأربعاء",
+               "Thursday":"الخميس","Friday":"الجمعة","Saturday":"السبت","Sunday":"الأحد"}
+    return f"{days_ar.get(now.strftime('%A'), now.strftime('%A'))} {now.strftime('%Y-%m-%d')} — {now.strftime('%H:%M:%S')}"
 
-class MultiExchange:
-    def __init__(self):
-        self.primary = None; self.fallbacks = []; self._banned = {}
-        self._init_all()
+def fmt_price(v):
+    if v >= 1000: return f"{v:.2f}"
+    if v >= 100:  return f"{v:.3f}"
+    if v >= 1:    return f"{v:.4f}"
+    if v >= 0.01: return f"{v:.5f}"
+    return f"{v:.8f}"
 
-    def _is_banned(self, name):
-        u = self._banned.get(name, 0); return (_time.time() < u), max(0, int(u-_time.time()))
-
-    def _mark_banned(self, name, sec):
-        self._banned[name] = _time.time() + sec
-        log.warning(f"🚫 {name} banned {sec}s")
-
-    def _make(self, name):
-        if name not in _EXCHANGE_CLASSES: return None
-        try:
-            opts = {"enableRateLimit": True, "timeout": 20000,
-                    "options": {"defaultType": MARKET_TYPE, "adjustForTimeDifference": True}}
-            if name == "bybit": opts["options"]["unifiedMargin"] = False
-            ex = _EXCHANGE_CLASSES[name](opts)
-            ex.load_markets()
-            log.info(f"✅ Data: {ex.name} | {len(ex.markets)} markets")
-            return ex
-        except Exception as e:
-            log.warning(f"❌ {name}: {type(e).__name__}: {e}"); return None
-
-    def _init_all(self):
-        self.primary = self._make(PRIMARY_EXCHANGE)
-        for n in FALLBACK_EXCHANGES:
-            if n == PRIMARY_EXCHANGE: continue
-            ex = self._make(n)
-            if ex: self.fallbacks.append(ex)
-        if not self.primary and self.fallbacks: self.primary = self.fallbacks.pop(0)
-
-    def _chain(self):
-        out = []
-        if self.primary: out.append(self.primary)
-        out.extend(self.fallbacks); return out
-
-    async def fetch_ohlcv(self, symbol, tf, limit=200):
-        for ex in self._chain():
-            banned, _ = self._is_banned(ex.id)
-            if banned: continue
-            try:
-                data = await asyncio.to_thread(ex.fetch_ohlcv, symbol, tf, None, limit)
-                if data and len(data) > 0: return data, ex.id
-            except ccxt.RateLimitExceeded: self._mark_banned(ex.id, 90); continue
-            except ccxt.DDoSProtection: self._mark_banned(ex.id, 300); continue
-            except ccxt.ExchangeNotAvailable: self._mark_banned(ex.id, 180); continue
-            except ccxt.BadSymbol: continue
-            except (ccxt.NetworkError, ccxt.ExchangeError): await asyncio.sleep(0.3); continue
-            except Exception: continue
-        return None, None
-
-    @property
-    def primary_name(self): return self.primary.name if self.primary else "none"
-    def ok(self): return self.primary is not None
-
-
-_exchange = MultiExchange()
-
+def find_symbol_by_name(name):
+    if not name: return None
+    name = name.upper().strip()
+    for sym in ALL_SYMBOLS:
+        if short(sym) == name: return sym
+    for sym in ALL_SYMBOLS:
+        if name in sym.upper(): return sym
+    if "/" not in name: return f"{name}/USDT:USDT"
+    return None
 
 # ═══════════════════════════════════════════════════════════
-# 3) 🆕 Binance WebSocket (bookTicker)
+# 4) المؤشرات
 # ═══════════════════════════════════════════════════════════
-class BinanceWS:
-    URL = "wss://fstream.binance.com/stream?streams={streams}"
+def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
-    def __init__(self):
-        self.prices = {}          # {"BTCUSDT": {"mark":.., "bid":.., "ask":.., "ts":..}}
-        self._task = None
-        self._running = False
-        self._connected = False
-        self._last_msg_ts = 0.0
-        self._reconnects = 0
-        self._symbols = set()
+def calc_rsi(s, p=14):
+    d = s.diff(); g = d.clip(lower=0); l = -d.clip(upper=0)
+    ag = g.ewm(alpha=1/p, adjust=False).mean(); al = l.ewm(alpha=1/p, adjust=False).mean()
+    rs = ag / al.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
 
-    def set_symbols(self, symbols):
-        self._symbols = {_to_ws_sym(s) for s in symbols}
+def calc_atr(df, p=14):
+    tr = pd.concat([df["h"]-df["l"], (df["h"]-df["c"].shift()).abs(),
+                    (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/p, adjust=False).mean()
 
-    def get(self, symbol):
-        ws = _to_ws_sym(symbol).upper()
-        p = self.prices.get(ws)
-        if not p: return None
-        if _time.time() - p["ts"] > 15: return None
-        return p
+def calc_adx(df, p=14):
+    h, l, c = df["h"], df["l"], df["c"]
+    pdm = h.diff(); ndm = -l.diff()
+    pdm = pdm.where((pdm > ndm) & (pdm > 0), 0)
+    ndm = ndm.where((ndm > pdm) & (ndm > 0), 0)
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/p, adjust=False).mean()
+    pdi = 100 * pdm.ewm(alpha=1/p, adjust=False).mean() / atr.replace(0, 1e-9)
+    ndi = 100 * ndm.ewm(alpha=1/p, adjust=False).mean() / atr.replace(0, 1e-9)
+    dx = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, 1e-9)
+    return dx.ewm(alpha=1/p, adjust=False).mean()
 
-    async def start(self, symbols):
-        self.set_symbols(symbols)
-        if self._running: return
-        self._running = True
-        self._task = asyncio.create_task(self._run())
+def calc_macd(s, f=12, sl=26, sig=9):
+    ef = s.ewm(span=f, adjust=False).mean(); es = s.ewm(span=sl, adjust=False).mean()
+    dif = ef - es; dea = dif.ewm(span=sig, adjust=False).mean()
+    return dif, dea, dif - dea
 
-    async def _run(self):
-        while self._running:
-            try:
-                if not self._symbols:
-                    await asyncio.sleep(5); continue
-                streams = "/".join(f"{s}@bookTicker" for s in sorted(self._symbols))
-                url = self.URL.format(streams=streams)
+def calc_vwap_session(df, session="day"):
+    if df.empty: return df["c"]
+    try:
+        ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        skey = ts.dt.floor("D") if session == "day" else ts.dt.floor("H")
+        tp = (df["h"] + df["l"] + df["c"]) / 3
+        pv = tp * df["v"]
+        return pv.groupby(skey).cumsum() / df["v"].groupby(skey).cumsum().replace(0, 1e-9)
+    except Exception:
+        tp = (df["h"] + df["l"] + df["c"]) / 3
+        return (tp * df["v"]).cumsum() / df["v"].cumsum()
 
-                kwargs = {"ping_interval": 20, "ping_timeout": 10,
-                          "close_timeout": 5, "max_size": 2**20}
-                if WS_USE_PROXY and PROXY_URL:
-                    kwargs["proxy"] = PROXY_URL
+def calc_bollinger(df, period=20, std_mult=2):
+    close = df["c"]; ma = close.rolling(period).mean(); sd = close.rolling(period).std()
+    upper = ma + std_mult * sd; lower = ma - std_mult * sd
+    width = (upper - lower) / ma * 100
+    return {"ma": ma, "upper": upper, "lower": lower, "width": width}
 
-                async with websockets.connect(url, **kwargs) as ws:
-                    log.info(f"🔌 WS connected ({len(self._symbols)} streams)")
-                    self._connected = True
-                    self._reconnects = 0
-                    async for raw in ws:
-                        self._last_msg_ts = _time.time()
-                        try:
-                            msg = json.loads(raw)
-                            d = msg.get("data", msg)
-                            sym = d.get("s")
-                            if sym and "b" in d and "a" in d:
-                                bid = float(d["b"]); ask = float(d["a"])
-                                self.prices[sym] = {
-                                    "mark": (bid+ask)/2.0,
-                                    "bid": bid, "ask": ask, "ts": _time.time(),
-                                }
-                        except Exception as e:
-                            log.debug(f"WS parse: {e}")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.warning(f"⚠️ WS: {type(e).__name__}: {e}")
-
-            self._connected = False
-            self._reconnects += 1
-            if self._running:
-                delay = min(2 ** min(self._reconnects, 6), 60)
-                log.info(f"🔌 WS reconnect in {delay}s")
-                await asyncio.sleep(delay)
-
-    async def stop(self):
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try: await self._task
-            except: pass
-
-    def status(self):
-        return {
-            "connected": self._connected,
-            "symbols": len(self._symbols),
-            "cached": len(self.prices),
-            "last_msg_age": round(_time.time() - self._last_msg_ts, 1) if self._last_msg_ts else None,
-            "reconnects": self._reconnects,
-        }
-
-
-_ws = BinanceWS()
-
-
-# ═══════════════════════════════════════════════════════════
-# 4) 🆕 FairPrice (WS → REST Binance → Median)
-# ═══════════════════════════════════════════════════════════
-class FairPrice:
-    def __init__(self):
-        self.binance_rest = None
-        self.others = []
-        self._init()
-
-    def _init(self):
-        if PROXY_URL:
-            px = {"http": PROXY_URL, "https": PROXY_URL}
+def compute_levels(df, direction, curr_idx=-2, tf="15m"):
+    try:
+        price = float(df["c"].iloc[curr_idx])
+        atr = float(calc_atr(df).iloc[curr_idx])
+        ema_slow = float(calc_ema(df["c"], EMA_SLOW).iloc[curr_idx])
+        min_sl_pct = MIN_SL_PCT.get(tf, 0.50)
+        lookback = min(20, len(df) + curr_idx - 1)
+        if lookback < 2: return None
+        recent_high = float(df["h"].iloc[curr_idx-lookback:curr_idx].max())
+        recent_low  = float(df["l"].iloc[curr_idx-lookback:curr_idx].min())
+        if direction == "bullish":
+            sl_atr = price - atr * 1.5
+            sl_struct = min(recent_low, ema_slow) * 0.998
+            stop_loss = max(sl_atr, sl_struct)
+            min_dist = price * (min_sl_pct / 100)
+            if (price - stop_loss) < min_dist: stop_loss = price - min_dist
+            risk = price - stop_loss
+            tp1, tp2, tp3 = price + risk, price + risk*2, price + risk*3
         else:
-            px = None
-        try:
-            opts = {"enableRateLimit": True, "timeout": 10000,
-                    "options": {"defaultType": MARKET_TYPE}}
-            if px: opts["proxies"] = px
-            self.binance_rest = ccxt.binance(opts)
-        except Exception as e:
-            log.warning(f"binance_rest init: {e}")
-        for name in ["bybit", "okx"]:
-            try:
-                ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": 8000})
-                self.others.append(ex)
-            except: pass
-        log.info(f"💰 FairPrice init | rest_binance={'✅' if self.binance_rest else '❌'} "
-                 f"others={len(self.others)}")
-
-    async def get(self, symbol):
-        """يُعيد (price, source, details)"""
-        # 1) WS
-        ws = _ws.get(symbol)
-        if ws:
-            return ws["mark"], "ws", [("ws", ws["mark"]), ("bid", ws["bid"]), ("ask", ws["ask"])]
-
-        # 2) REST Binance (via proxy)
-        if self.binance_rest:
-            try:
-                t = await asyncio.to_thread(self.binance_rest.fetch_ticker, symbol)
-                p = float(t["last"])
-                return p, "rest_binance", [("binance_rest", p)]
-            except Exception:
-                pass
-
-        # 3) Median من منصات بديلة
-        prices = []
-        for ex in self.others:
-            try:
-                t = await asyncio.to_thread(ex.fetch_ticker, symbol)
-                prices.append((ex.id, float(t["last"])))
-            except: continue
-        if not prices: return None, "none", []
-        vals = sorted(p for _, p in prices)
-        median = vals[len(vals)//2]
-        return median, "median", prices
-
-
-_fair = FairPrice()
-
+            sl_atr = price + atr * 1.5
+            sl_struct = max(recent_high, ema_slow) * 1.002
+            stop_loss = min(sl_atr, sl_struct)
+            min_dist = price * (min_sl_pct / 100)
+            if (stop_loss - price) < min_dist: stop_loss = price + min_dist
+            risk = stop_loss - price
+            tp1, tp2, tp3 = price - risk, price - risk*2, price - risk*3
+        risk_pct = abs(price - stop_loss) / price * 100 if price else 0
+        if risk_pct < min_sl_pct * 0.9: return None
+        # Hard reject: on 40x, SL must be ≤ MAX_SL_PCT
+        if risk_pct > MAX_SL_PCT:
+            log.info(f"❌ SL {risk_pct:.2f}% > MAX_SL_PCT {MAX_SL_PCT}% (rejected for {tf})")
+            return None
+        return {"entry": price, "stop_loss": stop_loss, "sl_pct": round(risk_pct, 2),
+                "tp1": tp1, "tp2": tp2, "tp3": tp3, "atr": atr}
+    except Exception as e:
+        log.warning(f"compute_levels: {e}")
+        return None
 
 # ═══════════════════════════════════════════════════════════
-# 5) SmartStrictness + Sessions
+# 5) SmartStrictness (كما هو من v6.4.3)
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -379,70 +254,89 @@ STATIC_PROFILES = {
                  "block_against_htf": True, "score_15m_override": 75},
 }
 TF_PROFILES = {
-    "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70},
-    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90},
-    "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80},
+    "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 5},
+    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90, "min_hold_min": 15},
+    "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80, "min_hold_min": 60},
 }
-SESSIONS = [(0,6,"🌏 آسيا",+8),(6,10,"🌅 آسيا/أوروبا",+2),(10,13,"🇪🇺 أوروبا",0),
-            (13,16,"🔥 ذروة",-5),(16,21,"🇺🇸 أمريكا",0),(21,24,"🌙 هدوء",+5)]
-
+SESSIONS = [
+    (0, 6,  "🌏 آسيا",       +8),
+    (6, 10, "🌅 آسيا/أوروبا",+2),
+    (10,13, "🇪🇺 أوروبا",     0),
+    (13,16, "🔥 ذروة",       -5),
+    (16,21, "🇺🇸 أمريكا",     0),
+    (21,24, "🌙 ليلي",       +5),
+]
 
 class SmartStrictness:
     def __init__(self):
         self.history = deque(maxlen=200); self.results = deque(maxlen=200)
         self.source_stats = defaultdict(lambda: {"wins":0,"losses":0,"expired":0,"sent":0,"filtered":0})
-        self._lock = threading.Lock(); self._cached = None; self._ts = 0.0
+        self._lock = threading.Lock()
+        self._cached_profile = None; self._cached_ts = 0.0
+        self._cached_atr = None; self._cached_adx = None; self._cache_ttl = 60.0
 
     def record(self, passed, score, source="unknown"):
-        with self._lock: self.history.append((passed, score, _time.time(), source))
+        with self._lock:
+            self.history.append((passed, score, _time.time(), source))
+            self.source_stats[source]["sent" if passed else "filtered"] += 1
 
     def record_result(self, result, direction, source="unknown"):
         win = result.startswith("win"); expired = result == "expired"
         with self._lock:
-            self.results.append({"win":win,"result":result,"source":source,"expired":expired})
-            s = self.source_stats[source]
-            if win: s["wins"] += 1
-            elif expired: s["expired"] += 1
-            else: s["losses"] += 1
+            self.results.append({"win":win,"result":result,"direction":direction,
+                                 "ts":_time.time(),"source":source,"expired":expired})
+            if win: self.source_stats[source]["wins"] += 1
+            elif expired: self.source_stats[source]["expired"] += 1
+            else: self.source_stats[source]["losses"] += 1
 
     def _feedback(self):
         with self._lock:
             results = list(self.results)[-50:]; recent = list(self.history)[-50:]
         non_exp = [r for r in results if not r.get("expired")]
         if len(non_exp) >= 15:
-            ratio = sum(1 for r in non_exp if r["win"]) / len(non_exp)
+            wins = sum(1 for r in non_exp if r["win"]); ratio = wins/len(non_exp); n = len(non_exp)
         else:
-            if len(recent) < 20: return 0
-            ratio = sum(1 for p,_,_,_ in recent if p) / len(recent)
-        if ratio > 0.65: return +10
-        if ratio > 0.50: return +5
-        if ratio < 0.25: return -18
-        if ratio < 0.40: return -8
-        return 0
+            n = len(recent)
+            if n < 20: return 0, None, 0
+            ratio = sum(1 for p,_,_,_ in recent if p)/n
+        if ratio > 0.65:   d = +10
+        elif ratio > 0.50: d = +5
+        elif ratio < 0.25: d = -18
+        elif ratio < 0.40: d = -8
+        else:              d = 0
+        return d, ratio, n
 
     def compute(self, atr_pct=None, adx=None):
-        if self._cached and (_time.time() - self._ts) < 60: return self._cached
-        atr_pct = atr_pct or 0.5
+        now = _time.time()
+        if (self._cached_profile and (now-self._cached_ts)<self._cache_ttl
+            and self._cached_atr is not None
+            and abs(self._cached_atr-(atr_pct or 0))<0.05
+            and abs(self._cached_adx-(adx or 0))<2.0):
+            return self._cached_profile
+        if atr_pct is None or atr_pct <= 0: atr_pct = 0.5
         if atr_pct < 0.15: base = 50
         elif atr_pct < 0.30: base = 55
         elif atr_pct < 0.60: base = 62
         elif atr_pct < 1.00: base = 70
         else: base = 78
-        adx_d = 0
+        adx_delta = 0
         if adx is not None:
-            if adx > 35: adx_d = -3
-            elif adx > 25: adx_d = -1
-            elif adx < 18: adx_d = +5
-            elif adx < 22: adx_d = +2
-        final = max(40, min(STRICTNESS_MAX_FINAL, base + adx_d + self._feedback()))
+            if adx > 35: adx_delta = -3
+            elif adx > 25: adx_delta = -1
+            elif adx < 18: adx_delta = +5
+            elif adx < 22: adx_delta = +2
+        fb_delta, _, _ = self._feedback()
+        final = max(40, min(STRICTNESS_MAX_FINAL, base + adx_delta + fb_delta))
         prof = {"min_score": final,
-                "min_vol_ratio": round(max(0.7, (final-30)/30), 2),
-                "min_adx": round(max(12, final*0.28), 1),
-                "max_atr_pct": round(max(0.35, 1.2 - final/100), 2),
-                "vwap_slope_pct": round(0.02 + final/1000, 3),
+                "min_vol_ratio": round(max(0.7,(final-30)/30),2),
+                "min_adx": round(max(12, final*0.28),1),
+                "max_atr_pct": round(max(0.35, 1.2-final/100),2),
+                "vwap_slope_pct": round(0.02+final/1000,3),
                 "block_against_htf": final >= 55,
-                "score_15m_override": min(80, final + 10)}
-        self._cached = prof; self._ts = _time.time()
+                "score_15m_override": min(80, final+10),
+                "_debug": {"base":base,"adx_delta":adx_delta,"fb_delta":fb_delta,"atr":atr_pct,"adx":adx}}
+        self._cached_profile = prof; self._cached_ts = now
+        self._cached_atr = atr_pct; self._cached_adx = adx
         return prof
 
     def stats(self):
@@ -453,178 +347,786 @@ class SmartStrictness:
             exp = sum(1 for r in self.results if r.get("expired"))
             losses = n - wins - exp
         dec = wins + losses
-        return {"n":n, "wr": round(wins/dec*100,1) if dec else 0,
-                "wins":wins, "losses":losses, "expired":exp}
+        wr = round(wins/dec*100,1) if dec>0 else 0
+        return {"n":n,"wr":wr,"wins":wins,"losses":losses,"expired":exp}
 
-    def reset(self):
-        with self._lock: self.history.clear(); self.results.clear(); self.source_stats.clear()
-        self._cached = None
+    def source_report(self):
+        with self._lock: return dict(self.source_stats)
 
+    def reset_feedback(self):
+        with self._lock:
+            self.history.clear(); self.results.clear(); self.source_stats.clear()
+        self._cached_profile = None; self._cached_ts = 0.0
 
 _smart = SmartStrictness()
 
-
 def get_session_info():
     h = datetime.now(timezone.utc).hour
-    for s, e, n, d in SESSIONS:
-        if s <= h < e: return d, n
+    for start,end,name,delta in SESSIONS:
+        if start <= h < end: return delta, name
     return 0, "❓"
 
-
 def get_thresholds(atr_pct=None, adx=None, tf="15m"):
-    prof = dict(_smart.compute(atr_pct, adx)) if STRICTNESS == "auto" \
-           else dict(STATIC_PROFILES.get(STRICTNESS, STATIC_PROFILES["balanced"]))
-    tfp = TF_PROFILES.get(tf, TF_PROFILES["15m"])
-    prof["min_score"] *= tfp["score_mult"]
-    prof["min_vol_ratio"] *= tfp["vol_mult"]
-    prof["max_atr_pct"] = tfp["atr_max"]
+    if STRICTNESS == "auto":
+        prof = dict(_smart.compute(atr_pct=atr_pct, adx=adx))
+    else:
+        prof = dict(STATIC_PROFILES.get(STRICTNESS, STATIC_PROFILES["balanced"]))
+        prof["_debug"] = {"mode":STRICTNESS}
+    tf_p = TF_PROFILES.get(tf, TF_PROFILES["15m"])
+    prof["min_score"] *= tf_p["score_mult"]
+    prof["min_vol_ratio"] *= tf_p["vol_mult"]
+    prof["max_atr_pct"] = tf_p["atr_max"]
+    prof["_tf"] = tf
     if SESSION_ADJUST_ENABLED:
-        sd, _ = get_session_info(); prof["min_score"] += sd
+        sd, sn = get_session_info()
+        prof["min_score"] += sd; prof["_session"] = sn; prof["_session_delta"] = sd
     prof.update(STRICTNESS_OVERRIDE)
     return prof
 
-
 # ═══════════════════════════════════════════════════════════
-# 6) أدوات
+# 6) BinanceExecutor — REST للتنفيذ فقط
 # ═══════════════════════════════════════════════════════════
-def short(s): return s.split("/")[0].split(":")[0].upper()
-def syria_now_str():
-    return datetime.now(SYRIA_TZ).strftime("%Y-%m-%d %H:%M:%S")
-def fmt_price(v):
-    if v >= 1000: return f"{v:.2f}"
-    if v >= 100:  return f"{v:.3f}"
-    if v >= 1:    return f"{v:.4f}"
-    if v >= 0.01: return f"{v:.5f}"
-    return f"{v:.8f}"
+class BinanceExecutor:
+    """ccxt.binanceusdm — REST مُحكَم بـ weight tracking + backoff"""
+    def __init__(self):
+        opts = {
+            "apiKey": BINANCE_API_KEY,
+            "secret": BINANCE_API_SECRET,
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {"defaultType": "future", "adjustForTimeDifference": True},
+        }
+        self.ex = ccxt.binanceusdm(opts)
+        self.ex.load_markets()
+        self._weight_used = 0
+        self._weight_reset = _time.time() + 60
+        self._lock = asyncio.Lock()
+        log.info(f"✅ Binance USDM متصل | {len(self.ex.markets)} سوق")
 
+    async def _call(self, method_name, *args, **kwargs):
+        """REST call with exponential backoff + jitter"""
+        delays = [0.5, 1, 2, 4, 8]
+        for i, d in enumerate(delays):
+            try:
+                m = getattr(self.ex, method_name)
+                return await asyncio.to_thread(m, *args, **kwargs)
+            except ccxt.RateLimitExceeded as e:
+                import random
+                wait = d + random.uniform(0, 0.5)
+                log.warning(f"⚠️ RateLimit {method_name}, wait {wait:.1f}s")
+                await asyncio.sleep(wait)
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as e:
+                import random
+                wait = d + random.uniform(0, 0.5)
+                log.warning(f"⚠️ Network {method_name}, wait {wait:.1f}s: {e}")
+                await asyncio.sleep(wait)
+            except ccxt.ExchangeError as e:
+                log.error(f"❌ Exchange {method_name}: {e}")
+                raise
+            except Exception as e:
+                log.exception(f"❌ {method_name}: {e}")
+                raise
+        raise ccxt.NetworkError(f"{method_name} failed after retries")
 
-# ═══════════════════════════════════════════════════════════
-# 7) المؤشرات
-# ═══════════════════════════════════════════════════════════
-def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
+    async def fetch_ohlcv(self, symbol, tf, limit=200):
+        return await self._call("fetch_ohlcv", symbol, tf, None, limit)
 
-def calc_rsi(s, p=14):
-    d = s.diff(); g = d.clip(lower=0); l = -d.clip(upper=0)
-    ag = g.ewm(alpha=1/p, adjust=False).mean(); al = l.ewm(alpha=1/p, adjust=False).mean()
-    return 100 - 100/(1 + ag/al.replace(0,1e-9))
+    async def fetch_balance(self):
+        return await self._call("fetch_balance", {"type":"future"})
 
-def calc_atr(df, p=14):
-    tr = pd.concat([df["h"]-df["l"], (df["h"]-df["c"].shift()).abs(),
-                    (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/p, adjust=False).mean()
+    async def fetch_positions(self, symbols=None):
+        return await self._call("fetch_positions", symbols)
 
-def calc_adx(df, p=14):
-    h, l, c = df["h"], df["l"], df["c"]
-    pdm = h.diff(); ndm = -l.diff()
-    pdm = pdm.where((pdm>ndm)&(pdm>0), 0); ndm = ndm.where((ndm>pdm)&(ndm>0), 0)
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/p, adjust=False).mean()
-    pdi = 100*pdm.ewm(alpha=1/p, adjust=False).mean()/atr.replace(0,1e-9)
-    ndi = 100*ndm.ewm(alpha=1/p, adjust=False).mean()/atr.replace(0,1e-9)
-    dx = 100*(pdi-ndi).abs()/(pdi+ndi).replace(0,1e-9)
-    return dx.ewm(alpha=1/p, adjust=False).mean()
+    async def fetch_open_orders(self, symbol=None):
+        return await self._call("fetch_open_orders", symbol)
 
-def calc_macd(s, f=12, sl=26, sig=9):
-    ef = s.ewm(span=f, adjust=False).mean(); es = s.ewm(span=sl, adjust=False).mean()
-    dif = ef - es; dea = dif.ewm(span=sig, adjust=False).mean()
-    return dif, dea, dif - dea
+    async def set_leverage(self, symbol, lev):
+        try:
+            return await self._call("set_leverage", lev, symbol)
+        except ccxt.ExchangeError as e:
+            if "No need to change" in str(e): return None
+            raise
 
-def calc_vwap_session(df, session="day"):
-    try:
-        ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        skey = ts.dt.floor("D") if session == "day" else ts.dt.to_period("W").astype(str)
-        tp = (df["h"]+df["l"]+df["c"])/3; pv = tp*df["v"]
-        return pv.groupby(skey).cumsum() / df["v"].groupby(skey).cumsum().replace(0,1e-9)
-    except:
-        tp = (df["h"]+df["l"]+df["c"])/3
-        return (tp*df["v"]).cumsum()/df["v"].cumsum()
+    async def set_margin_mode(self, symbol, mode="isolated"):
+        try:
+            return await self._call("set_margin_mode", mode, symbol)
+        except ccxt.ExchangeError as e:
+            if "No need to change" in str(e): return None
+            raise
 
-def calc_bollinger(df, p=20, m=2):
-    c = df["c"]; ma = c.rolling(p).mean(); sd = c.rolling(p).std()
-    up = ma + m*sd; lo = ma - m*sd
-    return {"ma":ma, "upper":up, "lower":lo, "width":(up-lo)/ma*100}
+    async def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+        return await self._call("create_order", symbol, order_type, side, amount, price, params or {})
 
+    async def cancel_order(self, order_id, symbol):
+        return await self._call("cancel_order", order_id, symbol)
 
-def classify_market(df, curr=-2):
-    if len(df) < 60: return "UNKNOWN"
-    try:
-        adx = float(calc_adx(df).iloc[curr])
-        bb_w = float(calc_bollinger(df)["width"].iloc[curr])
-        e50 = calc_ema(df["c"], 50)
-        slope = (float(e50.iloc[curr]) - float(e50.iloc[curr-5])) / float(e50.iloc[curr-5]) * 100
-        atr = float(calc_atr(df).iloc[curr]); price = float(df["c"].iloc[curr])
-        atr_pct = (atr/price)*100 if price else 0
-        if adx > 25 and abs(slope) > 0.15: return "TREND_UP" if slope > 0 else "TREND_DOWN"
-        if bb_w < 2.0 and adx < 18: return "RANGE"
-        if atr_pct > 1.2: return "VOLATILE"
-        return "RANGE" if adx < 20 else ("TREND_UP" if slope > 0 else "TREND_DOWN")
-    except: return "UNKNOWN"
+    async def cancel_all_orders(self, symbol):
+        try:
+            return await self._call("cancel_all_orders", symbol)
+        except Exception as e:
+            log.warning(f"cancel_all {symbol}: {e}")
 
+    async def fetch_order(self, order_id, symbol):
+        return await self._call("fetch_order", order_id, symbol)
 
-def compute_levels(df, direction, curr=-2, tf="15m"):
-    try:
-        price = float(df["c"].iloc[curr]); atr = float(calc_atr(df).iloc[curr])
-        ema_slow = float(calc_ema(df["c"], EMA_SLOW).iloc[curr])
-        min_sl = MIN_SL_PCT.get(tf, 0.50)
-        lb = min(20, len(df)+curr-1)
-        if lb < 2: return None
-        rh = float(df["h"].iloc[curr-lb:curr].max()); rl = float(df["l"].iloc[curr-lb:curr].min())
-        if direction == "bullish":
-            sl = max(price - atr*1.5, min(rl, ema_slow)*0.998)
-            min_d = price * (min_sl/100)
-            if (price - sl) < min_d: sl = price - min_d
-            r = price - sl
-            return {"entry":price, "stop_loss":sl, "sl_pct":round((price-sl)/price*100,2),
-                    "tp1":price+r, "tp2":price+r*2, "tp3":price+r*3, "atr":atr}
-        else:
-            sl = min(price + atr*1.5, max(rh, ema_slow)*1.002)
-            min_d = price * (min_sl/100)
-            if (sl - price) < min_d: sl = price + min_d
-            r = sl - price
-            return {"entry":price, "stop_loss":sl, "sl_pct":round((sl-price)/price*100,2),
-                    "tp1":price-r, "tp2":price-r*2, "tp3":price-r*3, "atr":atr}
-    except Exception as e:
-        log.warning(f"compute_levels: {e}"); return None
+    async def amount_to_precision(self, symbol, amount):
+        return self.ex.amount_to_precision(symbol, amount)
 
+    async def price_to_precision(self, symbol, price):
+        return self.ex.price_to_precision(symbol, price)
 
-# ═══════════════════════════════════════════════════════════
-# 8) كاشات
-# ═══════════════════════════════════════════════════════════
-_ohlcv_cache, _crossover_cache = {}, {}
-_recent_signals, _last_signal_time = {}, {}
-_pending_signals, _divergence_cache, _bb_cache, _sr_cache = {}, {}, {}, {}
-_last_signals = deque(maxlen=LAST_SIGNALS_MAX)
-_filter_stats = defaultdict(int)
+    def market(self, symbol): return self.ex.market(symbol)
 
+    # Listen key for user data stream
+    async def create_listen_key(self):
+        return await self._call("fapiPrivatePostListenKey")
 
-async def fetch_ohlcv_cached(symbol, tf, limit=150):
+    async def keepalive_listen_key(self):
+        return await self._call("fapiPrivatePutListenKey")
+
+_executor: Optional[BinanceExecutor] = None
+_ohlcv_rest_cache: Dict[tuple, dict] = {}
+
+async def fetch_ohlcv_cached(symbol, tf, limit=200):
     key = (symbol, tf, limit); now = _time.time()
-    c = _ohlcv_cache.get(key)
-    if c and (now - c["ts"]) < OHLCV_CACHE_SECONDS: return c["data"]
-    data, ex_id = await _exchange.fetch_ohlcv(symbol, tf, limit)
-    if data: _ohlcv_cache[key] = {"data":data, "ts":now, "ex":ex_id}
+    c = _ohlcv_rest_cache.get(key)
+    if c and (now - c["ts"]) < 90: return c["data"]
+    if _executor is None: return None
+    data = await _executor.fetch_ohlcv(symbol, tf, limit)
+    if data:
+        _ohlcv_rest_cache[key] = {"data": data, "ts": now}
     return data
 
+# ═══════════════════════════════════════════════════════════
+# 7) WebSocketManager — klines + user data stream
+# ═══════════════════════════════════════════════════════════
+class WebSocketManager:
+    """يستخدم websockets المجاني: klines لتحديث الكاش، user data للأوامر"""
+    FAPI_WS_BASE = "wss://fstream.binance.com"
 
-def clear_caches():
-    for c in (_ohlcv_cache, _crossover_cache, _recent_signals,
-              _divergence_cache, _bb_cache, _sr_cache): c.clear()
+    def __init__(self, executor: BinanceExecutor, positions_mgr):
+        self.executor = executor
+        self.positions_mgr = positions_mgr
+        self._running = False
+        self._kline_ws = None
+        self._user_ws = None
+        self._listen_key = None
+        self._tasks: List[asyncio.Task] = []
+        self._binance_sym_cache = {}   # "BTCUSDT" -> "BTC/USDT:USDT"
 
+    def _to_ws_sym(self, ccxt_sym: str) -> str:
+        # "BTC/USDT:USDT" -> "btcusdt"
+        base = ccxt_sym.split("/")[0].lower()
+        quote = ccxt_sym.split("/")[1].split(":")[0].lower()
+        return f"{base}{quote}"
+
+    def _to_ccxt_sym(self, ws_sym: str) -> str:
+        # "BTCUSDT" -> "BTC/USDT:USDT"
+        ws_sym = ws_sym.upper()
+        if ws_sym in self._binance_sym_cache:
+            return self._binance_sym_cache[ws_sym]
+        for m in self.executor.ex.markets.values():
+            if m.get("id") == ws_sym and m.get("swap"):
+                self._binance_sym_cache[ws_sym] = m["symbol"]
+                return m["symbol"]
+        return f"{ws_sym[:-4]}/USDT:USDT"
+
+    def _build_streams(self) -> str:
+        streams = []
+        for s in ALL_SYMBOLS:
+            ws_s = self._to_ws_sym(s)
+            for tf in TIMEFRAMES:
+                streams.append(f"{ws_s}@kline_{tf}")
+        return "/".join(streams)
+
+    async def start(self):
+        self._running = True
+        self._tasks.append(asyncio.create_task(self._kline_loop()))
+        self._tasks.append(asyncio.create_task(self._user_loop()))
+        log.info(f"🔌 WebSocket بدأ | klines: {len(ALL_SYMBOLS)}×{len(TIMEFRAMES)}")
+
+    async def stop(self):
+        self._running = False
+        for t in self._tasks: t.cancel()
+        for ws in (self._kline_ws, self._user_ws):
+            if ws:
+                try: await ws.close()
+                except: pass
+
+    async def _kline_loop(self):
+        backoff = 5
+        while self._running:
+            try:
+                url = f"{self.FAPI_WS_BASE}/stream?streams={self._build_streams()}"
+                async with websockets.connect(url, ping_interval=180, ping_timeout=60,
+                                              close_timeout=10, max_size=2**22) as ws:
+                    self._kline_ws = ws
+                    log.info("🟢 Kline WS متصل")
+                    backoff = 5
+                    async for raw in ws:
+                        if not self._running: break
+                        try:
+                            self._handle_kline(json.loads(raw))
+                        except Exception as e:
+                            log.debug(f"kline parse: {e}")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning(f"⚠️ Kline WS: {type(e).__name__}: {e} → retry in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
+
+    def _handle_kline(self, msg):
+        data = msg.get("data") or msg
+        k = data.get("k")
+        if not k: return
+        if not k.get("x"): return   # فقط الشموع المُغلقة
+        ws_sym = k.get("s"); tf = k.get("i")
+        ccxt_sym = self._to_ccxt_sym(ws_sym)
+        candle = [int(k["t"]), float(k["o"]), float(k["h"]),
+                  float(k["l"]), float(k["c"]), float(k["v"])]
+        key = (ccxt_sym, tf, 200)
+        entry = _ohlcv_rest_cache.get(key)
+        if not entry:
+            _ohlcv_rest_cache[key] = {"data": [candle], "ts": _time.time()}
+            return
+        lst = entry["data"]
+        if lst and lst[-1][0] == candle[0]:
+            lst[-1] = candle
+        else:
+            lst.append(candle)
+            if len(lst) > 300: lst[:] = lst[-200:]
+        entry["ts"] = _time.time()
+
+    async def _user_loop(self):
+        backoff = 5
+        while self._running:
+            try:
+                if not self._listen_key:
+                    resp = await self.executor.create_listen_key()
+                    self._listen_key = resp.get("listenKey") or resp.get("listen_key")
+                    if not self._listen_key:
+                        raise Exception("no listenKey returned")
+                    log.info(f"🔑 listenKey جديد: {self._listen_key[:12]}...")
+                url = f"{self.FAPI_WS_BASE}/ws/{self._listen_key}"
+                async with websockets.connect(url, ping_interval=180, ping_timeout=60,
+                                              close_timeout=10) as ws:
+                    self._user_ws = ws
+                    log.info("🟢 User WS متصل")
+                    backoff = 5
+                    ka_task = asyncio.create_task(self._listen_key_keepalive())
+                    try:
+                        async for raw in ws:
+                            if not self._running: break
+                            try:
+                                await self._handle_user_event(json.loads(raw))
+                            except Exception as e:
+                                log.debug(f"user parse: {e}")
+                    finally:
+                        ka_task.cancel()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning(f"⚠️ User WS: {type(e).__name__}: {e} → retry in {backoff}s")
+                self._listen_key = None
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
+
+    async def _listen_key_keepalive(self):
+        try:
+            while self._running:
+                await asyncio.sleep(25 * 60)
+                try:
+                    await self.executor.keepalive_listen_key()
+                    log.debug("🔑 listenKey keepalive OK")
+                except Exception as e:
+                    log.warning(f"⚠️ keepalive: {e}")
+                    self._listen_key = None
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _handle_user_event(self, ev):
+        etype = ev.get("e")
+        if etype == "ORDER_TRADE_UPDATE":
+            o = ev.get("o", {})
+            await self.positions_mgr.on_order_update(o)
+        elif etype == "ACCOUNT_UPDATE":
+            # يمكن استخدامها لتحديث الرصيد، لكن fetch_balance كافٍ
+            pass
+        elif etype == "MARGIN_CALL":
+            await self.positions_mgr.on_margin_call(ev)
+        elif etype == "listenKeyExpired":
+            log.warning("⚠️ listenKey expired")
+            self._listen_key = None
 
 # ═══════════════════════════════════════════════════════════
-# 9) HTF / MTF / VWAP / Conflict
+# 8) PositionManager
 # ═══════════════════════════════════════════════════════════
+class PositionManager:
+    def __init__(self, executor: BinanceExecutor, bot_getter):
+        self.executor = executor
+        self.bot_getter = bot_getter        # callable → telegram bot
+        self.positions: Dict[str, dict] = {}   # symbol -> position dict
+        self.closed_today = 0
+        self.daily_pnl_usd = 0.0
+        self.daily_reset_ts = _time.time()
+        self.consecutive_losses = 0
+        self.paused = False
+        self._lock = asyncio.Lock()
+
+    # ---------- HIGH-LEVEL ----------
+    async def can_open_new(self) -> tuple[bool, str]:
+        if self.paused: return False, "البوت موقوف (/resume)"
+        async with self._lock:
+            if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
+                return False, f"وصلت للحد الأقصى ({MAX_CONCURRENT_POSITIONS})"
+        # daily loss reset
+        if _time.time() - self.daily_reset_ts > 86400:
+            self.daily_reset_ts = _time.time()
+            self.daily_pnl_usd = 0.0
+            self.consecutive_losses = 0
+        if self.daily_pnl_usd < 0:
+            bal = await self._get_balance_usd()
+            if bal > 0 and abs(self.daily_pnl_usd) / bal * 100 >= MAX_DAILY_LOSS_PCT:
+                return False, f"حد الخسارة اليومي ({MAX_DAILY_LOSS_PCT}%)"
+        if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            self.paused = True
+            return False, f"{MAX_CONSECUTIVE_LOSSES} خسائر متتالية → إيقاف"
+        return True, ""
+
+    async def open_position(self, signal: dict) -> Optional[dict]:
+        """signal = cross dict بعد النجاح في الفلاتر"""
+        sym = signal["symbol"]
+        async with self._lock:
+            if sym in self.positions:
+                return None
+        direction = signal["direction"]
+        side = "buy" if direction == "bullish" else "sell"
+        if direction == "bullish" and not ENABLE_LONG: return None
+        if direction == "bearish" and not ENABLE_SHORT: return None
+
+        lv = signal.get("levels")
+        if not lv: return None
+        entry_ref = lv["entry"]; sl = lv["stop_loss"]; tp1, tp2, tp3 = lv["tp1"], lv["tp2"], lv["tp3"]
+        sl_pct = abs(entry_ref - sl) / entry_ref * 100
+        if sl_pct > MAX_SL_PCT:
+            log.info(f"❌ {short(sym)} SL {sl_pct:.2f}% > {MAX_SL_PCT}%")
+            return None
+
+        # calc qty
+        try:
+            m = self.executor.market(sym)
+            qty_raw = POSITION_NOTIONAL_USD / entry_ref
+            qty_str = self.executor.ex.amount_to_precision(sym, qty_raw)
+            qty = float(qty_str)
+            min_amt = m["limits"]["amount"]["min"] or 0
+            if qty < min_amt:
+                log.warning(f"❌ {short(sym)} qty {qty} < min {min_amt}")
+                return None
+            min_cost = m["limits"]["cost"]["min"] or 5
+            if qty * entry_ref < min_cost:
+                log.warning(f"❌ {short(sym)} notional < min {min_cost}")
+                return None
+        except Exception as e:
+            log.error(f"qty calc {sym}: {e}")
+            return None
+
+        # set leverage + margin mode
+        try:
+            await self.executor.set_margin_mode(sym, MARGIN_MODE)
+        except Exception as e:
+            log.warning(f"margin mode {sym}: {e}")
+        try:
+            await self.executor.set_leverage(sym, LEVERAGE)
+        except Exception as e:
+            log.warning(f"leverage {sym}: {e}")
+
+        # client order id
+        cid_base = f"v7{int(_time.time())}{sym.split('/')[0][:6]}"[:32]
+        entry_cid = f"{cid_base}_en"[:36]
+
+        # place market entry
+        try:
+            order = await self.executor.create_order(
+                sym, "market", side, qty, None,
+                {"newClientOrderId": entry_cid}
+            )
+        except Exception as e:
+            log.error(f"❌ entry order {sym}: {e}")
+            return None
+
+        # wait for fill
+        filled_qty = 0.0; avg_price = 0.0
+        for _ in range(10):
+            try:
+                o = await self.executor.fetch_order(order["id"], sym)
+                filled_qty = float(o.get("filled") or 0)
+                avg_price = float(o.get("average") or 0)
+                if o.get("status") == "closed" and filled_qty > 0:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        if filled_qty <= 0:
+            log.error(f"❌ {sym} لم تُملأ")
+            try: await self.executor.cancel_order(order["id"], sym)
+            except: pass
+            return None
+
+        entry_price = avg_price or entry_ref
+        # recalc SL/TP if fill price drifted
+        if direction == "bullish":
+            risk = entry_price - sl
+            tp1 = entry_price + risk
+            tp2 = entry_price + risk * 2
+            tp3 = entry_price + risk * 3
+        else:
+            risk = sl - entry_price
+            tp1 = entry_price - risk
+            tp2 = entry_price - risk * 2
+            tp3 = entry_price - risk * 3
+
+        pos = {
+            "symbol": sym, "side": side, "direction": direction,
+            "entry": entry_price, "qty": filled_qty, "qty_initial": filled_qty,
+            "leverage": LEVERAGE, "notional": entry_price * filled_qty,
+            "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+            "sl_pct": sl_pct, "score": signal.get("final_score", 0),
+            "source": signal.get("source", "ema"),
+            "tf": signal.get("timeframe", "?"),
+            "signal_id": cid_base,
+            "opened_at": _time.time(),
+            "sl_order_id": None, "tp1_order_id": None,
+            "tp2_order_id": None, "tp3_order_id": None,
+            "tp1_filled": False, "tp2_filled": False, "tp3_filled": False,
+            "trailing_active": False,
+            "breakeven_moved": False,
+        }
+        async with self._lock:
+            self.positions[sym] = pos
+
+        # place SL (closePosition=True → closes any remaining qty)
+        sl_side = "sell" if direction == "bullish" else "buy"
+        try:
+            sl_order = await self.executor.create_order(
+                sym, "STOP_MARKET", sl_side, None, None,
+                {"stopPrice": self.executor.ex.price_to_precision(sym, sl),
+                 "closePosition": True, "workingType": "MARK_PRICE",
+                 "priceProtect": True,
+                 "newClientOrderId": f"{cid_base}_sl"[:36]}
+            )
+            pos["sl_order_id"] = sl_order.get("id")
+        except Exception as e:
+            log.error(f"❌ SL placement FAILED for {sym}: {e} → EMERGENCY CLOSE")
+            await self._emergency_close(sym)
+            return None
+
+        # place TP1/TP2/TP3 as reduceOnly partial closes
+        async def place_tp(level_price, pct, tag):
+            q = float(self.executor.ex.amount_to_precision(sym, filled_qty * pct))
+            if q <= 0: return None
+            try:
+                o = await self.executor.create_order(
+                    sym, "TAKE_PROFIT_MARKET", sl_side, q, None,
+                    {"stopPrice": self.executor.ex.price_to_precision(sym, level_price),
+                     "reduceOnly": True, "workingType": "MARK_PRICE",
+                     "newClientOrderId": f"{cid_base}_{tag}"[:36]}
+                )
+                return o.get("id")
+            except Exception as e:
+                log.warning(f"TP {tag} {sym}: {e}")
+                return None
+
+        pos["tp1_order_id"] = await place_tp(tp1, TP_SPLITS[0], "tp1")
+        pos["tp2_order_id"] = await place_tp(tp2, TP_SPLITS[1], "tp2")
+        pos["tp3_order_id"] = await place_tp(tp3, TP_SPLITS[2], "tp3")
+
+        log.info(f"✅ فتح {short(sym)} {direction} @ {entry_price} | SL={sl} | qty={filled_qty}")
+        return pos
+
+    async def _emergency_close(self, symbol):
+        async with self._lock:
+            pos = self.positions.get(symbol)
+        if not pos: return
+        try:
+            side = "sell" if pos["direction"] == "bullish" else "buy"
+            await self.executor.create_order(symbol, "market", side, pos["qty"], None, {"reduceOnly": True})
+            log.warning(f"🆘 إغلاق طارئ: {short(symbol)}")
+        except Exception as e:
+            log.error(f"emergency_close {symbol}: {e}")
+        async with self._lock:
+            self.positions.pop(symbol, None)
+
+    async def close_position(self, symbol, reason="manual"):
+        async with self._lock:
+            pos = self.positions.get(symbol)
+        if not pos: return False
+        try:
+            await self.executor.cancel_all_orders(symbol)
+        except: pass
+        try:
+            side = "sell" if pos["direction"] == "bullish" else "buy"
+            await self.executor.create_order(symbol, "market", side, pos["qty"], None, {"reduceOnly": True})
+            log.info(f"🔒 إغلاق {short(symbol)} ({reason})")
+        except Exception as e:
+            log.error(f"close {symbol}: {e}")
+            return False
+        async with self._lock:
+            self.positions.pop(symbol, None)
+        return True
+
+    async def close_all(self, reason="closeall"):
+        syms = list(self.positions.keys())
+        for s in syms: await self.close_position(s, reason)
+
+    # ---------- EVENT HANDLERS ----------
+    async def on_order_update(self, o: dict):
+        ws_sym = o.get("s")  # BTCUSDT
+        if not ws_sym: return
+        try:
+            ccxt_sym = self.ws_ref._to_ccxt_sym(ws_sym) if hasattr(self, "ws_ref") else f"{ws_sym[:-4]}/USDT:USDT"
+        except Exception:
+            ccxt_sym = f"{ws_sym[:-4]}/USDT:USDT"
+        async with self._lock:
+            pos = self.positions.get(ccxt_sym)
+        if not pos: return
+        status = o.get("X"); order_type = o.get("o"); cid = o.get("c") or ""
+        if status != "FILLED": return
+        if "_tp1" in cid and not pos["tp1_filled"]:
+            pos["tp1_filled"] = True
+            await self._after_tp1(ccxt_sym, pos)
+        elif "_tp2" in cid and not pos["tp2_filled"]:
+            pos["tp2_filled"] = True
+            await self._after_tp2(ccxt_sym, pos)
+        elif "_tp3" in cid and not pos["tp3_filled"]:
+            pos["tp3_filled"] = True
+            await self._after_close(ccxt_sym, pos, "win_tp3")
+        elif "_sl" in cid:
+            await self._after_close(ccxt_sym, pos, "loss_sl")
+
+    async def _after_tp1(self, symbol, pos):
+        """breakeven: cancel static SL → new SL at entry"""
+        if not BREAKEVEN_AFTER_TP1: return
+        try: await self.executor.cancel_all_orders(symbol)
+        except: pass
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        try:
+            new_sl = await self.executor.create_order(
+                symbol, "STOP_MARKET", sl_side, None, None,
+                {"stopPrice": self.executor.ex.price_to_precision(symbol, pos["entry"]),
+                 "closePosition": True, "workingType": "MARK_PRICE",
+                 "newClientOrderId": f"{pos['signal_id']}_sl_be"[:36]})
+            pos["sl_order_id"] = new_sl.get("id")
+            pos["breakeven_moved"] = True
+            pos["sl"] = pos["entry"]
+        except Exception as e:
+            log.error(f"breakeven {symbol}: {e}")
+        # re-place TP2/TP3
+        await self._reopen_tp(symbol, pos, "tp2", pos["tp2"]); await self._reopen_tp(symbol, pos, "tp3", pos["tp3"])
+        await self._notify(f"🎯 <b>TP1</b> {short(symbol)} | SL → Breakeven")
+
+    async def _after_tp2(self, symbol, pos):
+        """trailing stop activation"""
+        if not TRAIL_AFTER_TP2: return
+        try: await self.executor.cancel_all_orders(symbol)
+        except: pass
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        try:
+            t = await self.executor.create_order(
+                symbol, "TRAILING_STOP_MARKET", sl_side, None, None,
+                {"callbackRate": TRAIL_CALLBACK_RATE, "reduceOnly": True,
+                 "workingType": "MARK_PRICE",
+                 "newClientOrderId": f"{pos['signal_id']}_trail"[:36]})
+            pos["sl_order_id"] = t.get("id"); pos["trailing_active"] = True
+        except Exception as e:
+            log.error(f"trailing {symbol}: {e}")
+        await self._reopen_tp(symbol, pos, "tp3", pos["tp3"])
+        await self._notify(f"✅ <b>TP2</b> {short(symbol)} | Trailing {TRAIL_CALLBACK_RATE}%")
+
+    async def _reopen_tp(self, symbol, pos, tag, price):
+        # for tp3 only after tp2, tp2/tp3 after tp1
+        remaining = pos["qty"]  # qty on exchange after partial fills
+        # Binance reports remaining in position. We use current qty from position update.
+        # Simplify: use fixed split of initial qty
+        pct = 0.20 if tag == "tp3" else 0.30
+        q = float(self.executor.ex.amount_to_precision(symbol, pos["qty_initial"] * pct))
+        if q <= 0: return
+        sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        try:
+            o = await self.executor.create_order(
+                symbol, "TAKE_PROFIT_MARKET", sl_side, q, None,
+                {"stopPrice": self.executor.ex.price_to_precision(symbol, price),
+                 "reduceOnly": True, "workingType": "MARK_PRICE",
+                 "newClientOrderId": f"{pos['signal_id']}_{tag}_r"[:36]})
+            pos[f"{tag}_order_id"] = o.get("id")
+        except Exception as e:
+            log.warning(f"reopen {tag} {symbol}: {e}")
+
+    async def _after_close(self, symbol, pos, result):
+        async with self._lock:
+            self.positions.pop(symbol, None)
+        # PnL from order event
+        _smart.record_result(result, pos["direction"], pos.get("source", "unknown"))
+        await self._notify(
+            f"{'✅' if result.startswith('win') else '❌'} "
+            f"<b>{result.upper()}</b> {short(symbol)} | "
+            f"{'ربح' if result.startswith('win') else 'خسارة'}")
+
+    async def on_margin_call(self, ev):
+        await self._notify("🚨 <b>MARGIN CALL</b> — راجع حسابك فوراً!")
+
+    # ---------- RECONCILE ----------
+    async def reconcile(self):
+        """عند الإقلاع: طابق الحالة المحلية مع Binance"""
+        try:
+            positions = await self.executor.fetch_positions()
+            open_orders = await self.executor.fetch_open_orders()
+        except Exception as e:
+            log.error(f"reconcile fetch: {e}"); return
+        binance_pos = {}
+        for p in positions:
+            contracts = float(p.get("contracts") or 0)
+            if abs(contracts) < 1e-12: continue
+            binance_pos[p["symbol"]] = p
+        # orphan positions (on Binance, not local)
+        for sym, p in binance_pos.items():
+            if sym in self.positions: continue
+            log.warning(f"⚠️ orphan {sym} → applying emergency SL")
+            side = "sell" if p.get("side") == "long" else "buy"
+            entry = float(p.get("entryPrice") or 0)
+            sl_price = entry * (0.985 if p.get("side") == "long" else 1.015)
+            try:
+                await self.executor.create_order(
+                    sym, "STOP_MARKET", side, None, None,
+                    {"stopPrice": self.executor.ex.price_to_precision(sym, sl_price),
+                     "closePosition": True, "workingType": "MARK_PRICE"})
+                log.info(f"🛡️ SL طارئ لـ {short(sym)} @ {sl_price}")
+            except Exception as e:
+                log.error(f"emergency SL {sym}: {e}")
+        # local positions not on Binance
+        for sym in list(self.positions.keys()):
+            if sym not in binance_pos:
+                log.info(f"♻️ إزالة {short(sym)} (غير موجود على Binance)")
+                async with self._lock:
+                    self.positions.pop(sym, None)
+        log.info(f"♻️ Reconcile: {len(self.positions)} محلية | {len(binance_pos)} على Binance")
+
+    async def _get_balance_usd(self) -> float:
+        try:
+            b = await self.executor.fetch_balance()
+            usdt = b.get("USDT", {}).get("total") or 0
+            return float(usdt)
+        except: return 0.0
+
+    async def _notify(self, text):
+        bot = self.bot_getter()
+        if bot and CHAT_ID:
+            try: await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+            except Exception as e: log.error(f"notify: {e}")
+
+_positions_mgr: Optional[PositionManager] = None
+_ws_mgr: Optional[WebSocketManager] = None
+
+# ═══════════════════════════════════════════════════════════
+# 9) Strategy — كواشف (منقولة من v6.4.3)
+# ═══════════════════════════════════════════════════════════
+async def _df_for(symbol, tf, extra=60):
+    data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
+    if not data or len(data) < EMA_SLOW + 5: return None
+    return pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+
+async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr, source="ema", extra=None):
+    cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+    cts = int(df["ts"].iloc[curr])
+    levels = compute_levels(df, direction, curr, tf=tf)
+    support = compute_score(df, direction, curr)
+    out = {"symbol": symbol, "timeframe": tf, "direction": direction,
+           "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
+           "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
+           "gap_pct": round(abs(cf-cs)/cs*100, 3) if cs else 0,
+           "strength": strength, "alert_type": alert_type,
+           "support": support, "base_score": support["score"],
+           "final_score": support["score"], "_df": df,
+           "levels": levels, "source": source,
+           "created_at": _time.time()}
+    if extra: out.update(extra)
+    return out
+
+def compute_score(df, direction, curr_idx=-2):
+    close = df["c"]; vol = df["v"]
+    price = float(close.iloc[curr_idx])
+    try:
+        s = max(0, len(df) + curr_idx - 20); e = len(df) + curr_idx
+        vma = float(vol.iloc[s:e].mean())
+        vr = float(vol.iloc[curr_idx]) / vma if vma > 0 else 0
+    except: vr = 0
+    v_pts = 30 if vr>=4 else 25 if vr>=2.5 else 18 if vr>=1.5 else 10 if vr>=1 else 5 if vr>=0.5 else 0
+    try: adx = float(calc_adx(df).iloc[curr_idx])
+    except: adx = 0
+    a_pts = 18 if adx>=50 else 20 if adx>=35 else 18 if adx>=25 else 12 if adx>=20 else 5 if adx>=15 else 0
+    try:
+        ef = float(calc_ema(close, EMA_FAST).iloc[curr_idx])
+        es = float(calc_ema(close, EMA_SLOW).iloc[curr_idx])
+        gap = abs(ef-es)/es*100 if es else 0
+    except: gap = 0
+    g_pts = 12 if gap>=0.6 else 15 if gap>=0.3 else 10 if gap>=0.1 else 6 if gap>=0.05 else 3 if gap>=0.02 else 0
+    try:
+        _,_,hist = calc_macd(close)
+        hn = float(hist.iloc[curr_idx]); hp = float(hist.iloc[curr_idx-1])
+        rising = hn > hp
+        m_pts = 10 if (hn>0 and rising) else 5 if hn>0 else 7 if (hn<0 and rising) else 5
+    except: m_pts = 0
+    try: rsi = float(calc_rsi(close).iloc[curr_idx])
+    except: rsi = 50
+    if direction == "bullish":
+        r_pts = 10 if 55<=rsi<=70 else 5 if rsi>70 else 7 if rsi>=45 else 3 if rsi>=30 else 0
+    else:
+        r_pts = 10 if 30<=rsi<=45 else 5 if rsi<30 else 7 if rsi<=55 else 3 if rsi<=70 else 0
+    try: e50 = float(calc_ema(close, 50).iloc[curr_idx])
+    except: e50 = price
+    above = price > e50
+    h_pts = 10 if (direction=="bullish" and above) or (direction=="bearish" and not above) else 0
+    try:
+        atr = float(calc_atr(df).iloc[curr_idx]); atr_pct = (atr/price)*100 if price>0 else 0
+    except: atr_pct = 0
+    t_pts = 5 if atr_pct>=0.30 else 3 if atr_pct>=0.15 else 1
+    total = v_pts + a_pts + g_pts + m_pts + r_pts + h_pts + t_pts
+    grade = ("🌟 ذهبية" if total>=80 else "⭐ قوية" if total>=65 else
+             "✅ جيدة" if total>=55 else "🟡 متوسطة" if total>=45 else "⚪ ضعيفة")
+    return {"score":total,"grade":grade,"adx":round(adx,1),"adx_pts":a_pts,
+            "rsi":round(rsi,1),"rsi_pts":r_pts,"macd_pts":m_pts,
+            "vol_ratio":round(vr,2),"vol_pts":v_pts,"atr_pct":round(atr_pct,2),
+            "atr_pts":t_pts,"htf_pts":h_pts,"gap_pct":round(gap,3),"gap_pts":g_pts}
+
+def classify_market(df, curr_idx=-2):
+    if len(df) < 60: return "UNKNOWN"
+    try:
+        adx = float(calc_adx(df).iloc[curr_idx])
+        close = df["c"]; bb = calc_bollinger(df)
+        bb_w = float(bb["width"].iloc[curr_idx])
+        e50 = calc_ema(close, 50)
+        e50_slope = (float(e50.iloc[curr_idx]) - float(e50.iloc[curr_idx-5])) / float(e50.iloc[curr_idx-5]) * 100
+        atr = float(calc_atr(df).iloc[curr_idx]); price = float(close.iloc[curr_idx])
+        atr_pct = (atr/price)*100 if price else 0
+        if adx > 25 and abs(e50_slope) > 0.15:
+            return "TREND_UP" if e50_slope > 0 else "TREND_DOWN"
+        if bb_w < 2.0 and adx < 18: return "RANGE"
+        if atr_pct > 1.2: return "VOLATILE"
+        return "RANGE" if adx < 20 else ("TREND_UP" if e50_slope > 0 else "TREND_DOWN")
+    except: return "UNKNOWN"
+
 async def get_htf_trend(symbol):
     if not HTF_ENABLED: return "NEUTRAL"
     data = await fetch_ohlcv_cached(symbol, HTF_TIMEFRAME, 250)
     if not data or len(data) < 200: return "NEUTRAL"
     df = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
     e50 = float(calc_ema(df["c"], 50).iloc[-1]); e200 = float(calc_ema(df["c"], 200).iloc[-1])
-    p = float(df["c"].iloc[-1])
-    if p > e50 > e200: return "UP"
-    if p < e50 < e200: return "DOWN"
+    price = float(df["c"].iloc[-1])
+    if price > e50 > e200: return "UP"
+    if price < e50 < e200: return "DOWN"
     return "NEUTRAL"
-
 
 async def get_mtf_alignment(symbol, direction):
     if not MTF_ENABLED: return 0, "—"
@@ -634,196 +1136,116 @@ async def get_mtf_alignment(symbol, direction):
             data = await fetch_ohlcv_cached(symbol, tf, 60)
             if not data or len(data) < 30: continue
             df = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
-            ef = float(calc_ema(df["c"], EMA_FAST).iloc[-2])
-            es = float(calc_ema(df["c"], EMA_SLOW).iloc[-2])
-            if (direction=="bullish" and ef>es) or (direction=="bearish" and ef<es): score += 1
+            ef = float(calc_ema(df["c"], EMA_FAST).iloc[-2]); es = float(calc_ema(df["c"], EMA_SLOW).iloc[-2])
+            if direction == "bullish" and ef > es: score += 1
+            elif direction == "bearish" and ef < es: score += 1
         except: continue
-    if score >= 3: return +8, "توافق كامل 3/3 🌟"
-    if score == 2: return +3, "توافق 2/3 ✅"
-    if score == 1: return -5, "توافق 1/3 ⚠️"
-    return -15, "تعارض 0/3 ❌"
+    if score >= 3: return +8, "توافق كامل (3/3) 🌟"
+    if score == 2: return +3, "توافق جزئي (2/3) ✅"
+    if score == 1: return -5, "توافق ضعيف (1/3) ⚠️"
+    return -15, "تعارض كامل (0/3) ❌"
 
-
-def check_vwap_slope(df, direction, th, tf="15m"):
-    min_pct = th.get("vwap_slope_pct", 0.05)
-    if len(df) < VWAP_SLOPE_LOOKBACK+1: return True, 0.0
+def check_vwap_slope(df, direction, thresholds, tf="15m"):
+    min_pct = thresholds.get("vwap_slope_pct", 0.05)
+    if len(df) < VWAP_SLOPE_LOOKBACK + 1: return True, 0.0
     session = "week" if tf == "1h" else "day"
     vwap = calc_vwap_session(df, session)
-    vn, vp = float(vwap.iloc[-1]), float(vwap.iloc[-VWAP_SLOPE_LOOKBACK-1])
-    if vp == 0: return True, 0.0
-    slope = (vn-vp)/vp*100
+    v_now = float(vwap.iloc[-1]); v_prev = float(vwap.iloc[-VWAP_SLOPE_LOOKBACK-1])
+    if v_prev == 0: return True, 0.0
+    slope = (v_now - v_prev) / v_prev * 100
     if direction == "bullish" and slope < -min_pct: return False, slope
     if direction == "bearish" and slope > min_pct: return False, slope
     return True, slope
 
-
-def has_conflicting_signal(symbol, direction):
-    prev = _recent_signals.get(symbol)
-    if not prev: return False
-    return (_time.time()-prev[1] < CONFLICT_WINDOW_SEC) and prev[0] != direction
-
-
-def record_signal(symbol, direction): _recent_signals[symbol] = (direction, _time.time())
-
-
-def check_symbol_cooldown(symbol):
-    if SYMBOL_COOLDOWN_SEC <= 0: return True, 0
-    now = _time.time(); last = _last_signal_time.get(symbol, 0)
-    if now - last < SYMBOL_COOLDOWN_SEC:
-        return False, int(SYMBOL_COOLDOWN_SEC - (now-last))
-    return True, 0
-
-
-def mark_symbol_sent(symbol): _last_signal_time[symbol] = _time.time()
-
-
 # ═══════════════════════════════════════════════════════════
-# 10) Score
-# ═══════════════════════════════════════════════════════════
-def compute_score(df, direction, curr=-2):
-    close = df["c"]; vol = df["v"]; price = float(close.iloc[curr])
-    try:
-        s = max(0, len(df)+curr-20); vma = float(vol.iloc[s:len(df)+curr].mean())
-        vr = float(vol.iloc[curr])/vma if vma > 0 else 0
-    except: vr = 0
-    v_pts = 30 if vr>=4 else 25 if vr>=2.5 else 18 if vr>=1.5 else 10 if vr>=1 else 5 if vr>=0.5 else 0
-    try: adx = float(calc_adx(df).iloc[curr])
-    except: adx = 0
-    a_pts = 20 if adx>=35 else 18 if adx>=25 else 12 if adx>=20 else 5 if adx>=15 else 0
-    try:
-        ef = float(calc_ema(close, EMA_FAST).iloc[curr]); es = float(calc_ema(close, EMA_SLOW).iloc[curr])
-        gap = abs(ef-es)/es*100 if es else 0
-    except: gap = 0
-    g_pts = 15 if gap>=0.3 else 10 if gap>=0.1 else 6 if gap>=0.05 else 3 if gap>=0.02 else 0
-    try:
-        _,_,hist = calc_macd(close)
-        hn, hp = float(hist.iloc[curr]), float(hist.iloc[curr-1])
-        m_pts = 10 if (hn>0 and hn>hp) else 5 if hn>0 else 7 if (hn<0 and hn>hp) else 5
-    except: m_pts = 0
-    try: rsi = float(calc_rsi(close).iloc[curr])
-    except: rsi = 50
-    if direction == "bullish":
-        r_pts = 10 if 55<=rsi<=70 else 5 if rsi>70 else 7 if rsi>=45 else 3 if rsi>=30 else 0
-    else:
-        r_pts = 10 if 30<=rsi<=45 else 5 if rsi<30 else 7 if rsi<=55 else 3 if rsi<=70 else 0
-    try: e50 = float(calc_ema(close, 50).iloc[curr])
-    except: e50 = price
-    above = price > e50
-    h_pts = 10 if ((direction=="bullish" and above) or (direction=="bearish" and not above)) else 0
-    try:
-        atr = float(calc_atr(df).iloc[curr]); atr_pct = (atr/price)*100 if price else 0
-    except: atr_pct = 0
-    t_pts = 5 if atr_pct>=0.30 else 3 if atr_pct>=0.15 else 1
-    total = v_pts + a_pts + g_pts + m_pts + r_pts + h_pts + t_pts
-    grade = ("🌟 ذهبية" if total>=80 else "⭐ قوية" if total>=65 else
-             "✅ جيدة" if total>=55 else "🟡 متوسطة" if total>=45 else "⚪ ضعيفة")
-    return {"score":total, "grade":grade, "adx":round(adx,1), "adx_pts":a_pts,
-            "rsi":round(rsi,1), "rsi_pts":r_pts, "macd_pts":m_pts,
-            "vol_ratio":round(vr,2), "vol_pts":v_pts, "atr_pct":round(atr_pct,2),
-            "atr_pts":t_pts, "htf_pts":h_pts, "gap_pct":round(gap,3), "gap_pts":g_pts}
-
-
-# ═══════════════════════════════════════════════════════════
-# 11) الفلتر
+# 10) فلتر
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
     if not s: return False, "لا مؤشرات", "other"
-    tf = cross["timeframe"]
-    vol = s.get("vol_ratio",0); adx = s.get("adx",0); atr = s.get("atr_pct",0)
-    base = cross.get("base_score", s.get("score",0))
-    gap_pct = s.get("gap_pct",0); source = cross.get("source","ema")
+    tf = cross["timeframe"]; vol = s.get("vol_ratio", 0); adx = s.get("adx", 0)
+    atr = s.get("atr_pct", 0); base_score = cross.get("base_score", 0)
+    gap_pct = s.get("gap_pct", 0); source = cross.get("source", "ema")
     direction = cross["direction"]
 
-    if SYMBOL_COOLDOWN_SEC > 0:
-        ok, rem = check_symbol_cooldown(cross["symbol"])
-        if not ok: return False, f"cooldown {rem}s", "cooldown"
-    if gap_pct < MIN_EMA_GAP_PCT.get(tf, 0.02) and source == "ema":
-        return False, f"gap {gap_pct:.3f}%", "ema_gap"
-    if atr < MIN_ATR_PCT.get(tf, 0.05):
-        return False, f"ATR {atr}%", "atr_low"
+    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
+    if gap_pct < min_gap and source == "ema":
+        return False, f"gap {gap_pct:.3f}% < {min_gap}%", "ema_gap"
+    min_atr = MIN_ATR_PCT.get(tf, 0.05)
+    if atr < min_atr: return False, f"ATR {atr}% < {min_atr}%", "atr_low"
 
-    mtf_b, mtf_d = await get_mtf_alignment(cross["symbol"], direction)
-    cross["mtf"] = mtf_d; cross["mtf_bonus"] = mtf_b
-    score = base + mtf_b; s["score"] = score; cross["final_score"] = score
-
-    if mtf_b <= -15: return False, mtf_d, "mtf"
+    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
+    cross["mtf"] = mtf_desc; cross["mtf_bonus"] = mtf_bonus
+    score = base_score + mtf_bonus
+    cross["final_score"] = score
+    if mtf_bonus <= -15: return False, mtf_desc, "mtf"
     if score < ABS_MIN_SCORE: return False, f"Score {score} < {ABS_MIN_SCORE}", "score_abs"
 
-    market = cross.get("market") or "UNKNOWN"
     th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
     min_score = th["min_score"]
     if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
     if score < min_score: return False, f"Score {score} < {min_score:.0f}", "score"
-    if vol < th["min_vol_ratio"]: return False, f"Vol {vol} < {th['min_vol_ratio']}", "vol"
+    if vol < th["min_vol_ratio"]: return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
     if adx < th["min_adx"]: return False, f"ADX {adx} < {th['min_adx']}", "adx"
-    if atr > th["max_atr_pct"]: return False, f"ATR {atr}%", "atr"
+    if atr > th["max_atr_pct"]: return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
+
+    df = cross.get("_df"); market = cross.get("market") or "UNKNOWN"
+    if market == "UNKNOWN" and df is not None:
+        market = classify_market(df); cross["market"] = market
 
     if source == "bb_squeeze":
-        if adx < MIN_ADX_FOR_BB: return False, f"ADX {adx} < {MIN_ADX_FOR_BB}", "adx"
-        if vol < BB_MIN_VOL: return False, f"BB Vol {vol} < {BB_MIN_VOL}", "vol"
-        if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE: return False, "BB range", "range"
-        if BB_CONFIRM_ENABLED and not ((mtf_b >= 8) or (adx > 22) or (vol > 1.5)):
-            return False, "BB no confirm", "bb_confirm"
+        if adx < MIN_ADX_FOR_BB: return False, f"BB ADX {adx} < {MIN_ADX_FOR_BB}", "adx"
+        if vol < BB_MIN_VOL: return False, f"BB Vol {vol}× < {BB_MIN_VOL}×", "vol"
+        if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE:
+            return False, f"BB في رينج ADX < {BB_MIN_ADX_IN_RANGE}", "range"
+        if BB_CONFIRM_ENABLED and not ((mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)):
+            return False, "BB بدون تأكيد", "bb_confirm"
 
     if source == "ema":
-        if market == "TREND_DOWN" and direction == "bullish" and mtf_b < 5:
-            return False, "trend ضد", "trend"
-        elif market == "TREND_UP" and direction == "bearish" and mtf_b < 5:
-            return False, "trend ضد", "trend"
-    if source == "rsi_div":
-        if market == "TREND_DOWN" and direction == "bullish" and mtf_b < 3:
-            return False, "div ضد", "trend"
-        elif market == "TREND_UP" and direction == "bearish" and mtf_b < 3:
-            return False, "div ضد", "trend"
+        if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 5:
+            return False, "تقاطع صاعد ضد الترند", "trend"
+        if market == "TREND_UP" and direction == "bearish" and mtf_bonus < 5:
+            return False, "تقاطع هابط ضد الترند", "trend"
 
     if market == "RANGE" and source == "ema" and cross.get("alert_type") == "confirmed":
-        return False, "range وهمي", "range"
+        return False, "سوق عرضي", "range"
 
     if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
-        if direction == "bullish" and htf_trend == "DOWN": return False, "HTF ضد", "htf"
-        if direction == "bearish" and htf_trend == "UP": return False, "HTF ضد", "htf"
+        if direction == "bullish" and htf_trend == "DOWN":
+            return False, "HTF=DOWN ضد LONG", "htf"
+        if direction == "bearish" and htf_trend == "UP":
+            return False, "HTF=UP ضد SHORT", "htf"
 
-    df = cross.get("_df")
     if df is not None:
-        ok, slope = check_vwap_slope(df, direction, th, tf)
+        ok, slope = check_vwap_slope(df, direction, th, tf=tf)
         if not ok: return False, f"VWAP {slope:+.2f}%", "vwap"
-
-    if cross.get("alert_type") == "confirmed":
-        if has_conflicting_signal(cross["symbol"], direction):
-            return False, "تعارض", "conflict"
 
     if STRICTNESS == "auto": _smart.record(True, score, source=source)
     return True, "", ""
 
-
 # ═══════════════════════════════════════════════════════════
-# 12) كواشف الإشارات
+# 11) Detectors
 # ═══════════════════════════════════════════════════════════
-async def _df_for(symbol, tf, extra=60):
-    data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
-    if not data or len(data) < EMA_SLOW+5: return None
-    return pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+_crossover_cache = {}; _divergence_cache = {}; _bb_cache = {}; _sr_cache = {}
+_recent_signals = {}; _last_signal_time = {}
+_last_signals = deque(maxlen=LAST_SIGNALS_MAX)
+_filter_stats = defaultdict(int)
 
+def has_conflicting_signal(sym, direction):
+    prev = _recent_signals.get(sym)
+    if not prev: return False
+    if _time.time() - prev[1] < 300 and prev[0] != direction: return True
+    return False
 
-async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
-                     source="ema", extra=None):
-    cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
-    cts = int(df["ts"].iloc[curr])
-    levels = compute_levels(df, direction, curr, tf=tf)
-    market = classify_market(df)
-    support = compute_score(df, direction, curr)
-    out = {"symbol":symbol, "timeframe":tf, "direction":direction,
-           "ema_fast":round(cf,8), "ema_slow":round(cs,8),
-           "price":round(float(df["c"].iloc[curr]),8), "candle_ts":cts,
-           "gap_pct":round(abs(cf-cs)/cs*100,3) if cs else 0,
-           "strength":strength, "alert_type":alert_type, "support":support,
-           "base_score":support["score"], "final_score":support["score"],
-           "_df":df, "exchange":_exchange.primary_name, "levels":levels,
-           "source":source, "market":market, "created_at":_time.time()}
-    if extra: out.update(extra)
-    return out
+def record_signal(sym, direction): _recent_signals[sym] = (direction, _time.time())
 
+def check_symbol_cooldown(sym):
+    if SYMBOL_COOLDOWN_SEC <= 0: return True, 0
+    now = _time.time(); last = _last_signal_time.get(sym, 0)
+    if now - last < SYMBOL_COOLDOWN_SEC: return False, int(SYMBOL_COOLDOWN_SEC - (now - last))
+    return True, 0
+
+def mark_symbol_sent(sym): _last_signal_time[sym] = _time.time()
 
 async def detect_crossover(symbol, tf):
     if not ENABLE_CONFIRMED: return None
@@ -836,30 +1258,12 @@ async def detect_crossover(symbol, tf):
     bull = (cf > cs) and (pf <= ps); bear = (cf < cs) and (pf >= ps)
     if not (bull or bear): return None
     d = "bullish" if bull else "bearish"; cts = int(df["ts"].iloc[curr])
-    key = (symbol, tf); last = _crossover_cache.get(key)
+    key = (symbol, tf)
+    last = _crossover_cache.get(key)
     if last and last.get("candle_ts") == cts and last.get("direction") == d: return None
-    _crossover_cache[key] = {"candle_ts":cts, "direction":d}
+    _crossover_cache[key] = {"candle_ts": cts, "direction": d}
     return await _make_cross(symbol, tf, df, d, "confirmed", "✅ مؤكد", curr)
 
-
-async def detect_live_crossover(symbol, tf):
-    if not ENABLE_LIVE_CROSS: return None
-    df = await _df_for(symbol, tf)
-    if df is None: return None
-    df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
-    curr, prev = -1, -2
-    cf, cs = float(df["ef"].iloc[curr]), float(df["es"].iloc[curr])
-    pf, ps = float(df["ef"].iloc[prev]), float(df["es"].iloc[prev])
-    bull = (cf > cs) and (pf <= ps); bear = (cf < cs) and (pf >= ps)
-    if not (bull or bear): return None
-    d = "bullish" if bull else "bearish"; cts = int(df["ts"].iloc[curr])
-    key = (symbol, tf, "live"); last = _crossover_cache.get(key)
-    if last and last.get("candle_ts") == cts: return None
-    _crossover_cache[key] = {"candle_ts":cts, "direction":d}
-    return await _make_cross(symbol, tf, df, d, "live", "⚡ مبدئي", curr)
-
-
-_TF_MS = {"5m":300000, "15m":900000, "1h":3600000}
 async def detect_pre_crossover(symbol, tf):
     if not ENABLE_PRE_CROSS: return None
     df = await _df_for(symbol, tf, extra=60)
@@ -875,29 +1279,42 @@ async def detect_pre_crossover(symbol, tf):
         gaps.append(abs(f-s)/s*100)
     gch = list(reversed(gaps))
     if not all(gch[i] >= gch[i+1] for i in range(len(gch)-1)): return None
-    if abs(cf-cs) < 1e-9: return None
     d = "bullish" if cf < cs else "bearish"; cts = int(df["ts"].iloc[curr])
     key = (symbol, tf, "pre"); last = _crossover_cache.get(key)
-    if last and cts - last.get("candle_ts",0) < _TF_MS.get(tf, 900000)*PRE_CROSS_COOLDOWN:
-        return None
-    _crossover_cache[key] = {"candle_ts":cts, "direction":d}
+    if last and cts - last.get("candle_ts", 0) < 900_000 * PRE_CROSS_COOLDOWN: return None
+    _crossover_cache[key] = {"candle_ts": cts, "direction": d}
     return await _make_cross(symbol, tf, df, d, "pre", "🔔 تقارب وشيك", curr)
 
+async def detect_live_crossover(symbol, tf):
+    if not ENABLE_LIVE_CROSS: return None
+    df = await _df_for(symbol, tf)
+    if df is None: return None
+    df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+    curr, prev = -1, -2
+    cf, cs = float(df["ef"].iloc[curr]), float(df["es"].iloc[curr])
+    pf, ps = float(df["ef"].iloc[prev]), float(df["es"].iloc[prev])
+    bull = (cf>cs) and (pf<=ps); bear = (cf<cs) and (pf>=ps)
+    if not (bull or bear): return None
+    d = "bullish" if bull else "bearish"; cts = int(df["ts"].iloc[curr])
+    key = (symbol, tf, "live"); last = _crossover_cache.get(key)
+    if last and last.get("candle_ts") == cts: return None
+    _crossover_cache[key] = {"candle_ts": cts, "direction": d}
+    return await _make_cross(symbol, tf, df, d, "live", "⚡ مبدئي", curr)
 
 async def detect_rsi_divergence(symbol, tf):
     if not ENABLE_RSI_DIVERGENCE: return None
-    df = await _df_for(symbol, tf, extra=RSI_DIV_LOOKBACK+10)
-    if df is None or len(df) < RSI_DIV_LOOKBACK+5: return None
+    df = await _df_for(symbol, tf, extra=RSI_DIV_LOOKBACK + 10)
+    if df is None or len(df) < RSI_DIV_LOOKBACK + 5: return None
     rsi = calc_rsi(df["c"]); close = df["c"]; curr = -2
     key = (symbol, tf, "div"); last = _divergence_cache.get(key)
-    if last and (_time.time()-last) < RSI_DIV_COOLDOWN_MIN*60: return None
+    if last and (_time.time() - last) < RSI_DIV_COOLDOWN_MIN * 60: return None
     win = RSI_DIV_LOOKBACK; best = None
-    for i in range(3, win//2):
-        for j in range(i+3, win):
+    for i in range(3, win // 2):
+        for j in range(i + 3, win):
             idx1 = curr - i; idx2 = curr - j
             if idx1 >= 0 or idx2 >= 0: continue
             c1 = float(close.iloc[idx1]); c2 = float(close.iloc[idx2])
-            r1 = float(rsi.iloc[idx1]); r2 = float(rsi.iloc[idx2])
+            r1 = float(rsi.iloc[idx1]);   r2 = float(rsi.iloc[idx2])
             if c2 < c1 and r2 > r1 and r1 < 40:
                 s = (r2-r1)/max(1, 40-r1)
                 if not best or s > best["strength"]:
@@ -910,10 +1327,9 @@ async def detect_rsi_divergence(symbol, tf):
     d = best["dir"]
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _divergence_cache[key] = _time.time()
-    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🔄 دايفرجنس", curr, source="rsi_div")
-    cross["div_info"] = {"r1":round(best["r1"],1), "r2":round(best["r2"],1)}
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🔄 دايفرجنس RSI", curr, source="rsi_div")
+    cross["div_info"] = {"r1":round(best["r1"],1),"r2":round(best["r2"],1)}
     return cross
-
 
 async def detect_bb_squeeze_breakout(symbol, tf):
     if not ENABLE_BB_SQUEEZE: return None
@@ -921,797 +1337,130 @@ async def detect_bb_squeeze_breakout(symbol, tf):
     if df is None or len(df) < 60: return None
     bb = calc_bollinger(df); curr = -2
     key = (symbol, tf, "bb"); last = _bb_cache.get(key)
-    if last and (_time.time()-last) < BB_SQUEEZE_COOLDOWN_MIN*60: return None
-    hw = bb["width"].iloc[curr-50:curr].dropna()
-    if len(hw) < 20: return None
-    if float(bb["width"].iloc[curr]) > hw.quantile(BB_SQUEEZE_PCTL): return None
+    if last and (_time.time() - last) < BB_SQUEEZE_COOLDOWN_MIN * 60: return None
+    hist_width = bb["width"].iloc[curr-50:curr].dropna()
+    if len(hist_width) < 20: return None
+    if float(bb["width"].iloc[curr]) > hist_width.quantile(BB_SQUEEZE_PCTL): return None
     price = float(df["c"].iloc[curr]); up = float(bb["upper"].iloc[curr]); lo = float(bb["lower"].iloc[curr])
-    d = "bullish" if price > up else "bearish" if price < lo else None
-    if not d: return None
+    if price > up: d = "bullish"
+    elif price < lo: d = "bearish"
+    else: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _bb_cache[key] = _time.time()
     cross = await _make_cross(symbol, tf, df, d, "confirmed", "💥 كسر BB", curr, source="bb_squeeze")
-    cross["bb_info"] = {"width":round(float(bb["width"].iloc[curr]),2)}
+    cross["bb_info"] = {"width":round(float(bb["width"].iloc[curr]),2),"upper":up,"lower":lo}
     return cross
-
 
 async def detect_sr_breakout(symbol, tf):
     if not ENABLE_SR_BREAKOUT: return None
-    df = await _df_for(symbol, tf, extra=SR_BREAKOUT_LOOKBACK+10)
-    if df is None or len(df) < SR_BREAKOUT_LOOKBACK+5: return None
+    df = await _df_for(symbol, tf, extra=SR_BREAKOUT_LOOKBACK + 10)
+    if df is None or len(df) < SR_BREAKOUT_LOOKBACK + 5: return None
     curr = -2; key = (symbol, tf, "sr"); last = _sr_cache.get(key)
-    if last and (_time.time()-last) < SR_BREAKOUT_COOLDOWN_MIN*60: return None
-    w = df.iloc[curr-SR_BREAKOUT_LOOKBACK:curr]
-    high = float(w["h"].max()); low = float(w["l"].min()); cp = float(w["c"].iloc[-1])
-    pivot = (high+low+cp)/3; r1 = 2*pivot-low; s1 = 2*pivot-high
-    pn = float(df["c"].iloc[curr]); pp = float(df["c"].iloc[curr-1])
-    d = "bullish" if (pn > r1 and pp <= r1) else "bearish" if (pn < s1 and pp >= s1) else None
-    if not d: return None
+    if last and (_time.time() - last) < SR_BREAKOUT_COOLDOWN_MIN * 60: return None
+    window = df.iloc[curr - SR_BREAKOUT_LOOKBACK:curr]
+    high = float(window["h"].max()); low = float(window["l"].min())
+    close_prev = float(window["c"].iloc[-1])
+    pivot = (high + low + close_prev) / 3
+    r1 = 2*pivot - low; s1 = 2*pivot - high
+    price_now = float(df["c"].iloc[curr]); price_prev = float(df["c"].iloc[curr-1])
+    if price_now > r1 and price_prev <= r1: d, level = "bullish", r1
+    elif price_now < s1 and price_prev >= s1: d, level = "bearish", s1
+    else: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     _sr_cache[key] = _time.time()
-    return await _make_cross(symbol, tf, df, d, "confirmed", "🎯 كسر S/R", curr, source="sr_breakout")
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🎯 كسر S/R", curr, source="sr_breakout")
+    cross["sr_info"] = {"level":level}
+    return cross
 
-
-# ═══════════════════════════════════════════════════════════
-# 13) BinanceExecutor (SL/TP من سعر التنفيذ الفعلي)
-# ═══════════════════════════════════════════════════════════
-class BinanceExecutor:
-    def __init__(self):
-        self.ex = None; self.ready = False; self._init()
-
-    def _init(self):
-        if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-            log.warning("⚠️ لا مفاتيح Binance — التنفيذ معطّل"); return
-        try:
-            opts = {"apiKey": BINANCE_API_KEY, "secret": BINANCE_API_SECRET,
-                    "enableRateLimit": True, "timeout": 15000,
-                    "options": {"defaultType":"swap", "adjustForTimeDifference":True}}
-            if PROXY_URL: opts["proxies"] = {"http":PROXY_URL, "https":PROXY_URL}
-            self.ex = ccxt.binance(opts)
-            self.ex.load_markets()
-            self.ready = True
-            log.info("✅ Binance Executor ready")
-        except Exception as e:
-            log.error(f"❌ Binance Executor: {type(e).__name__}: {e}")
-            self.ex = None; self.ready = False
-
-    async def set_leverage(self, symbol):
-        try:
-            await asyncio.to_thread(self.ex.set_leverage, LEVERAGE, symbol,
-                                    {"marginMode":"isolated"})
-            return True
-        except Exception as e:
-            log.warning(f"set_leverage {symbol}: {e}"); return False
-
-    async def get_balance(self):
-        try:
-            b = await asyncio.to_thread(self.ex.fetch_balance)
-            u = b.get("USDT", {})
-            return {"free":float(u.get("free",0)), "used":float(u.get("used",0)),
-                    "total":float(u.get("total",0))}
-        except Exception as e:
-            log.error(f"balance: {e}"); return {"free":0,"used":0,"total":0}
-
-    async def get_positions(self):
-        try:
-            pos = await asyncio.to_thread(self.ex.fetch_positions)
-            return [p for p in pos if float(p.get("contracts") or 0) > 0]
-        except Exception as e:
-            log.error(f"positions: {e}"); return []
-
-    async def open_position(self, symbol, direction, ref_price, sl_price, tp_price):
-        """
-        تُحسب SL/TP كنِسَب من ref_price، ثم تُطبَّق على سعر التنفيذ الفعلي.
-        """
-        try:
-            # نِسَب من السعر المرجعي (سعر مصدر البيانات)
-            if direction == "bullish":
-                sl_pct = abs(ref_price - sl_price) / ref_price
-                tp_pct = abs(tp_price - ref_price) / ref_price
-            else:
-                sl_pct = abs(sl_price - ref_price) / ref_price
-                tp_pct = abs(ref_price - tp_price) / ref_price
-
-            await self.set_leverage(symbol)
-
-            # احصل على سعر Binance الحالي
-            ticker = await asyncio.to_thread(self.ex.fetch_ticker, symbol)
-            price = float(ticker["last"])
-
-            # الكمية من notional
-            notional = TRADE_MARGIN_USD * LEVERAGE
-            qty_raw = notional / price
-            qty = float(self.ex.amount_to_precision(symbol, qty_raw))
-
-            # التحقق من الحد الأدنى
-            mkt = self.ex.market(symbol)
-            min_amt = (mkt.get("limits",{}).get("amount",{}) or {}).get("min") or 0
-            min_cost = (mkt.get("limits",{}).get("cost",{}) or {}).get("min") or 0
-            if qty < min_amt:
-                return {"ok":False, "err":f"qty {qty} < min {min_amt}"}
-            if qty * price < min_cost:
-                return {"ok":False, "err":f"notional {qty*price:.2f} < min {min_cost}"}
-
-            side = "buy" if direction == "bullish" else "sell"
-            close_side = "sell" if side == "buy" else "buy"
-
-            # Market entry
-            entry_order = await asyncio.to_thread(
-                self.ex.create_order, symbol, "market", side, qty)
-            fill = float(entry_order.get("average") or entry_order.get("price") or price)
-
-            # احسب SL/TP من fill الفعلي
-            if direction == "bullish":
-                actual_sl = fill * (1 - sl_pct)
-                actual_tp = fill * (1 + tp_pct)
-            else:
-                actual_sl = fill * (1 + sl_pct)
-                actual_tp = fill * (1 - tp_pct)
-
-            # SL
-            sl_p = self.ex.price_to_precision(symbol, actual_sl)
-            sl_ok = False
-            try:
-                await asyncio.to_thread(
-                    self.ex.create_order, symbol, "STOP_MARKET", close_side, None, None,
-                    {"stopPrice":sl_p, "closePosition":True, "workingType":"MARK_PRICE"})
-                sl_ok = True
-            except Exception as e:
-                log.error(f"SL order {symbol}: {e}")
-
-            # TP
-            tp_p = self.ex.price_to_precision(symbol, actual_tp)
-            tp_ok = False
-            try:
-                await asyncio.to_thread(
-                    self.ex.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, None, None,
-                    {"stopPrice":tp_p, "closePosition":True, "workingType":"MARK_PRICE"})
-                tp_ok = True
-            except Exception as e:
-                log.error(f"TP order {symbol}: {e}")
-
-            return {"ok":True, "symbol":symbol, "side":side, "qty":qty,
-                    "entry":fill, "sl":actual_sl, "tp":actual_tp,
-                    "sl_ok":sl_ok, "tp_ok":tp_ok,
-                    "order_id":entry_order.get("id"), "notional":qty*fill,
-                    "sl_pct":round(sl_pct*100,3), "tp_pct":round(tp_pct*100,3)}
-        except Exception as e:
-            log.exception(f"open_position {symbol}: {e}")
-            return {"ok":False, "err":str(e)}
-
-    async def close_position(self, symbol):
-        try:
-            positions = await self.get_positions()
-            pos = next((p for p in positions if p["symbol"] == symbol), None)
-            if not pos: return {"ok":False, "err":"no position"}
-            side = "sell" if pos["side"] == "long" else "buy"
-            qty = abs(float(pos["contracts"]))
-            try: await asyncio.to_thread(self.ex.cancel_all_orders, symbol)
-            except: pass
-            order = await asyncio.to_thread(
-                self.ex.create_order, symbol, "market", side, qty, None, {"reduceOnly":True})
-            return {"ok":True, "order":order}
-        except Exception as e:
-            log.error(f"close {symbol}: {e}")
-            return {"ok":False, "err":str(e)}
-
-
-_executor = BinanceExecutor()
-
+def _get_detectors():
+    dets = []
+    if ENABLE_PRE_CROSS:  dets.append(detect_pre_crossover)
+    if ENABLE_LIVE_CROSS: dets.append(detect_live_crossover)
+    if ENABLE_CONFIRMED:  dets.append(detect_crossover)
+    if ENABLE_RSI_DIVERGENCE: dets.append(detect_rsi_divergence)
+    if ENABLE_BB_SQUEEZE:     dets.append(detect_bb_squeeze_breakout)
+    if ENABLE_SR_BREAKOUT:    dets.append(detect_sr_breakout)
+    return dets
 
 # ═══════════════════════════════════════════════════════════
-# 14) Risk Manager
+# 12) رسائل
 # ═══════════════════════════════════════════════════════════
-_open_positions = {}
-_daily_pnl = {"date": "", "realized": 0.0, "trades": 0}
-_kill_switch = {"active": False, "reason": "", "until": 0}
+def _source_label(src):
+    return {"ema":"📈 EMA","rsi_div":"🔄 RSI Div","bb_squeeze":"💥 BB",
+            "sr_breakout":"🎯 S/R"}.get(src, "—")
 
-
-def _check_daily_reset():
-    today = datetime.now(SYRIA_TZ).strftime("%Y-%m-%d")
-    if _daily_pnl["date"] != today:
-        _daily_pnl["date"] = today
-        _daily_pnl["realized"] = 0.0
-        _daily_pnl["trades"] = 0
-
-
-def can_open_new_trade():
-    _check_daily_reset()
-    if _kill_switch["active"] and _time.time() < _kill_switch["until"]:
-        rem = int(_kill_switch["until"] - _time.time())
-        return False, f"Kill ({rem}s): {_kill_switch['reason']}"
-    if _kill_switch["active"]: _kill_switch["active"] = False
-    if len(_open_positions) >= MAX_CONCURRENT_POSITIONS:
-        return False, f"عدد {len(_open_positions)}/{MAX_CONCURRENT_POSITIONS}"
-    if _daily_pnl["realized"] <= -MAX_DAILY_LOSS_USD:
-        _kill_switch["active"] = True
-        _kill_switch["reason"] = f"خسارة يومية {_daily_pnl['realized']:.0f}$"
-        _kill_switch["until"] = _time.time() + 86400
-        return False, _kill_switch["reason"]
-    return True, ""
-
-
-# ═══════════════════════════════════════════════════════════
-# 15) التنفيذ
-# ═══════════════════════════════════════════════════════════
-async def execute_signal(cross, bot):
-    if not EXECUTION_ENABLED or not _executor.ready: return None
-    if cross["alert_type"] != "confirmed": return None
-    if cross["symbol"] in _open_positions: return None
-
-    ok, reason = can_open_new_trade()
-    if not ok:
-        log.warning(f"🚫 {cross['symbol']}: {reason}")
-        try:
-            await bot.send_message(chat_id=CHAT_ID,
-                text=f"🚫 <b>تخطي {short(cross['symbol'])}</b>\n{reason}",
-                parse_mode="HTML")
-        except: pass
-        return None
-
-    levels = cross.get("levels")
-    if not levels: return None
-
-    fair, src, details = await _fair.get(cross["symbol"])
-    if not fair:
-        log.warning(f"❌ لا سعر عادل {cross['symbol']}")
-        try:
-            await bot.send_message(chat_id=CHAT_ID,
-                text=f"❌ <b>تخطي {short(cross['symbol'])}</b>\nلا سعر عادل من أي مصدر",
-                parse_mode="HTML")
-        except: pass
-        return None
-
-    entry_ref = levels["entry"]
-    div = abs(fair - entry_ref) / entry_ref * 100
-    if div > MAX_PRICE_DIVERGENCE_PCT:
-        log.warning(f"⚠️ انحراف {cross['symbol']} {div:.3f}%")
-        try:
-            await bot.send_message(chat_id=CHAT_ID,
-                text=f"⚠️ <b>تخطي {short(cross['symbol'])}</b>\n"
-                     f"انحراف {div:.2f}% > {MAX_PRICE_DIVERGENCE_PCT}%\n"
-                     f"• مرجع: {fmt_price(entry_ref)}\n"
-                     f"• عادل ({src}): {fmt_price(fair)}",
-                parse_mode="HTML")
-        except: pass
-        return None
-
-    log.info(f"🚀 تنفيذ {cross['symbol']} | src={src} fair={fair:.6f} "
-             f"ref={entry_ref:.6f} div={div:.3f}%")
-
-    result = await _executor.open_position(
-        cross["symbol"], cross["direction"],
-        entry_ref, levels["stop_loss"], levels["tp2"])
-
-    if not result.get("ok"):
-        log.error(f"❌ فشل {cross['symbol']}: {result.get('err')}")
-        try:
-            await bot.send_message(chat_id=CHAT_ID,
-                text=f"❌ <b>فشل التنفيذ</b>\n{short(cross['symbol'])}\n{result.get('err')}",
-                parse_mode="HTML")
-        except: pass
-        return None
-
-    _open_positions[cross["symbol"]] = {
-        "cross":cross, "levels":levels, "exec":result,
-        "opened_at":_time.time(), "source":cross.get("source","ema"),
-        "fair_price":fair, "fair_source":src, "divergence_pct":round(div,3),
-    }
-    _daily_pnl["trades"] += 1
-    mark_symbol_sent(cross["symbol"])
-    register_signal_for_tracking(cross)
-
-    msg = (f"🟢 <b>تنفيذ ناجح — {short(cross['symbol'])}</b>\n"
-           f"🇸🇾 {syria_now_str()}\n"
-           f"━━━━━━━━━━━━━━━━━━━\n"
-           f"📊 {cross['direction']} | {cross.get('source','ema')}\n"
-           f"⚙️ {LEVERAGE}x | Margin ${TRADE_MARGIN_USD}\n"
-           f"📦 Qty: <b>{result['qty']}</b> | Notional: <b>${result['notional']:.0f}</b>\n"
-           f"💰 دخول فعلي: <b>{fmt_price(result['entry'])}</b>\n"
-           f"🛑 SL: <b>{fmt_price(result['sl'])}</b> (-{result['sl_pct']}%) "
-           f"{'✅' if result['sl_ok'] else '⚠️'}\n"
-           f"🎯 TP (1:2): <b>{fmt_price(result['tp'])}</b> (+{result['tp_pct']}%) "
-           f"{'✅' if result['tp_ok'] else '⚠️'}\n"
-           f"📉 انحراف: <b>{div:.3f}%</b> | 📡 سعر: {src}\n"
-           f"🏦 نشطة: <b>{len(_open_positions)}/{MAX_CONCURRENT_POSITIONS}</b>")
-    try: await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
-    except: pass
-    return result
-
-
-async def sync_positions(bot):
-    if not _executor.ready or not _open_positions: return
-    try:
-        positions = await _executor.get_positions()
-        open_syms = {p["symbol"] for p in positions}
-        for sym in list(_open_positions.keys()):
-            if sym not in open_syms:
-                info = _open_positions.pop(sym)
-                pnl = 0.0
-                try:
-                    trades = await asyncio.to_thread(
-                        _executor.ex.fetch_my_trades, sym, None, 20)
-                    pnl = sum(float(t.get("info",{}).get("realizedPnl",0)) for t in trades[-5:])
-                except: pass
-                _daily_pnl["realized"] += pnl
-                emoji = "✅" if pnl >= 0 else "❌"
-                msg = (f"{emoji} <b>صفقة مغلقة — {short(sym)}</b>\n"
-                       f"💰 PnL: <b>{pnl:+.2f} USDT</b>\n"
-                       f"📉 اليوم: <b>{_daily_pnl['realized']:+.2f}$</b>\n"
-                       f"🏦 نشطة: <b>{len(_open_positions)}/{MAX_CONCURRENT_POSITIONS}</b>")
-                try: await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
-                except: pass
-    except Exception as e:
-        log.error(f"sync: {e}")
-
-
-# ═══════════════════════════════════════════════════════════
-# 16) تتبّع الإشارات
-# ═══════════════════════════════════════════════════════════
-def register_signal_for_tracking(cross):
-    levels = cross.get("levels")
-    if not levels: return
-    sid = f"{cross['symbol']}_{cross['timeframe']}_{int(_time.time())}"
-    _pending_signals[sid] = {
-        "cross":cross, "levels":levels, "entry_price":levels["entry"],
-        "entry_ts":_time.time(), "direction":cross["direction"],
-        "source":cross.get("source","ema"), "checked":False, "result":None,
-    }
-
-
-async def evaluate_pending():
-    if not _pending_signals: return
-    now = _time.time()
-    for sid, sig in list(_pending_signals.items()):
-        if sig["checked"]: continue
-        age_min = (now - sig["entry_ts"]) / 60
-        if age_min > SIGNAL_TRACK_MAX_MIN:
-            sig["checked"] = True; sig["result"] = "expired"
-            _smart.record_result("expired", sig["direction"], sig.get("source","unknown"))
-            _record_history(sig, "expired", sig["levels"]["entry"], age_min); continue
-        try:
-            # استخدم WS إن أمكن
-            ws = _ws.get(sig["cross"]["symbol"])
-            price = ws["mark"] if ws else None
-            if not price:
-                data, _ = await _exchange.fetch_ohlcv(sig["cross"]["symbol"], "1m", 3)
-                if not data: continue
-                price = float(data[-1][4])
-            lv = sig["levels"]; new_r = None
-            if sig["direction"] == "bullish":
-                if price <= lv["stop_loss"]: sig["checked"]=True; new_r="loss_sl"
-                elif price >= lv["tp2"]: sig["checked"]=True; new_r="win_tp2"
-                elif price >= lv["tp1"] and not sig.get("result"):
-                    new_r="win_tp1"; sig["result"]="win_tp1"
-            else:
-                if price >= lv["stop_loss"]: sig["checked"]=True; new_r="loss_sl"
-                elif price <= lv["tp2"]: sig["checked"]=True; new_r="win_tp2"
-                elif price <= lv["tp1"] and not sig.get("result"):
-                    new_r="win_tp1"; sig["result"]="win_tp1"
-            if new_r and sig["checked"]:
-                _smart.record_result(sig["result"], sig["direction"], sig.get("source","unknown"))
-                _record_history(sig, sig["result"], price, age_min)
-        except Exception as e:
-            log.warning(f"track {sid}: {e}")
-    cutoff = now - 3600
-    for sid in [k for k,v in _pending_signals.items() if v.get("checked") and v["entry_ts"] < cutoff]:
-        _pending_signals.pop(sid, None)
-
-
-def _record_history(sig, result, price, age_min):
-    cross = sig["cross"]; entry = sig["levels"]["entry"]
-    bull = sig["direction"] == "bullish"
-    pnl = ((price-entry)/entry*100) * (1 if bull else -1)
-    _last_signals.append({"symbol":cross["symbol"], "timeframe":cross["timeframe"],
-        "direction":cross["direction"], "source":cross.get("source","ema"),
-        "score":cross.get("final_score",0), "entry":entry, "exit":price,
-        "result":result, "pnl_pct":round(pnl,2),
-        "duration_min":int(age_min), "ts":_time.time()})
-
-
-# ═══════════════════════════════════════════════════════════
-# 17) رسائل
-# ═══════════════════════════════════════════════════════════
-def _source_label(s):
-    return {"ema":"📈 EMA","rsi_div":"🔄 RSI","bb_squeeze":"💥 BB","sr_breakout":"🎯 S/R"}.get(s,"—")
-
-
-def build_signal_message(cross):
-    sym = cross["symbol"]; tf = cross["timeframe"]
+def build_signal_msg(cross):
+    sym = short(cross["symbol"]); tf = cross["timeframe"]
     bull = cross["direction"] == "bullish"
-    at = cross.get("alert_type","confirmed")
-    s = cross.get("support",{})
-    score = cross.get("final_score", s.get("score",0))
-    grade = s.get("grade","?"); market = cross.get("market","?")
-    levels = cross.get("levels"); source = cross.get("source","ema")
-    mtf = cross.get("mtf","—")
-
-    if at == "pre": emoji, title, tl = "🔔", "تقارب وشيك", "🔔 مبكر"
-    elif at == "live": emoji, title, tl = "⚡", "تقاطع مبدئي", "⚡ مبدئي"
-    else: emoji, title, tl = ("🚀" if bull else "🔻"), "إشارة مؤكدة", "✅ مؤكد"
+    s = cross.get("support", {}); score = cross.get("final_score", 0)
+    lv = cross.get("levels")
     dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
-    market_lbl = {"TREND_UP":"📈 ترند صاعد","TREND_DOWN":"📉 ترند هابط",
-                  "RANGE":"↔️ عرضي","VOLATILE":"🌊 متقلب","UNKNOWN":"❓"}.get(market, market)
-
-    msg = (f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
+    msg = (f"🎯 <b>إشارة — {sym} [{tf}]</b>\n"
            f"🇸🇾 {syria_now_str()}\n"
            f"━━━━━━━━━━━━━━━━━━━\n"
-           f"{tl} | {_source_label(source)}\n"
-           f"📊 <b>{dir_lbl}</b>\n"
-           f"🏛️ السوق: <b>{market_lbl}</b>\n"
-           f"🔗 MTF: <b>{mtf}</b>\n"
-           f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
-           f"🎯 <b>{score}/100 {grade}</b>\n"
-           f"━━━━━━━━━━━━━━━━━━━\n"
-           f"• Vol: {s.get('vol_ratio','?')}× ({s.get('vol_pts',0)}/30)\n"
-           f"• ADX: {s.get('adx','?')} ({s.get('adx_pts',0)}/20)\n"
-           f"• RSI: {s.get('rsi','?')} ({s.get('rsi_pts',0)}/10)\n"
-           f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n")
-    if levels:
-        msg += (f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 <b>الخطة:</b>\n"
-                f"• الدخول: <b>{fmt_price(levels['entry'])}</b>\n"
-                f"• SL: <b>{fmt_price(levels['stop_loss'])}</b> (-{levels['sl_pct']}%)\n"
-                f"• TP1: {fmt_price(levels['tp1'])}\n"
-                f"• TP2: {fmt_price(levels['tp2'])}\n"
-                f"• TP3: {fmt_price(levels['tp3'])}\n")
-    msg += f"• 📦 {cross.get('exchange','?')}"
+           f"{_source_label(cross.get('source','ema'))} | {dir_lbl}\n"
+           f"📊 Score: <b>{score}/100</b> | MTF: {cross.get('mtf','—')}\n")
+    if lv:
+        msg += (f"💰 الدخول: <b>{fmt_price(lv['entry'])}</b>\n"
+                f"🛑 SL: {fmt_price(lv['stop_loss'])} (-{lv['sl_pct']}%)\n"
+                f"🎯 TP1: {fmt_price(lv['tp1'])} | TP2: {fmt_price(lv['tp2'])} | TP3: {fmt_price(lv['tp3'])}")
     return msg
 
+def build_position_msg(pos):
+    sym = short(pos["symbol"]); bull = pos["direction"] == "bullish"
+    return (f"{'🟢' if bull else '🔴'} <b>{sym}</b> [{pos['tf']}] {_source_label(pos.get('source','ema'))}\n"
+            f"   💰 Entry: {fmt_price(pos['entry'])} | Qty: {pos['qty']}\n"
+            f"   🛑 SL: {fmt_price(pos['sl'])} | TP1: {fmt_price(pos['tp1'])}\n"
+            f"   🎯 TP2: {fmt_price(pos['tp2'])} | TP3: {fmt_price(pos['tp3'])}\n"
+            f"   {'✅TP1 ' if pos['tp1_filled'] else ''}"
+            f"{'✅TP2 ' if pos['tp2_filled'] else ''}"
+            f"{'🔄TRAIL ' if pos.get('trailing_active') else ''}")
 
 # ═══════════════════════════════════════════════════════════
-# 18) الأوامر
+# 13) Trading Engine
 # ═══════════════════════════════════════════════════════════
-async def cmd_start(update, context):
-    ws = _ws.status()
-    await update.message.reply_text(
-        f"🤖 <b>Bot v7.1 — WS + Execution</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 Data: <b>{_exchange.primary_name}</b>\n"
-        f"💼 Exec: <b>{'Binance ✅' if _executor.ready else '❌'}</b>\n"
-        f"🔌 WS: <b>{'🟢' if ws['connected'] else '🔴'} ({ws['cached']}/{ws['symbols']})</b>\n"
-        f"🔐 Proxy: <b>{'✅' if PROXY_URL else '❌'}</b>\n"
-        f"⚙️ {LEVERAGE}x | ${TRADE_MARGIN_USD} | Max {MAX_CONCURRENT_POSITIONS}\n"
-        f"🚨 Kill: -${MAX_DAILY_LOSS_USD:.0f}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"/ws /balance /positions /close SYM /closeall\n"
-        f"/emergency /resume /status /last /pending /perf\n"
-        f"/cross /cross5 /cross15 /cross1h /clearcache",
-        parse_mode="HTML")
-
-
-async def cmd_ws(update, context):
-    st = _ws.status()
-    lines = [f"🔌 <b>WebSocket Status</b>", "━━━━━━━━━━━━━━━━━━━",
-             f"• متصل: {'🟢 نعم' if st['connected'] else '🔴 لا'}",
-             f"• رموز مشتركة: {st['symbols']}",
-             f"• أسعار مخزّنة: {st['cached']}",
-             f"• آخر رسالة: {st['last_msg_age']}s" if st['last_msg_age'] else "• آخر رسالة: —",
-             f"• إعادة اتصال: {st['reconnects']}"]
-    if _ws.prices:
-        lines.append("\n<b>أسعار حالية:</b>")
-        for sym, p in list(_ws.prices.items())[:10]:
-            lines.append(f"• {sym}: <b>{fmt_price(p['mark'])}</b> (bid={fmt_price(p['bid'])})")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_balance(update, context):
-    if not _executor.ready:
-        await update.message.reply_text("❌ التنفيذ معطّل."); return
-    b = await _executor.get_balance(); _check_daily_reset()
-    await update.message.reply_text(
-        f"💰 <b>رصيد Binance</b>\n"
-        f"• متاح: <b>{b['free']:.2f}$</b>\n"
-        f"• مستخدم: <b>{b['used']:.2f}$</b>\n"
-        f"• إجمالي: <b>{b['total']:.2f}$</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 PnL اليوم: <b>{_daily_pnl['realized']:+.2f}$</b>\n"
-        f"🎯 صفقات: {_daily_pnl['trades']}\n"
-        f"🏦 نشطة: {len(_open_positions)}/{MAX_CONCURRENT_POSITIONS}",
-        parse_mode="HTML")
-
-
-async def cmd_positions(update, context):
-    if not _executor.ready:
-        await update.message.reply_text("❌ التنفيذ معطّل."); return
-    positions = await _executor.get_positions()
-    if not positions:
-        await update.message.reply_text("📭 لا صفقات."); return
-    lines = [f"🏦 <b>الصفقات ({len(positions)})</b>", "━━━━━━━━━━━━━━━━━━━"]
-    total = 0
-    for p in positions:
-        pnl = float(p.get("unrealizedPnl") or 0); total += pnl
-        emoji = "🟢" if p["side"] == "long" else "🔴"
-        lines.append(
-            f"\n{emoji} <b>{short(p['symbol'])}</b> {p['side'].upper()}\n"
-            f"   Qty: {p['contracts']} | Entry: {fmt_price(float(p.get('entryPrice') or 0))}\n"
-            f"   Mark: {fmt_price(float(p.get('markPrice') or 0))}\n"
-            f"   PnL: <b>{pnl:+.2f}$</b>")
-    lines.append(f"\n━━━━━━━━━━━━━━━━━━━\n💰 إجمالي: <b>{total:+.2f}$</b>")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_close(update, context):
-    if not _executor.ready:
-        await update.message.reply_text("❌ التنفيذ معطّل."); return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("استخدام: <code>/close BTC</code>", parse_mode="HTML"); return
-    name = args[0].upper()
-    target = next((s for s in _open_positions if short(s) == name), None)
-    if not target:
-        await update.message.reply_text(f"❌ لا صفقة على {name}"); return
-    await update.message.reply_text(f"🔄 إغلاق {name}...")
-    r = await _executor.close_position(target)
-    if r.get("ok"):
-        _open_positions.pop(target, None)
-        await update.message.reply_text(f"✅ أُغلقت {name}")
-    else:
-        await update.message.reply_text(f"❌ {r.get('err')}")
-
-
-async def cmd_closeall(update, context):
-    if not _executor.ready:
-        await update.message.reply_text("❌ التنفيذ معطّل."); return
-    if not _open_positions:
-        await update.message.reply_text("📭 لا صفقات."); return
-    n = len(_open_positions)
-    await update.message.reply_text(f"🔄 إغلاق {n} صفقة...")
-    closed = 0
-    for sym in list(_open_positions.keys()):
-        r = await _executor.close_position(sym)
-        if r.get("ok"): _open_positions.pop(sym, None); closed += 1
-    await update.message.reply_text(f"✅ {closed}/{n}")
-
-
-async def cmd_emergency(update, context):
-    if not _executor.ready:
-        await update.message.reply_text("❌ التنفيذ معطّل."); return
-    _kill_switch["active"] = True
-    _kill_switch["reason"] = "يدوي"
-    _kill_switch["until"] = _time.time() + 86400
-    closed = 0
-    for sym in list(_open_positions.keys()):
-        r = await _executor.close_position(sym)
-        if r.get("ok"): _open_positions.pop(sym, None); closed += 1
-    await update.message.reply_text(
-        f"🚨 <b>KILL SWITCH</b>\n• أُغلقت {closed}\n• معطّل 24h\n• /resume",
-        parse_mode="HTML")
-
-
-async def cmd_resume(update, context):
-    _kill_switch["active"] = False; _kill_switch["until"] = 0
-    await update.message.reply_text("✅ استُؤنف التنفيذ.")
-
-
-async def cmd_status(update, context):
-    _check_daily_reset()
-    st = _smart.stats(); ws = _ws.status()
-    await update.message.reply_text(
-        f"🤖 <b>Status</b>\n"
-        f"📦 {_exchange.primary_name} | 💼 {'✅' if _executor.ready else '❌'}\n"
-        f"🔌 WS: {'🟢' if ws['connected'] else '🔴'} ({ws['cached']})\n"
-        f"🔐 Proxy: {'✅' if PROXY_URL else '❌'}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🏦 {len(_open_positions)}/{MAX_CONCURRENT_POSITIONS} | "
-        f"💰 {_daily_pnl['realized']:+.2f}$\n"
-        f"🎯 {_daily_pnl['trades']} | WR: {st['wr']}%\n"
-        f"🚨 Kill: {'🔴' if _kill_switch['active'] else '🟢'}",
-        parse_mode="HTML")
-
-
-async def cmd_last(update, context):
-    if not _last_signals:
-        await update.message.reply_text("📭 لا إشارات."); return
-    lines = ["📋 <b>آخر الإشارات</b>"]
-    for s in reversed(list(_last_signals)):
-        ic = {"win_tp2":"✅","win_tp1":"🎯","loss_sl":"❌","expired":"⏰"}.get(s["result"],"⏳")
-        t = datetime.fromtimestamp(s["ts"], tz=SYRIA_TZ).strftime("%H:%M")
-        d = "🟢" if s["direction"]=="bullish" else "🔴"
-        lines.append(f"\n{ic} <b>{short(s['symbol'])}</b> [{s['timeframe']}] {d}")
-        lines.append(f"   {t} | Score={s['score']} | {s['pnl_pct']:+.2f}%")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_pending(update, context):
-    active = {sid:s for sid,s in _pending_signals.items() if not s["checked"]}
-    if not active:
-        await update.message.reply_text("📭 لا نشطة."); return
-    lines = [f"⏳ <b>نشطة ({len(active)})</b>"]
-    for sid, sig in active.items():
-        c = sig["cross"]; lv = sig["levels"]
-        lines.append(f"• <b>{short(c['symbol'])}</b> [{c['timeframe']}] {c['direction']}")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_perf(update, context):
-    rep = _smart.source_stats
-    if not rep:
-        await update.message.reply_text("📊 لا بيانات."); return
-    lines = ["📊 <b>الأداء</b>"]
-    for src, d in rep.items():
-        tot = d["wins"] + d["losses"]
-        wr = round(d["wins"]/tot*100,1) if tot else 0
-        lines.append(f"• {_source_label(src)}: ✅{d['wins']} ❌{d['losses']} WR={wr}%")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def _run_cross(update, tfs=None):
-    if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    tfs = tfs or TIMEFRAMES
-    await update.message.reply_text(f"🔍 فحص {', '.join(tfs)}...")
-    clear_caches()
-    dets = []
-    if ENABLE_PRE_CROSS: dets.append(detect_pre_crossover)
-    if ENABLE_LIVE_CROSS: dets.append(detect_live_crossover)
-    if ENABLE_CONFIRMED: dets.append(detect_crossover)
-    if ENABLE_RSI_DIVERGENCE: dets.append(detect_rsi_divergence)
-    if ENABLE_BB_SQUEEZE: dets.append(detect_bb_squeeze_breakout)
-    if ENABLE_SR_BREAKOUT: dets.append(detect_sr_breakout)
-    found = 0
-    for sym in ALL_SYMBOLS:
-        for tf in tfs:
-            for det in dets:
-                cross = await det(sym, tf)
-                if not cross: continue
-                htf = await get_htf_trend(sym)
-                passed, _, _ = await passes_filter(cross, htf)
-                if not passed: continue
-                try:
-                    await update.message.reply_text(build_signal_message(cross), parse_mode="HTML")
-                    found += 1
-                    if cross["alert_type"] == "confirmed":
-                        record_signal(sym, cross["direction"])
-                        await execute_signal(cross, context.bot)
-                except Exception as e:
-                    log.error(f"send: {e}")
-            await asyncio.sleep(SYMBOL_DELAY_MS/1000)
-    await update.message.reply_text(f"✅ {found} إشارة.")
-
-
-async def cmd_cross(u,c): await _run_cross(u)
-async def cmd_cross5(u,c): await _run_cross(u, ["5m"])
-async def cmd_cross15(u,c): await _run_cross(u, ["15m"])
-async def cmd_cross1h(u,c): await _run_cross(u, ["1h"])
-
-
-async def cmd_clearcache(update, context):
-    clear_caches(); _smart.reset()
-    await update.message.reply_text("✅ تم.")
-
-
-async def error_handler(update, context):
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut)): return
-    log.error(f"❌ {err}", exc_info=err)
-
-
-# ═══════════════════════════════════════════════════════════
-# 19) Jobs
-# ═══════════════════════════════════════════════════════════
-async def crossover_job(context):
-    if not _exchange.ok(): return
-    dets = []
-    if ENABLE_PRE_CROSS: dets.append(detect_pre_crossover)
-    if ENABLE_LIVE_CROSS: dets.append(detect_live_crossover)
-    if ENABLE_CONFIRMED: dets.append(detect_crossover)
-    if ENABLE_RSI_DIVERGENCE: dets.append(detect_rsi_divergence)
-    if ENABLE_BB_SQUEEZE: dets.append(detect_bb_squeeze_breakout)
-    if ENABLE_SR_BREAKOUT: dets.append(detect_sr_breakout)
-    total = 0
+async def trading_loop(context):
+    """job كل 2 دقيقة: يفحص الإشارات وينفذ"""
+    if _executor is None or _positions_mgr is None: return
+    if _positions_mgr.paused: return
+    detectors = _get_detectors()
     for sym in ALL_SYMBOLS:
         for tf in TIMEFRAMES:
-            for det in dets:
+            for det in detectors:
                 try:
                     cross = await det(sym, tf)
                     if not cross: continue
+                    # فقط confirmed للتنفيذ
+                    if TRADE_ON_CONFIRMED_ONLY and cross.get("alert_type") != "confirmed":
+                        continue
+                    # cooldown
+                    ok_cd, rem = check_symbol_cooldown(sym)
+                    if not ok_cd: continue
+                    # existing position for symbol?
+                    if sym in _positions_mgr.positions: continue
+                    # can open?
+                    ok, why = await _positions_mgr.can_open_new()
+                    if not ok:
+                        log.info(f"⏸️ لا يمكن فتح صفقة: {why}")
+                        continue
+                    # filters
                     htf = await get_htf_trend(sym)
-                    passed, _, cat = await passes_filter(cross, htf)
+                    passed, reason, cat = await passes_filter(cross, htf)
                     if not passed:
-                        _filter_stats[f"f_{cat}"] += 1; continue
-                    if CHAT_ID:
-                        try:
-                            await context.bot.send_message(chat_id=CHAT_ID,
-                                text=build_signal_message(cross), parse_mode="HTML")
-                            total += 1; _filter_stats["sent"] += 1
-                            if cross["alert_type"] == "confirmed":
-                                record_signal(sym, cross["direction"])
-                                await execute_signal(cross, context.bot)
-                        except Exception as e:
-                            log.error(f"send: {e}")
-                except Exception as e:
-                    log.exception(f"job {sym} {tf}: {e}")
-            await asyncio.sleep(SYMBOL_DELAY_MS/1000)
-    if total: log.info(f"📤 {total} إشارة")
-
-
-async def tracker_job(context):
-    try: await evaluate_pending()
-    except Exception as e: log.exception(f"tracker: {e}")
-
-
-async def sync_job(context):
-    try: await sync_positions(bot=context.bot)
-    except Exception as e: log.exception(f"sync: {e}")
-
-
-# ═══════════════════════════════════════════════════════════
-# 20) Health
-# ═══════════════════════════════════════════════════════════
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK - v7.1")
-    def do_HEAD(self): self.send_response(200); self.end_headers()
-    def log_message(self, *a): pass
-
-def run_health():
-    port = int(os.getenv("PORT","8080"))
-    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
-
-
-# ═══════════════════════════════════════════════════════════
-# 21) Main
-# ═══════════════════════════════════════════════════════════
-async def post_init(app):
-    await _ws.start(ALL_SYMBOLS)
-    log.info(f"🔌 WS started: {len(ALL_SYMBOLS)} symbols")
-
-
-async def post_shutdown(app):
-    await _ws.stop()
-
-
-def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        print("❌ مفاتيح Telegram مطلوبة"); return
-
-    threading.Thread(target=run_health, daemon=True).start()
-
-    print(f"📦 Data: {_exchange.primary_name}")
-    print(f"💼 Executor: {'✅' if _executor.ready else '❌'}")
-    print(f"🔐 Proxy: {'✅' if PROXY_URL else '❌'} | WS proxy: {WS_USE_PROXY}")
-    print(f"⚙️ {LEVERAGE}x | ${TRADE_MARGIN_USD} | Max {MAX_CONCURRENT_POSITIONS}")
-    print(f"🚨 Kill: -${MAX_DAILY_LOSS_USD}")
-    print(f"📊 Symbols: {[s.split('/')[0] for s in ALL_SYMBOLS]}")
-
-    from telegram.request import HTTPXRequest
-    req = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
-                       connect_timeout=30.0, pool_timeout=30.0)
-
-    app = (Application.builder().token(BOT_TOKEN)
-           .request(req).get_updates_request(req)
-           .post_init(post_init).post_shutdown(post_shutdown)
-           .build())
-
-    if app.job_queue is None:
-        raise RuntimeError("pip install 'python-telegram-bot[job-queue]'")
-
-    handlers = [
-        ("start", cmd_start), ("ws", cmd_ws),
-        ("balance", cmd_balance), ("positions", cmd_positions),
-        ("close", cmd_close), ("closeall", cmd_closeall),
-        ("emergency", cmd_emergency), ("resume", cmd_resume),
-        ("cross", cmd_cross), ("cross5", cmd_cross5),
-        ("cross15", cmd_cross15), ("cross1h", cmd_cross1h),
-        ("status", cmd_status), ("last", cmd_last), ("pending", cmd_pending),
-        ("perf", cmd_perf), ("clearcache", cmd_clearcache),
-    ]
-    for name, fn in handlers:
-        app.add_handler(CommandHandler(name, fn))
-    app.add_error_handler(error_handler)
-
-    app.job_queue.run_repeating(crossover_job, interval=JOB_INTERVAL_MIN*60, first=20, name="cross")
-    app.job_queue.run_repeating(tracker_job, interval=SIGNAL_TRACK_INTERVAL_MIN*60, first=50, name="tracker")
-    app.job_queue.run_repeating(sync_job, interval=60, first=30, name="sync")
-
-    print("✅ polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True, bootstrap_retries=5)
-
-
-if __name__ == "__main__":
-    main()
+                        _filter_stats[f"filtered_{cat}"] += 1
+                        continue
+                    if not cross.get("levels"): continue
+                    # ===== EXECUTE =====
+                    pos = await _positions_mgr.open_position(cross)
+                    if pos:
+                        mark_symbol_sent(sym); record_signal(sym, cross["direction"])
+                        _filter_stats["sent"] += 1
+                        _last_signals.append({
+                            "symbol": sym, "timeframe": tf, "direction": cross["direction"],
+                            "source": cross.get("source","ema"), "score": cross.get("final_score",0),
+                            "entry": pos["entry"], "ts": _time.time(),
+                        })
+                        text = (f"🚀 <b>تم الفتح — {short(sym)}</b> [{tf}]\n"
+                                f"{'🟢 LONG' if cross['direction']=='bullish' else '🔴 SHORT'}\n"
+                                f"━━━━━━━━━━━━━━━━━━━\n"
+                                f
