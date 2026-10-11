@@ -1,19 +1,19 @@
 """
-Unified Smart Bot v6.0 — Pro Signals + Morning Report
-=====================================================
-  ✓ SL/TP لكل إشارة (ATR + هيكلي)
-  ✓ تصنيف السوق (Trend/Range/Volatile)
-  ✓ تتبّع نتائج الإشارات (Feedback Loop فعلي)
-  ✓ ملفات تعريف لكل إطار زمني
-  ✓ 🌅 تقرير صباحي تلقائي 10:00 صباحاً (توقيت سوريا)
-  ✓ /sr — تقرير الدعم/المقاومة عند الطلب
-  ✓ النطاقات اليدوية + تقرير 6% كل 4 ساعات
+Unified Smart Bot v6.2 — Fixed SL + Safe Market + Session VWAP
+==============================================================
+  ✓ SL/TP مع حد أدنى حسب الإطار (إصلاح SL الضيق)
+  ✓ classify_market_safe مع HTF fallback (إصلاح ❓)
+  ✓ VWAP بنظام الجلسة (day/week)
+  ✓ SmartStrictness مُعاد هيكلته
+  ✓ 4 كواشف: EMA + RSI Div + BB Squeeze + S/R
+  ✓ Multi-TF + Session Adjustments
+  ✓ 🌅 تقرير صباحي + /perf لتحليل الأداء
 """
 import os, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
-from collections import deque
+from collections import deque, defaultdict
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler"):
@@ -55,6 +55,20 @@ PRE_CROSS_GAP = 0.05
 PRE_CROSS_LOOKBACK = 3
 PRE_CROSS_COOLDOWN = 3
 
+ENABLE_RSI_DIVERGENCE = True
+ENABLE_BB_SQUEEZE     = True
+ENABLE_SR_BREAKOUT    = True
+
+RSI_DIV_LOOKBACK = 35
+RSI_DIV_COOLDOWN_MIN = 30
+BB_SQUEEZE_PCTL = 0.20
+BB_SQUEEZE_COOLDOWN_MIN = 20
+SR_BREAKOUT_LOOKBACK = 50
+SR_BREAKOUT_COOLDOWN_MIN = 30
+
+MTF_ENABLED = True
+SESSION_ADJUST_ENABLED = True
+
 OHLCV_CACHE_SECONDS = 90
 CONFLICT_WINDOW_SEC = 300
 
@@ -80,17 +94,18 @@ RANGE_BREAKOUT_COOLDOWN_MIN = 60
 SYMBOL_DELAY_MS = 200
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
-# 🆕 إعدادات التقرير الصباحي
 MORNING_REPORT_ENABLED = True
 MORNING_REPORT_HOUR_SYRIA = 10
 MORNING_REPORT_TF = "1h"
-MORNING_REPORT_LIMIT = 200   # شمعة للتحليل
-SWING_LOOKBACK = 3           # جيران لكل جهة
-SWING_MAX_COUNT = 4          # عدد القمم/القيعان المعروضة
+MORNING_REPORT_LIMIT = 200
+SWING_LOOKBACK = 3
+SWING_MAX_COUNT = 4
 
-# 🆕 تتبّع الإشارات
-SIGNAL_TRACK_MAX_MIN = 90    # مدة التتبع الأقصى
+SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
+
+# 🆕 الحد الأدنى لـ SL% حسب الإطار
+MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -98,10 +113,8 @@ SIGNAL_TRACK_INTERVAL_MIN = 2
 # ═══════════════════════════════════════════════════════════
 def _normalize_symbol_from_var(name):
     name = name.strip().upper()
-    if "/" in name:
-        return name
-    if name.endswith("_USDT"):
-        name = name[:-5]
+    if "/" in name: return name
+    if name.endswith("_USDT"): name = name[:-5]
     if ":" in name:
         return name if "/" in name else name.replace("_", "/", 1)
     return f"{name}/USDT:USDT"
@@ -111,8 +124,7 @@ def _detect_manual_ranges():
     env = dict(os.environ)
     out = {}
     for key, upper_val in env.items():
-        if not key.upper().endswith("_UPPER"):
-            continue
+        if not key.upper().endswith("_UPPER"): continue
         coin_part = key[:-6]
         lower_key = f"{coin_part}_LOWER"
         lower_val = env.get(lower_key)
@@ -128,7 +140,7 @@ def _detect_manual_ranges():
         except Exception as e:
             log.warning(f"⚠️ تحويل {key}: {e}"); continue
         if upper <= lower:
-            log.warning(f"⚠️ نطاق غير صالح {coin_part}: {lower} >= {upper}"); continue
+            log.warning(f"⚠️ نطاق غير صالح {coin_part}"); continue
         sym = _normalize_symbol_from_var(coin_part)
         out[sym] = {"lower": lower, "upper": upper}
         log.info(f"📌 {sym}: [{lower} – {upper}]")
@@ -156,8 +168,7 @@ class MultiExchange:
         self._init_all()
 
     def _make(self, name):
-        if name == "binance" or name not in _EXCHANGE_CLASSES:
-            return None
+        if name == "binance" or name not in _EXCHANGE_CLASSES: return None
         try:
             opts = {"enableRateLimit": True, "timeout": 60000,
                     "options": {"defaultType": MARKET_TYPE, "fetchOHLCV": {"maxLimit": 200}}}
@@ -214,7 +225,7 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) محرك التشدد الذكي (مع تتبّع نتائج فعلي)
+# 4) محرك التشدد الذكي (مُعاد هيكلته)
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -225,50 +236,66 @@ STATIC_PROFILES = {
                  "block_against_htf": True, "score_15m_override": 75},
 }
 
-# 🆕 ملفات تعريف لكل إطار
+# 🆕 5m أصبح 1.20
 TF_PROFILES = {
-    "5m":  {"score_mult": 1.10, "vol_mult": 1.20, "atr_max": 0.50, "min_hold_min": 5},
+    "5m":  {"score_mult": 1.20, "vol_mult": 1.25, "atr_max": 0.50, "min_hold_min": 5},
     "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 15},
     "1h":  {"score_mult": 0.90, "vol_mult": 0.80, "atr_max": 1.50, "min_hold_min": 60},
 }
 
+SESSIONS = [
+    (0, 6,  "🌏 آسيا (هادئة)",   +8),
+    (6, 10, "🌅 آسيا/أوروبا",     +2),
+    (10, 13, "🇪🇺 أوروبا",        0),
+    (13, 16, "🔥 ذروة",           -5),
+    (16, 21, "🇺🇸 أمريكا",        0),
+    (21, 24, "🌙 الهدوء الليلي",  +5),
+]
+
 
 class SmartStrictness:
+    """محرك تشدد يتعلّم من نتائج فعلية"""
     def __init__(self):
-        self.history = deque(maxlen=200)          # فحوص الفلتر
-        self.results = deque(maxlen=200)          # 🆕 نتائج الإشارات الفعلية
+        self.history = deque(maxlen=200)
+        self.results = deque(maxlen=200)
+        # 🆕 إحصائيات لكل مصدر
+        self.source_stats = defaultdict(lambda: {"wins": 0, "losses": 0,
+                                                  "sent": 0, "filtered": 0})
         self._lock = threading.Lock()
         self._cached_profile = None
         self._cached_ts = 0.0
         self._cache_ttl = 120.0
 
-    def record(self, passed, score):
-        with self._lock: self.history.append((passed, score, _time.time()))
+    def record(self, passed, score, source="unknown"):
+        with self._lock:
+            self.history.append((passed, score, _time.time(), source))
+            if passed:
+                self.source_stats[source]["sent"] += 1
+            else:
+                self.source_stats[source]["filtered"] += 1
 
-    def record_result(self, result, direction):
-        """🆕 تسجيل نتيجة إشارة حقيقية"""
+    def record_result(self, result, direction, source="unknown"):
         win = result.startswith("win")
         with self._lock:
             self.results.append({"win": win, "result": result,
-                                 "direction": direction, "ts": _time.time()})
+                                 "direction": direction, "ts": _time.time(),
+                                 "source": source})
+            if win:
+                self.source_stats[source]["wins"] += 1
+            else:
+                self.source_stats[source]["losses"] += 1
 
     def _feedback(self):
-        # أولوية للنتائج الفعلية
         with self._lock:
             results = list(self.results)[-50:]
             recent = list(self.history)[-50:]
-        
         if len(results) >= 15:
             wins = sum(1 for r in results if r["win"])
-            ratio = wins / len(results)
-            n = len(results)
-            source = "live"
+            ratio = wins / len(results); n = len(results)
         else:
             n = len(recent)
             if n < 20: return 0, None, 0
-            ratio = sum(1 for p, _, _ in recent if p) / n
-            source = "filter"
-        
+            ratio = sum(1 for p, _, _, _ in recent if p) / n
         if ratio > 0.65:   d = +10
         elif ratio > 0.50: d = +5
         elif ratio < 0.25: d = -18
@@ -301,8 +328,8 @@ class SmartStrictness:
                 "vwap_slope_pct": round(0.02 + final / 1000, 3),
                 "block_against_htf": final >= 55,
                 "score_15m_override": min(90, final + 10),
-                "_debug": {"base": base, "adx_delta": adx_delta, "fb_delta": fb_delta,
-                           "pass_ratio": pass_ratio, "sample_n": sample_n}}
+                "_debug": {"base": base, "adx_delta": adx_delta,
+                           "fb_delta": fb_delta, "pass_ratio": pass_ratio}}
         self._cached_profile = prof
         self._cached_ts = now
         return prof
@@ -312,18 +339,30 @@ class SmartStrictness:
             n = len(self.results)
             if n == 0: return {"n": 0, "wr": 0, "wins": 0, "losses": 0}
             wins = sum(1 for r in self.results if r["win"])
-            losses = n - wins
-        return {"n": n, "wr": round(wins/n*100, 1), "wins": wins, "losses": losses}
+        return {"n": n, "wr": round(wins/n*100, 1), "wins": wins, "losses": n - wins}
+
+    def source_report(self):
+        with self._lock:
+            return dict(self.source_stats)
 
     def reset_feedback(self):
         with self._lock:
             self.history.clear()
             self.results.clear()
+            self.source_stats.clear()
         self._cached_profile = None
         self._cached_ts = 0.0
 
 
 _smart = SmartStrictness()
+
+
+def get_session_info():
+    h = datetime.now(timezone.utc).hour
+    for start, end, name, delta in SESSIONS:
+        if start <= h < end:
+            return delta, name
+    return 0, "❓"
 
 
 def get_thresholds(atr_pct=None, adx=None, tf="15m"):
@@ -332,14 +371,16 @@ def get_thresholds(atr_pct=None, adx=None, tf="15m"):
     else:
         prof = dict(STATIC_PROFILES.get(STRICTNESS, STATIC_PROFILES["balanced"]))
         prof["_debug"] = {"mode": STRICTNESS}
-    
-    # 🆕 تعديل حسب الإطار الزمني
     tf_p = TF_PROFILES.get(tf, TF_PROFILES["15m"])
     prof["min_score"] = prof["min_score"] * tf_p["score_mult"]
     prof["min_vol_ratio"] = prof["min_vol_ratio"] * tf_p["vol_mult"]
     prof["max_atr_pct"] = tf_p["atr_max"]
     prof["_tf"] = tf
-    
+    if SESSION_ADJUST_ENABLED:
+        sd, sn = get_session_info()
+        prof["min_score"] += sd
+        prof["_session"] = sn
+        prof["_session_delta"] = sd
     prof.update(STRICTNESS_OVERRIDE)
     return prof
 
@@ -362,9 +403,7 @@ def syria_now_str():
 def syria_from_ts(ts_ms, with_time=True):
     try:
         dt = datetime.fromtimestamp(ts_ms / 1000, tz=SYRIA_TZ)
-        if with_time:
-            return dt.strftime("%Y-%m-%d %H:%M")
-        return dt.strftime("%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d %H:%M") if with_time else dt.strftime("%Y-%m-%d")
     except Exception:
         return "?"
 
@@ -419,92 +458,113 @@ def calc_macd(s, f=12, sl=26, sig=9):
     return dif, dea, dif - dea
 
 
-def calc_vwap(df):
-    tp = (df["h"] + df["l"] + df["c"]) / 3
-    return (tp * df["v"]).cumsum() / df["v"].cumsum()
+def calc_vwap_session(df, session="day"):
+    """🆕 VWAP من بداية الجلسة (day/week)"""
+    if df.empty: return df["c"]
+    try:
+        ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        if session == "day":
+            skey = ts.dt.floor("D")
+        elif session == "week":
+            skey = ts.dt.to_period("W").astype(str)
+        else:
+            skey = ts.dt.floor("H")
+        tp = (df["h"] + df["l"] + df["c"]) / 3
+        pv = tp * df["v"]
+        cum_pv = pv.groupby(skey).cumsum()
+        cum_v = df["v"].groupby(skey).cumsum()
+        return cum_pv / cum_v.replace(0, 1e-9)
+    except Exception:
+        tp = (df["h"] + df["l"] + df["c"]) / 3
+        return (tp * df["v"]).cumsum() / df["v"].cumsum()
+
+
+def calc_bollinger(df, period=20, std_mult=2):
+    close = df["c"]
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    upper = ma + std_mult * sd
+    lower = ma - std_mult * sd
+    width = (upper - lower) / ma * 100
+    return {"ma": ma, "upper": upper, "lower": lower, "width": width}
 
 
 # ═══════════════════════════════════════════════════════════
-# 6b) 🆕 الدعم/المقاومة + القمم والقيعان
+# 6b) S/R + Swing Levels
 # ═══════════════════════════════════════════════════════════
 def find_swing_levels(df, lookback=SWING_LOOKBACK, max_count=SWING_MAX_COUNT):
-    """يكشف القمم والقيعان السابقة (Swing Highs/Lows)"""
     if len(df) < lookback * 2 + 2:
         return {"highs": [], "lows": []}
-    
     highs, lows = [], []
     end = len(df) - lookback - 1
-    
     for i in range(lookback, end):
-        h = float(df["h"].iloc[i])
-        l = float(df["l"].iloc[i])
-        ts = int(df["ts"].iloc[i])
-        
+        h = float(df["h"].iloc[i]); l = float(df["l"].iloc[i]); ts = int(df["ts"].iloc[i])
         nh = [float(df["h"].iloc[i+j]) for j in range(-lookback, lookback+1) if j != 0]
         nl = [float(df["l"].iloc[i+j]) for j in range(-lookback, lookback+1) if j != 0]
-        
-        if all(h > x for x in nh):
-            highs.append((h, ts))
-        if all(l < x for x in nl):
-            lows.append((l, ts))
-    
+        if all(h > x for x in nh): highs.append((h, ts))
+        if all(l < x for x in nl): lows.append((l, ts))
     highs.sort(key=lambda x: x[1], reverse=True)
     lows.sort(key=lambda x: x[1], reverse=True)
     return {"highs": highs[:max_count], "lows": lows[:max_count]}
 
 
 def calc_pivots_classic(df):
-    """Pivot Points الكلاسيكية من آخر شمعة مكتملة"""
     if len(df) < 2: return None
     last = df.iloc[-2]
     h, l, c = float(last["h"]), float(last["l"]), float(last["c"])
     pivot = (h + l + c) / 3
-    return {
-        "pivot": pivot,
-        "r1": 2*pivot - l,
-        "r2": pivot + (h - l),
-        "r3": h + 2*(pivot - l),
-        "s1": 2*pivot - h,
-        "s2": pivot - (h - l),
-        "s3": l - 2*(h - pivot),
-        "h": h, "l": l, "c": c,
-    }
+    return {"pivot": pivot, "r1": 2*pivot - l, "r2": pivot + (h - l),
+            "r3": h + 2*(pivot - l), "s1": 2*pivot - h,
+            "s2": pivot - (h - l), "s3": l - 2*(h - pivot),
+            "h": h, "l": l, "c": c}
 
 
 def classify_market(df, curr_idx=-2):
-    """🆕 تصنيف حالة السوق"""
     if len(df) < 60: return "UNKNOWN"
     try:
         adx = float(calc_adx(df).iloc[curr_idx])
         close = df["c"]
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        bb_w = float(((ma20 + 2*std20) - (ma20 - 2*std20)).iloc[curr_idx]
-                     / ma20.iloc[curr_idx] * 100)
+        bb = calc_bollinger(df)
+        bb_w = float(bb["width"].iloc[curr_idx])
         e50 = calc_ema(close, 50)
         e50_slope = (float(e50.iloc[curr_idx]) - float(e50.iloc[curr_idx-5])) \
                     / float(e50.iloc[curr_idx-5]) * 100
         atr = float(calc_atr(df).iloc[curr_idx])
         price = float(close.iloc[curr_idx])
         atr_pct = (atr / price) * 100 if price else 0
-        
         if adx > 25 and abs(e50_slope) > 0.15:
             return "TREND_UP" if e50_slope > 0 else "TREND_DOWN"
-        if bb_w < 2.0 and adx < 18:
-            return "RANGE"
-        if atr_pct > 1.2:
-            return "VOLATILE"
+        if bb_w < 2.0 and adx < 18: return "RANGE"
+        if atr_pct > 1.2: return "VOLATILE"
         return "RANGE" if adx < 20 else ("TREND_UP" if e50_slope > 0 else "TREND_DOWN")
     except Exception:
         return "UNKNOWN"
 
 
-def compute_levels(df, direction, curr_idx=-2):
-    """🆕 حساب SL/TP/Entry لكل إشارة"""
+async def classify_market_safe(symbol, tf, df):
+    """🆕 يستخدم الإطار الحالي، وإن لم يكفِ يستخدم 15m"""
+    if df is not None and len(df) >= 60:
+        m = classify_market(df)
+        if m != "UNKNOWN": return m
+    # fallback: نجلب 15m
+    try:
+        data = await fetch_ohlcv_cached(symbol, "15m", 80)
+        if data and len(data) >= 60:
+            df2 = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+            return classify_market(df2)
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
+def compute_levels(df, direction, curr_idx=-2, tf="15m"):
+    """🆕 مع فرض حد أدنى للـ SL حسب الإطار"""
     try:
         price = float(df["c"].iloc[curr_idx])
         atr = float(calc_atr(df).iloc[curr_idx])
         ema_slow = float(calc_ema(df["c"], EMA_SLOW).iloc[curr_idx])
+        
+        min_sl_pct = MIN_SL_PCT.get(tf, 0.50)
         
         lookback = min(20, len(df) + curr_idx - 1)
         if lookback < 2: return None
@@ -515,22 +575,26 @@ def compute_levels(df, direction, curr_idx=-2):
             sl_atr = price - atr * 1.5
             sl_struct = min(recent_low, ema_slow) * 0.998
             stop_loss = max(sl_atr, sl_struct)
+            # 🆕 فرض الحد الأدنى
+            min_dist = price * (min_sl_pct / 100)
+            if (price - stop_loss) < min_dist:
+                stop_loss = price - min_dist
             risk = price - stop_loss
-            tp1 = price + risk
-            tp2 = price + risk * 2
-            tp3 = price + risk * 3
+            tp1, tp2, tp3 = price + risk, price + risk*2, price + risk*3
         else:
             sl_atr = price + atr * 1.5
             sl_struct = max(recent_high, ema_slow) * 1.002
             stop_loss = min(sl_atr, sl_struct)
+            min_dist = price * (min_sl_pct / 100)
+            if (stop_loss - price) < min_dist:
+                stop_loss = price + min_dist
             risk = stop_loss - price
-            tp1 = price - risk
-            tp2 = price - risk * 2
-            tp3 = price - risk * 3
+            tp1, tp2, tp3 = price - risk, price - risk*2, price - risk*3
         
         risk_pct = abs(price - stop_loss) / price * 100 if price else 0
-        if risk_pct < 0.15 or risk_pct > 5.0:
-            return None  # SL غير منطقي
+        # قبول النطاق المعقول
+        if risk_pct < min_sl_pct * 0.9 or risk_pct > 6.0:
+            return None
         
         return {"entry": price, "stop_loss": stop_loss, "sl_pct": round(risk_pct, 2),
                 "tp1": tp1, "tp2": tp2, "tp3": tp3, "atr": atr}
@@ -548,14 +612,19 @@ _price_state = {}
 _recent_signals = {}
 _last_range = {}
 _last_6pct_report = {}
-_pending_signals = {}  # 🆕 تتبّع الإشارات
+_pending_signals = {}
+_divergence_cache = {}
+_bb_cache = {}
+_sr_cache = {}
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0, "filtered_adx": 0,
     "filtered_atr": 0, "filtered_htf": 0, "filtered_vwap": 0,
     "filtered_conflict": 0, "filtered_range": 0, "filtered_mtf": 0,
+    "filtered_session": 0, "filtered_other": 0,
     "range_breakouts": 0, "range_approaches": 0,
     "range_6pct_reports": 0, "morning_reports": 0, "signals_tracked": 0,
+    "signals_divergence": 0, "signals_bb": 0, "signals_sr": 0,
 }
 
 
@@ -578,10 +647,13 @@ def clear_caches():
     _ohlcv_cache.clear()
     _crossover_cache.clear()
     _recent_signals.clear()
+    _divergence_cache.clear()
+    _bb_cache.clear()
+    _sr_cache.clear()
 
 
 # ═══════════════════════════════════════════════════════════
-# 9) HTF / VWAP / Conflict
+# 9) HTF / VWAP / Conflict / MTF
 # ═══════════════════════════════════════════════════════════
 async def get_htf_trend(symbol):
     if not HTF_ENABLED: return "NEUTRAL"
@@ -596,10 +668,32 @@ async def get_htf_trend(symbol):
     return "NEUTRAL"
 
 
-def check_vwap_slope(df, direction, thresholds):
+async def get_mtf_alignment(symbol, direction):
+    if not MTF_ENABLED: return 0, "—"
+    score = 0
+    for tf in ["5m", "15m", "1h"]:
+        try:
+            data = await fetch_ohlcv_cached(symbol, tf, 60)
+            if not data or len(data) < 30: continue
+            df = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+            ef = float(calc_ema(df["c"], EMA_FAST).iloc[-2])
+            es = float(calc_ema(df["c"], EMA_SLOW).iloc[-2])
+            if direction == "bullish" and ef > es: score += 1
+            elif direction == "bearish" and ef < es: score += 1
+        except Exception:
+            continue
+    if score >= 3:   return +8, "توافق كامل (3/3) 🌟"
+    if score == 2:   return +3, "توافق جزئي (2/3) ✅"
+    if score == 1:   return -5, "توافق ضعيف (1/3) ⚠️"
+    return -15, "تعارض كامل (0/3) ❌"
+
+
+def check_vwap_slope(df, direction, thresholds, tf="15m"):
+    """🆕 VWAP بنظام الجلسة"""
     min_pct = thresholds.get("vwap_slope_pct", 0.05)
     if len(df) < VWAP_SLOPE_LOOKBACK + 1: return True, 0.0
-    vwap = calc_vwap(df)
+    session = "week" if tf == "1h" else "day"
+    vwap = calc_vwap_session(df, session)
     v_now = float(vwap.iloc[-1]); v_prev = float(vwap.iloc[-VWAP_SLOPE_LOOKBACK - 1])
     if v_prev == 0: return True, 0.0
     slope = (v_now - v_prev) / v_prev * 100
@@ -621,55 +715,47 @@ def record_signal(symbol, direction):
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) حساب الـ Score
+# 10) حساب Score
 # ═══════════════════════════════════════════════════════════
 def compute_score(df, direction, curr_idx=-2):
     close = df["c"]; vol = df["v"]
     price = float(close.iloc[curr_idx])
-
     try:
         s = max(0, len(df) + curr_idx - 20); e = len(df) + curr_idx
         vma = float(vol.iloc[s:e].mean())
         vr = float(vol.iloc[curr_idx]) / vma if vma > 0 else 0
     except Exception: vr = 0
     v_pts = 30 if vr >= 4 else 25 if vr >= 2.5 else 18 if vr >= 1.5 else 10 if vr >= 1 else 5 if vr >= 0.5 else 0
-
     try: adx = float(calc_adx(df).iloc[curr_idx])
     except Exception: adx = 0
     a_pts = 18 if adx >= 50 else 20 if adx >= 35 else 18 if adx >= 25 else 12 if adx >= 20 else 5 if adx >= 15 else 0
-
     try:
         ef = float(calc_ema(close, EMA_FAST).iloc[curr_idx])
         es = float(calc_ema(close, EMA_SLOW).iloc[curr_idx])
         gap = abs(ef - es) / es * 100 if es else 0
     except Exception: gap = 0
     g_pts = 12 if gap >= 0.6 else 15 if gap >= 0.3 else 10 if gap >= 0.1 else 6 if gap >= 0.05 else 3 if gap >= 0.02 else 0
-
     try:
         _, _, hist = calc_macd(close)
         hn = float(hist.iloc[curr_idx]); hp = float(hist.iloc[curr_idx - 1])
         rising = hn > hp
         m_pts = 10 if (hn > 0 and rising) else 5 if hn > 0 else 7 if (hn < 0 and rising) else 5
     except Exception: m_pts = 0
-
     try: rsi = float(calc_rsi(close).iloc[curr_idx])
     except Exception: rsi = 50
     if direction == "bullish":
         r_pts = 10 if 55 <= rsi <= 70 else 5 if rsi > 70 else 7 if rsi >= 45 else 3 if rsi >= 30 else 0
     else:
         r_pts = 10 if 30 <= rsi <= 45 else 5 if rsi < 30 else 7 if rsi <= 55 else 3 if rsi <= 70 else 0
-
     try: e50 = float(calc_ema(close, 50).iloc[curr_idx])
     except Exception: e50 = price
     above = price > e50
     h_pts = 10 if (direction == "bullish" and above) or (direction == "bearish" and not above) else 0
-
     try:
         atr = float(calc_atr(df).iloc[curr_idx])
         atr_pct = (atr / price) * 100 if price > 0 else 0
     except Exception: atr_pct = 0
     t_pts = 5 if atr_pct >= 0.30 else 3 if atr_pct >= 0.15 else 1
-
     total = v_pts + a_pts + g_pts + m_pts + r_pts + h_pts + t_pts
     grade = ("🌟 ذهبية" if total >= 80 else "⭐ قوية" if total >= 65 else
              "✅ جيدة" if total >= 55 else "🟡 متوسطة" if total >= 45 else "⚪ ضعيفة")
@@ -682,7 +768,7 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) الفلتر (مع تصنيف السوق)
+# 11) الفلتر
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
@@ -693,13 +779,23 @@ async def passes_filter(cross, htf_trend=None):
     min_score = th["min_score"]
     if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
 
-    # 🆕 تصنيف السوق
     df = cross.get("_df")
-    market = classify_market(df) if df is not None else "UNKNOWN"
-    cross["market"] = market
-    
+    # 🆕 السوق محسوب مسبقاً في _make_cross
+    market = cross.get("market") or "UNKNOWN"
+    if market == "UNKNOWN":
+        market = await classify_market_safe(cross["symbol"], tf, df)
+        cross["market"] = market
+
+    # MTF alignment
+    mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], cross["direction"])
+    cross["mtf"] = mtf_desc
+    score += mtf_bonus
+    s["score"] = score
+
     passed, reason, cat = True, "", ""
-    
+    if mtf_bonus <= -15:
+        return False, mtf_desc, "mtf"
+
     if score < min_score:
         passed, reason, cat = False, f"Score {score} < {min_score:.0f}", "score"
     elif vol < th["min_vol_ratio"]:
@@ -708,7 +804,8 @@ async def passes_filter(cross, htf_trend=None):
         passed, reason, cat = False, f"ADX {adx} < {th['min_adx']}", "adx"
     elif atr > th["max_atr_pct"]:
         passed, reason, cat = False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
-    elif market == "RANGE" and cross.get("alert_type") == "confirmed":
+    elif market == "RANGE" and cross.get("source") == "ema" \
+         and cross.get("alert_type") == "confirmed":
         passed, reason, cat = False, "سوق عرضي — تقاطع وهمي", "range"
     elif th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
         d = cross["direction"]
@@ -718,23 +815,43 @@ async def passes_filter(cross, htf_trend=None):
             passed, reason, cat = False, "HTF=UP ضد SHORT", "htf"
 
     if passed and df is not None:
-        ok, slope = check_vwap_slope(df, cross["direction"], th)
+        ok, slope = check_vwap_slope(df, cross["direction"], th, tf=tf)
         if not ok: passed, reason, cat = False, f"VWAP {slope:+.2f}% ضد", "vwap"
     if passed and cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], cross["direction"]):
             passed, reason, cat = False, "تعارض", "conflict"
     if STRICTNESS == "auto":
-        _smart.record(passed, score)
+        _smart.record(passed, score, source=cross.get("source", "unknown"))
     return passed, reason, cat
 
 
 # ═══════════════════════════════════════════════════════════
-# 12) كواشف الإشارات (مع SL/TP)
+# 12) كواشف الإشارات — EMA
 # ═══════════════════════════════════════════════════════════
 async def _df_for(symbol, tf, extra=60):
     data = await fetch_ohlcv_cached(symbol, tf, EMA_SLOW + extra)
     if not data or len(data) < EMA_SLOW + 5: return None
     return pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
+
+
+async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
+                     source="ema", extra=None):
+    """🆕 مع market محسوب مسبقاً + tf لـ compute_levels"""
+    cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+    cts = int(df["ts"].iloc[curr])
+    levels = compute_levels(df, direction, curr, tf=tf)
+    market = await classify_market_safe(symbol, tf, df)
+    out = {"symbol": symbol, "timeframe": tf, "direction": direction,
+           "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
+           "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
+           "gap_pct": round(abs(cf - cs) / cs * 100, 3) if cs else 0,
+           "strength": strength, "alert_type": alert_type,
+           "support": compute_score(df, direction, curr),
+           "_df": df, "exchange": _exchange.primary_name,
+           "levels": levels, "source": source,
+           "market": market}
+    if extra: out.update(extra)
+    return out
 
 
 async def detect_crossover(symbol, tf):
@@ -752,17 +869,7 @@ async def detect_crossover(symbol, tf):
     last = _crossover_cache.get(key)
     if last and last.get("candle_ts") == cts and last.get("direction") == d: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": d}
-    
-    # 🆕 حساب SL/TP
-    levels = compute_levels(df, d, curr)
-    
-    return {"symbol": symbol, "timeframe": tf, "direction": d,
-            "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
-            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
-            "gap_pct": round(abs(cf - cs) / cs * 100, 3), "strength": "✅ مؤكد",
-            "alert_type": "confirmed", "support": compute_score(df, d, curr),
-            "_df": df, "exchange": _exchange.primary_name,
-            "levels": levels}
+    return await _make_cross(symbol, tf, df, d, "confirmed", "✅ مؤكد", curr)
 
 
 async def detect_live_crossover(symbol, tf):
@@ -780,14 +887,7 @@ async def detect_live_crossover(symbol, tf):
     last = _crossover_cache.get(key)
     if last and last.get("candle_ts") == cts: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": d}
-    levels = compute_levels(df, d, curr)
-    return {"symbol": symbol, "timeframe": tf, "direction": d,
-            "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
-            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
-            "gap_pct": round(abs(cf - cs) / cs * 100, 3), "strength": "⚡ مبدئي",
-            "alert_type": "live", "support": compute_score(df, d, curr),
-            "_df": df, "exchange": _exchange.primary_name,
-            "levels": levels}
+    return await _make_cross(symbol, tf, df, d, "live", "⚡ مبدئي", curr)
 
 
 _TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "1d": 86_400_000}
@@ -795,7 +895,8 @@ _TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "1d": 86
 
 async def detect_pre_crossover(symbol, tf):
     if not ENABLE_PRE_CROSS: return None
-    df = await _df_for(symbol, tf, extra=10)
+    # 🆕 extra=60 بدل 10 — للحصول على بيانات كافية
+    df = await _df_for(symbol, tf, extra=60)
     if df is None: return None
     df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
     curr = -2
@@ -817,14 +918,110 @@ async def detect_pre_crossover(symbol, tf):
         tf_ms = _TF_MS.get(tf, 900_000)
         if cts - last.get("candle_ts", 0) < tf_ms * PRE_CROSS_COOLDOWN: return None
     _crossover_cache[key] = {"candle_ts": cts, "direction": d}
-    levels = compute_levels(df, d, curr)
-    return {"symbol": symbol, "timeframe": tf, "direction": d,
-            "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
-            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
-            "gap_pct": round(gap, 3), "strength": "🔔 تقارب وشيك",
-            "alert_type": "pre", "support": compute_score(df, d, curr),
-            "_df": df, "exchange": _exchange.primary_name,
-            "levels": levels}
+    return await _make_cross(symbol, tf, df, d, "pre", "🔔 تقارب وشيك", curr)
+
+
+# ═══════════════════════════════════════════════════════════
+# 12b) RSI Divergence
+# ═══════════════════════════════════════════════════════════
+async def detect_rsi_divergence(symbol, tf):
+    if not ENABLE_RSI_DIVERGENCE: return None
+    df = await _df_for(symbol, tf, extra=RSI_DIV_LOOKBACK + 10)
+    if df is None or len(df) < RSI_DIV_LOOKBACK + 5: return None
+    rsi = calc_rsi(df["c"]); close = df["c"]
+    curr = -2
+    key = (symbol, tf, "div")
+    last = _divergence_cache.get(key)
+    if last and (_time.time() - last) < RSI_DIV_COOLDOWN_MIN * 60: return None
+    win = RSI_DIV_LOOKBACK; best = None
+    for i in range(3, win // 2):
+        for j in range(i + 3, win):
+            idx1 = curr - i; idx2 = curr - j
+            if idx1 >= 0 or idx2 >= 0: continue
+            c1 = float(close.iloc[idx1]); c2 = float(close.iloc[idx2])
+            r1 = float(rsi.iloc[idx1]);   r2 = float(rsi.iloc[idx2])
+            if c2 < c1 and r2 > r1 and r1 < 40:
+                s = (r2 - r1) / max(1, 40 - r1)
+                if not best or s > best["strength"]:
+                    best = {"dir": "bullish", "strength": s,
+                            "idx1": idx1, "idx2": idx2, "r1": r1, "r2": r2}
+            if c2 > c1 and r2 < r1 and r1 > 60:
+                s = (r1 - r2) / max(1, r1 - 60)
+                if not best or s > best["strength"]:
+                    best = {"dir": "bearish", "strength": s,
+                            "idx1": idx1, "idx2": idx2, "r1": r1, "r2": r2}
+    if not best or best["strength"] < 0.15: return None
+    d = best["dir"]
+    df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+    _divergence_cache[key] = _time.time()
+    _filter_stats["signals_divergence"] += 1
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🔄 دايفرجنس RSI", curr,
+                              source="rsi_div")
+    cross["div_info"] = {"r1": round(best["r1"], 1), "r2": round(best["r2"], 1),
+                         "ts1": int(df["ts"].iloc[best["idx1"]]),
+                         "ts2": int(df["ts"].iloc[best["idx2"]])}
+    return cross
+
+
+# ═══════════════════════════════════════════════════════════
+# 12c) BB Squeeze
+# ═══════════════════════════════════════════════════════════
+async def detect_bb_squeeze_breakout(symbol, tf):
+    if not ENABLE_BB_SQUEEZE: return None
+    df = await _df_for(symbol, tf, extra=80)
+    if df is None or len(df) < 60: return None
+    bb = calc_bollinger(df)
+    curr = -2
+    key = (symbol, tf, "bb")
+    last = _bb_cache.get(key)
+    if last and (_time.time() - last) < BB_SQUEEZE_COOLDOWN_MIN * 60: return None
+    hist_width = bb["width"].iloc[curr-50:curr].dropna()
+    if len(hist_width) < 20: return None
+    if float(bb["width"].iloc[curr]) > hist_width.quantile(BB_SQUEEZE_PCTL): return None
+    price = float(df["c"].iloc[curr])
+    up = float(bb["upper"].iloc[curr]); lo = float(bb["lower"].iloc[curr])
+    d = None
+    if price > up:   d = "bullish"
+    elif price < lo: d = "bearish"
+    if not d: return None
+    df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+    _bb_cache[key] = _time.time()
+    _filter_stats["signals_bb"] += 1
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "💥 كسر BB Squeeze", curr,
+                              source="bb_squeeze")
+    cross["bb_info"] = {"width": round(float(bb["width"].iloc[curr]), 2),
+                        "upper": up, "lower": lo}
+    return cross
+
+
+# ═══════════════════════════════════════════════════════════
+# 12d) S/R Breakout
+# ═══════════════════════════════════════════════════════════
+async def detect_sr_breakout(symbol, tf):
+    if not ENABLE_SR_BREAKOUT: return None
+    df = await _df_for(symbol, tf, extra=SR_BREAKOUT_LOOKBACK + 10)
+    if df is None or len(df) < SR_BREAKOUT_LOOKBACK + 5: return None
+    curr = -2
+    key = (symbol, tf, "sr")
+    last = _sr_cache.get(key)
+    if last and (_time.time() - last) < SR_BREAKOUT_COOLDOWN_MIN * 60: return None
+    window = df.iloc[curr - SR_BREAKOUT_LOOKBACK:curr]
+    high = float(window["h"].max()); low = float(window["l"].min())
+    close_prev = float(window["c"].iloc[-1])
+    pivot = (high + low + close_prev) / 3
+    r1 = 2*pivot - low; s1 = 2*pivot - high
+    price_now = float(df["c"].iloc[curr]); price_prev = float(df["c"].iloc[curr - 1])
+    d = None; level = None
+    if price_now > r1 and price_prev <= r1: d, level = "bullish", r1
+    elif price_now < s1 and price_prev >= s1: d, level = "bearish", s1
+    if not d: return None
+    df["ef"] = calc_ema(df["c"], EMA_FAST); df["es"] = calc_ema(df["c"], EMA_SLOW)
+    _sr_cache[key] = _time.time()
+    _filter_stats["signals_sr"] += 1
+    cross = await _make_cross(symbol, tf, df, d, "confirmed", "🎯 كسر S/R", curr,
+                              source="sr_breakout")
+    cross["sr_info"] = {"level": level, "r1": r1, "s1": s1, "pivot": pivot}
+    return cross
 
 
 # ═══════════════════════════════════════════════════════════
@@ -857,7 +1054,7 @@ async def detect_sudden_change(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 14) تخزين النطاقات اليدوية
+# 14) تخزين النطاقات
 # ═══════════════════════════════════════════════════════════
 def _store_range(symbol, lower, upper, source="manual"):
     _last_range[symbol] = {
@@ -893,16 +1090,11 @@ async def compute_6pct_ranges():
     for symbol in ALL_SYMBOLS:
         try:
             price = await _get_current_price(symbol)
-            if price <= 0:
-                log.warning(f"⚠️ لا سعر لـ {symbol}")
-                continue
-            lower = price * (1 - half)
-            upper = price * (1 + half)
-            width = upper - lower
+            if price <= 0: continue
+            lower = price * (1 - half); upper = price * (1 + half)
             r = {"symbol": symbol, "price": price, "lower": lower, "upper": upper,
-                 "width": width, "pct": RANGE_PCT, "ts": _time.time()}
-            results.append(r)
-            _last_6pct_report[symbol] = r
+                 "width": upper - lower, "pct": RANGE_PCT, "ts": _time.time()}
+            results.append(r); _last_6pct_report[symbol] = r
             _filter_stats["range_6pct_reports"] += 1
         except Exception as e:
             log.exception(f"compute_6pct {symbol}: {e}")
@@ -916,114 +1108,78 @@ def build_6pct_report(results, title="📊 نطاقات 6% المرجعية"):
     header = (
         f"{title}\n"
         f"🇸🇾 {syria_now_str()}\n"
-        f"📐 النسبة: <b>{RANGE_PCT}%</b> (السعر ± {RANGE_PCT/2}%)\n"
+        f"📐 النسبة: <b>{RANGE_PCT}%</b>\n"
         f"🔌 المصدر: <b>{_exchange.primary_name}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-    )
+        f"━━━━━━━━━━━━━━━━━━━\n")
     body = ""
     env_block = "\n<b>📋 انسخ إلى Render → Environment:</b>\n<code>"
     for r in results:
         body += (
             f"\n🔹 <b>{short(r['symbol'])}</b>\n"
-            f"   💰 السعر الحالي: <b>{fmt_price(r['price'])}</b>\n"
-            f"   📉 الأدنى ({RANGE_PCT/2}%-): <b>{fmt_price(r['lower'])}</b>\n"
-            f"   📈 الأعلى ({RANGE_PCT/2}%+): <b>{fmt_price(r['upper'])}</b>\n"
-            f"   📏 العرض: {fmt_price(r['width'])}\n"
-        )
+            f"   💰 السعر: <b>{fmt_price(r['price'])}</b>\n"
+            f"   📉 الأدنى: <b>{fmt_price(r['lower'])}</b>\n"
+            f"   📈 الأعلى: <b>{fmt_price(r['upper'])}</b>\n")
         sym_up = short(r["symbol"])
         env_block += f"{sym_up}_LOWER={r['lower']:.6f}\n{sym_up}_UPPER={r['upper']:.6f}\n"
     env_block += "</code>\n"
-    footer = (
-        f"\n━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ التقرير القادم: بعد {RANGE_REPORT_INTERVAL_HOURS} ساعات\n"
-        f"💡 <i>هذه القيم للمرجع فقط — النطاقات المُراقَبة حالياً هي ما وضعته في Render.</i>"
-    )
-    return header + body + env_block + footer
+    return header + body + env_block
 
 
 # ═══════════════════════════════════════════════════════════
-# 15b) 🌅 تقرير الصباح — الدعم والمقاومة
+# 15b) 🌅 تقرير الصباح
 # ═══════════════════════════════════════════════════════════
 async def collect_sr_data(symbol):
-    """يجمع بيانات الدعم/المقاومة لعملة واحدة"""
     try:
         data = await fetch_ohlcv_cached(symbol, MORNING_REPORT_TF, MORNING_REPORT_LIMIT)
-        if not data or len(data) < 60:
-            return None
+        if not data or len(data) < 60: return None
         df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
         price = float(df["c"].iloc[-2])
-        
-        pivots = calc_pivots_classic(df)
-        swings = find_swing_levels(df)
-        
-        return {
-            "symbol": symbol,
-            "price": price,
-            "pivots": pivots,
-            "highs": swings["highs"],
-            "lows": swings["lows"],
-            "tf": MORNING_REPORT_TF,
-        }
+        return {"symbol": symbol, "price": price,
+                "pivots": calc_pivots_classic(df),
+                "highs": find_swing_levels(df)["highs"],
+                "lows": find_swing_levels(df)["lows"],
+                "tf": MORNING_REPORT_TF}
     except Exception as e:
         log.exception(f"collect_sr_data {symbol}: {e}")
         return None
 
 
 def build_morning_report(items, title=None):
-    """يبني رسالة الصباح"""
-    if not title:
-        title = "🌅 تقرير الصباح — الدعم والمقاومة"
-    
+    if not title: title = "🌅 تقرير الصباح — الدعم والمقاومة"
     if not items:
         return f"{title}\n🇸🇾 {syria_now_str()}\n📭 لا بيانات."
-    
-    out = [
-        f"{title}",
-        f"🇸🇾 <b>{syria_now_str()}</b>",
-        f"📊 الإطار: <b>{MORNING_REPORT_TF}</b> | 🔌 {_exchange.primary_name}",
-        "",
-    ]
-    
+    out = [f"{title}", f"🇸🇾 <b>{syria_now_str()}</b>",
+           f"📊 الإطار: <b>{MORNING_REPORT_TF}</b> | 🔌 {_exchange.primary_name}", ""]
     for it in items:
         if not it: continue
-        sym = short(it["symbol"])
-        price = it["price"]
-        p = it["pivots"]
-        
-        block = [f"━━━━━━━━━━━━━━━━━━━", f"🔹 <b>{sym}</b>", f"💰 السعر: <b>{fmt_price(price)}</b>"]
-        
+        sym = short(it["symbol"]); price = it["price"]; p = it["pivots"]
+        block = [f"━━━━━━━━━━━━━━━━━━━", f"🔹 <b>{sym}</b>",
+                 f"💰 السعر: <b>{fmt_price(price)}</b>"]
         if p:
-            block.append("")
-            block.append("📊 <b>Pivot Points:</b>")
-            block.append(f"   <b>R3</b>: {fmt_price(p['r3'])}")
-            block.append(f"   <b>R2</b>: {fmt_price(p['r2'])}")
-            block.append(f"   <b>R1</b>: {fmt_price(p['r1'])}")
-            block.append(f"   ⚪ <b>Pivot</b>: {fmt_price(p['pivot'])}")
-            block.append(f"   <b>S1</b>: {fmt_price(p['s1'])}")
-            block.append(f"   <b>S2</b>: {fmt_price(p['s2'])}")
-            block.append(f"   <b>S3</b>: {fmt_price(p['s3'])}")
-        
+            block += ["", "📊 <b>Pivot Points:</b>",
+                     f"   <b>R3</b>: {fmt_price(p['r3'])}",
+                     f"   <b>R2</b>: {fmt_price(p['r2'])}",
+                     f"   <b>R1</b>: {fmt_price(p['r1'])}",
+                     f"   ⚪ <b>Pivot</b>: {fmt_price(p['pivot'])}",
+                     f"   <b>S1</b>: {fmt_price(p['s1'])}",
+                     f"   <b>S2</b>: {fmt_price(p['s2'])}",
+                     f"   <b>S3</b>: {fmt_price(p['s3'])}"]
         if it["highs"]:
-            block.append("")
-            block.append("📈 <b>القمم السابقة:</b>")
+            block += ["", "📈 <b>القمم السابقة:</b>"]
             for h, ts in it["highs"]:
                 block.append(f"   • {fmt_price(h)} — <i>{syria_from_ts(ts)}</i>")
-        
         if it["lows"]:
-            block.append("")
-            block.append("📉 <b>القيعان السابقة:</b>")
+            block += ["", "📉 <b>القيعان السابقة:</b>"]
             for l, ts in it["lows"]:
                 block.append(f"   • {fmt_price(l)} — <i>{syria_from_ts(ts)}</i>")
-        
         out.append("\n".join(block))
-    
     out.append("━━━━━━━━━━━━━━━━━━━")
     out.append("💡 <i>استخدم /sr لعرضه عند الطلب</i>")
     return "\n".join(out)
 
 
 # ═══════════════════════════════════════════════════════════
-# 16) مراقبة النطاق اليدوي
+# 16) مراقبة النطاق
 # ═══════════════════════════════════════════════════════════
 async def check_range_breakout(symbol):
     if not RANGE_BREAKOUT_ENABLED: return None
@@ -1034,10 +1190,8 @@ async def check_range_breakout(symbol):
     now = _time.time()
     cooldown = RANGE_BREAKOUT_COOLDOWN_MIN * 60
     width = r["upper"] - r["lower"]
-
     if r["lower"] <= price <= r["upper"]:
         r["state"] = "inside"; return None
-
     if price > r["upper"]:
         if r["state"] == "above" or now - r["last_alert_at"] < cooldown: return None
         r["state"] = "above"; r["last_alert_at"] = now
@@ -1046,7 +1200,6 @@ async def check_range_breakout(symbol):
                 "width": width, "deviation_pct": ((price - r["upper"]) / width) * 100,
                 "age_min": int((now - r["computed_at"]) / 60),
                 "source": r.get("source", "manual")}
-
     if price < r["lower"]:
         if r["state"] == "below" or now - r["last_alert_at"] < cooldown: return None
         r["state"] = "below"; r["last_alert_at"] = now
@@ -1066,39 +1219,28 @@ async def check_range_approach(symbol):
     if price <= 0: return None
     width = r["upper"] - r["lower"]
     if width <= 0: return None
-
     position_pct = ((price - r["lower"]) / width) * 100
-    dist_up = 100 - position_pct
-    dist_down = position_pct
-
-    if dist_up <= RANGE_APPROACH_PCT:
-        side, dist = "upper", dist_up
-    elif dist_down <= RANGE_APPROACH_PCT:
-        side, dist = "lower", dist_down
+    dist_up = 100 - position_pct; dist_down = position_pct
+    if dist_up <= RANGE_APPROACH_PCT: side, dist = "upper", dist_up
+    elif dist_down <= RANGE_APPROACH_PCT: side, dist = "lower", dist_down
     else:
         r["last_near_side"] = None; return None
-
     now = _time.time()
     cooldown = RANGE_APPROACH_COOLDOWN_MIN * 60
     if r["last_near_side"] == side and now - r["last_approach_alert_at"] < cooldown:
         return None
     r["last_near_side"] = side; r["last_approach_alert_at"] = now
-
     mid = (r["lower"] + r["upper"]) / 2
     shift = price - mid
     shift_pct = (shift / mid) * 100 if mid else 0
     width_ratio = width / price if price > 0 else 0
-
     if width_ratio > 0.40:
         new_width = price * 0.08
-        sug_lower = price - new_width / 2
-        sug_upper = price + new_width / 2
-        stype, snote = "rebuild", f"⚠️ العرض ضخم ({width_ratio*100:.1f}% من السعر)"
+        sug_lower = price - new_width / 2; sug_upper = price + new_width / 2
+        stype, snote = "rebuild", f"⚠️ العرض ضخم ({width_ratio*100:.1f}%)"
     else:
-        sug_lower = price - width / 2
-        sug_upper = price + width / 2
-        stype, snote = "shift", "إزاحة النطاق (بنفس العرض)"
-
+        sug_lower = price - width / 2; sug_upper = price + width / 2
+        stype, snote = "shift", "إزاحة النطاق"
     return {"symbol": symbol, "side": side, "price": price,
             "lower": r["lower"], "upper": r["upper"], "width": width,
             "position_pct": round(position_pct, 1), "distance_pct": round(dist, 1),
@@ -1111,48 +1253,47 @@ async def check_range_approach(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 17) رسائل النطاق اليدوي
+# 17) رسائل النطاق
 # ═══════════════════════════════════════════════════════════
 def build_breakout_msg(b):
     up = b["direction"] == "above"
-    emoji = "🚨" if up else "🔻"
-    title = "خروج صعودي" if up else "خروج هبوطي"
-    arrow = "⬆️" if up else "⬇️"
     return (
-        f"{emoji} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
+        f"{'🚨' if up else '🔻'} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{title}</b>\n"
-        f"{arrow} السعر: <b>{fmt_price(b['price'])}</b>\n"
+        f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(b['price'])}</b>\n"
         f"🎯 الحد المخترق: <b>{fmt_price(b['boundary'])}</b>\n"
-        f"📏 المسافة: <b>{b['deviation_pct']:.2f}%</b> من العرض\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• النطاق: <b>{fmt_price(b['lower'])} – {fmt_price(b['upper'])}</b>\n"
-        f"• العرض: {fmt_price(b['width'])} | عمر: {b['age_min']} د"
+        f"📏 المسافة: <b>{b['deviation_pct']:.2f}%</b>\n"
+        f"• النطاق: {fmt_price(b['lower'])} – {fmt_price(b['upper'])}\n"
+        f"• عمر: {b['age_min']} د"
     )
 
 
 def build_approach_msg(a):
     up = a["side"] == "upper"
-    emoji = "⚠️" if up else "🔔"
-    title = "اقتراب من الحد الأعلى 🔺" if up else "اقتراب من الحد الأدنى 🔻"
-    arrow = "⬆️" if up else "⬇️"
     return (
-        f"{emoji} <b>اقتراب — {short(a['symbol'])}</b>\n"
+        f"{'⚠️' if up else '🔔'} <b>اقتراب — {short(a['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{title}</b>\n"
-        f"{arrow} السعر: <b>{fmt_price(a['price'])}</b>\n"
+        f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(a['price'])}</b>\n"
         f"📏 المسافة: <b>{a['distance_pct']}%</b> | الموضع: {a['position_pct']}%\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
         f"📍 النطاق: {fmt_price(a['lower'])} – {fmt_price(a['upper'])}\n"
         f"💡 الاقتراح: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>"
     )
 
 
 # ═══════════════════════════════════════════════════════════
-# 18) رسائل الإشارات (مع SL/TP)
+# 18) رسائل الإشارات
 # ═══════════════════════════════════════════════════════════
+def _source_label(src):
+    return {
+        "ema": "📈 تقاطع EMA",
+        "rsi_div": "🔄 دايفرجنس RSI",
+        "bb_squeeze": "💥 BB Squeeze",
+        "sr_breakout": "🎯 كسر S/R",
+    }.get(src, "—")
+
+
 def build_signal_message(cross):
     sym = cross["symbol"]; tf = cross["timeframe"]
     bull = cross["direction"] == "bullish"
@@ -1161,6 +1302,8 @@ def build_signal_message(cross):
     score = s.get("score", 0); grade = s.get("grade", "?")
     market = cross.get("market", "?")
     levels = cross.get("levels")
+    source = cross.get("source", "ema")
+    mtf = cross.get("mtf", "—")
 
     if at == "pre":
         emoji, title = "🔔", "تقارب وشيك"
@@ -1171,22 +1314,37 @@ def build_signal_message(cross):
         type_lbl = "⚡ <b>مبدئي</b>"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
     else:
-        emoji, title = ("🚀" if bull else "🔻"), "تقاطع مؤكد"
+        emoji, title = ("🚀" if bull else "🔻"), "إشارة مؤكدة"
         type_lbl = "✅ <b>مؤكد</b>"
         dir_lbl = "🟢 صاعد" if bull else "🔴 هابط"
     
-    market_lbl = {
-        "TREND_UP": "📈 ترند صاعد", "TREND_DOWN": "📉 ترند هابط",
-        "RANGE": "↔️ عرضي", "VOLATILE": "🌊 متقلب", "UNKNOWN": "❓",
-    }.get(market, market)
+    market_lbl = {"TREND_UP": "📈 ترند صاعد", "TREND_DOWN": "📉 ترند هابط",
+                  "RANGE": "↔️ عرضي", "VOLATILE": "🌊 متقلب",
+                  "UNKNOWN": "❓"}.get(market, market)
 
     msg = (
         f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{type_lbl}\n"
+        f"{type_lbl} | {_source_label(source)}\n"
         f"📊 <b>{dir_lbl}</b>\n"
         f"🏛️ السوق: <b>{market_lbl}</b>\n"
+        f"🔗 MTF: <b>{mtf}</b>\n"
+    )
+    if source == "rsi_div" and cross.get("div_info"):
+        di = cross["div_info"]
+        msg += (
+            f"🔄 الدايفرجنس: RSI <b>{di['r1']}</b> → <b>{di['r2']}</b>\n"
+            f"   • من: {syria_from_ts(di['ts1'])}\n"
+            f"   • إلى: {syria_from_ts(di['ts2'])}\n")
+    elif source == "bb_squeeze" and cross.get("bb_info"):
+        bi = cross["bb_info"]
+        msg += f"💥 عرض BB: <b>{bi['width']}%</b> (أدنى 20%)\n"
+    elif source == "sr_breakout" and cross.get("sr_info"):
+        si = cross["sr_info"]
+        msg += f"🎯 المستوى المكسور: <b>{fmt_price(si['level'])}</b>\n"
+    
+    msg += (
         f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
         f"🎯 <b>العلامة: {score}/100 {grade}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1195,7 +1353,6 @@ def build_signal_message(cross):
         f"• RSI: {s.get('rsi','?')} ({s.get('rsi_pts',0)}/10)\n"
         f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n"
     )
-    
     if levels:
         msg += (
             f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1206,7 +1363,6 @@ def build_signal_message(cross):
             f"• هدف 2 (1:2): {fmt_price(levels['tp2'])}\n"
             f"• هدف 3 (1:3): {fmt_price(levels['tp3'])}\n"
         )
-    
     msg += (
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"• السعر: {fmt_price(cross['price'])}\n"
@@ -1217,13 +1373,9 @@ def build_signal_message(cross):
 
 def build_price_alert_msg(a):
     up = a["direction"] == "up"
-    emoji = "🚀" if up else "🔻"
-    title = "ارتفاع مفاجئ 🟢" if up else "انخفاض مفاجئ 🔴"
     return (
-        f"{emoji} <b>تغير مفاجئ — {short(a['symbol'])}</b>\n"
+        f"{'🚀' if up else '🔻'} <b>تغير مفاجئ — {short(a['symbol'])}</b>\n"
         f"🇸🇾 <b>{syria_now_str()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>{title}</b>\n"
         f"📈 التغير: <b>{a['change_pct']}%</b>\n"
         f"🔔 التنبيه: {a['alert_count']} من {a['max_alerts']}\n"
         f"• الحالي: {fmt_price(a['current_price'])}\n"
@@ -1238,27 +1390,21 @@ def build_ranges_report():
     now = _time.time()
     for sym, r in _last_range.items():
         age = int((now - r["computed_at"]) / 60)
-        state_icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
-        width = r["upper"] - r["lower"]
+        icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
         lines.append(
-            f"{state_icon} <b>{short(sym)}</b>\n"
-            f"   الأدنى: <b>{fmt_price(r['lower'])}</b>\n"
-            f"   الأعلى: <b>{fmt_price(r['upper'])}</b>\n"
-            f"   العرض: {fmt_price(width)} | عمر: {age} د\n"
-        )
+            f"{icon} <b>{short(sym)}</b>\n"
+            f"   الأدنى: {fmt_price(r['lower'])} | الأعلى: {fmt_price(r['upper'])}\n"
+            f"   عمر: {age} د\n")
     lines.append(
-        f"\n🎯 تحذير الاقتراب: {RANGE_APPROACH_PCT}%\n"
-        f"📊 تقرير 6%: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات\n"
-        f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00"
-    )
+        f"\n🎯 اقتراب: {RANGE_APPROACH_PCT}% | 6%: كل {RANGE_REPORT_INTERVAL_HOURS}h\n"
+        f"🌅 تقرير الصباح: {MORNING_REPORT_HOUR_SYRIA}:00")
     return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
-# 18b) 🆕 تتبّع الإشارات
+# 18b) تتبّع الإشارات
 # ═══════════════════════════════════════════════════════════
 def register_signal_for_tracking(cross):
-    """تسجيل إشارة لمتابعة نتيجتها"""
     levels = cross.get("levels")
     if not levels: return
     sid = f"{cross['symbol']}_{cross['timeframe']}_{int(_time.time())}"
@@ -1266,31 +1412,27 @@ def register_signal_for_tracking(cross):
         "cross": cross, "levels": levels,
         "entry_price": levels["entry"], "entry_ts": _time.time(),
         "direction": cross["direction"],
+        "source": cross.get("source", "ema"),
         "checked": False, "result": None,
     }
     _filter_stats["signals_tracked"] += 1
 
 
 async def evaluate_pending_signals():
-    """يفحص نتائج الإشارات النشطة"""
     if not _pending_signals: return
     now = _time.time()
-    
     for sid, sig in list(_pending_signals.items()):
         if sig["checked"]: continue
         age_min = (now - sig["entry_ts"]) / 60
-        
         if age_min > SIGNAL_TRACK_MAX_MIN:
             sig["checked"] = True; sig["result"] = "expired"
-            _smart.record_result("expired", sig["direction"])
+            _smart.record_result("expired", sig["direction"], sig.get("source", "unknown"))
             continue
-        
         try:
             data, _ = await _exchange.fetch_ohlcv(sig["cross"]["symbol"], "1m", 3)
             if not data: continue
             price = float(data[-1][4])
             lv = sig["levels"]
-            
             if sig["direction"] == "bullish":
                 if price <= lv["stop_loss"]:
                     sig["checked"] = True; sig["result"] = "loss_sl"
@@ -1309,14 +1451,12 @@ async def evaluate_pending_signals():
                     sig["result"] = "win_tp2"
                 elif price <= lv["tp1"] and not sig["result"]:
                     sig["result"] = "win_tp1"
-            
             if sig["checked"]:
-                _smart.record_result(sig["result"], sig["direction"])
-                log.info(f"🎯 نتيجة إشارة {sid}: {sig['result']}")
+                _smart.record_result(sig["result"], sig["direction"],
+                                     sig.get("source", "unknown"))
+                log.info(f"🎯 نتيجة {sid}: {sig['result']}")
         except Exception as e:
             log.warning(f"track {sid}: {e}")
-    
-    # تنظيف
     cutoff = now - 3600
     for sid in [k for k, v in _pending_signals.items()
                 if v.get("checked") and v.get("entry_ts", 0) < cutoff]:
@@ -1328,28 +1468,27 @@ async def evaluate_pending_signals():
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update, context):
     th = get_thresholds(tf="15m")
+    session_delta, session_name = get_session_info()
     ranges_txt = "\n".join(
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
-        for s, r in _last_range.items()
-    ) or "  (لا نطاقات)"
+        for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.0</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.2</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
+        f"🕐 الجلسة: <b>{session_name}</b> ({session_delta:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🎯 التشدد:</b> {STRICTNESS.upper()}\n"
-        f"• Score ≥ {th['min_score']:.0f}\n"
-        f"• Vol ≥ {th['min_vol_ratio']}×\n"
-        f"• ADX ≥ {th['min_adx']}\n\n"
+        f"<b>🎯 الكواشف:</b>\n"
+        f"• EMA {'✅' if ENABLE_CONFIRMED else '❌'} | "
+        f"RSI Div {'✅' if ENABLE_RSI_DIVERGENCE else '❌'} | "
+        f"BB {'✅' if ENABLE_BB_SQUEEZE else '❌'} | "
+        f"S/R {'✅' if ENABLE_SR_BREAKOUT else '❌'}\n"
+        f"• Multi-TF: {'✅' if MTF_ENABLED else '❌'}\n\n"
         f"<b>الأوامر:</b>\n"
-        f"/sr — 🌅 تقرير الدعم والمقاومة\n"
-        f"/ref6 — تقرير 6% فوري\n"
-        f"/ranges /checkranges /refresh\n"
-        f"/cross /cross5 /cross15 /cross1h\n"
-        f"/checkprice /status /strict /stats\n"
-        f"/jobs /clearcache",
-        parse_mode="HTML",
-    )
+        f"/sr /ref6 /ranges /checkranges /refresh\n"
+        f"/cross /cross5 /cross15 /cross1h /checkprice\n"
+        f"/status /stats /perf /jobs /strict /clearcache",
+        parse_mode="HTML")
 
 
 async def _run_cross(update, tfs=None):
@@ -1358,16 +1497,16 @@ async def _run_cross(update, tfs=None):
     tfs = tfs or TIMEFRAMES
     await update.message.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
     clear_caches()
-    detectors = []
-    if ENABLE_PRE_CROSS:  detectors.append(detect_pre_crossover)
-    if ENABLE_LIVE_CROSS: detectors.append(detect_live_crossover)
-    if ENABLE_CONFIRMED:  detectors.append(detect_crossover)
-
+    detectors = _get_detectors()
     found = filtered = 0
     for sym in ALL_SYMBOLS:
         for tf in tfs:
-            for k in [(sym, tf), (sym, tf, "pre"), (sym, tf, "live")]:
+            for k in [(sym, tf), (sym, tf, "pre"), (sym, tf, "live"),
+                      (sym, tf, "div"), (sym, tf, "bb"), (sym, tf, "sr")]:
                 _crossover_cache.pop(k, None)
+            _divergence_cache.pop((sym, tf, "div"), None)
+            _bb_cache.pop((sym, tf, "bb"), None)
+            _sr_cache.pop((sym, tf, "sr"), None)
             for det in detectors:
                 cross = await det(sym, tf)
                 if not cross: continue
@@ -1386,6 +1525,17 @@ async def _run_cross(update, tfs=None):
     if found == 0 and filtered == 0:
         msg = f"⚪ لا إشارات على {', '.join(tfs)}"
     await update.message.reply_text(msg)
+
+
+def _get_detectors():
+    dets = []
+    if ENABLE_PRE_CROSS:  dets.append(detect_pre_crossover)
+    if ENABLE_LIVE_CROSS: dets.append(detect_live_crossover)
+    if ENABLE_CONFIRMED:  dets.append(detect_crossover)
+    if ENABLE_RSI_DIVERGENCE: dets.append(detect_rsi_divergence)
+    if ENABLE_BB_SQUEEZE:     dets.append(detect_bb_squeeze_breakout)
+    if ENABLE_SR_BREAKOUT:    dets.append(detect_sr_breakout)
+    return dets
 
 
 async def cmd_cross(u, c):   await _run_cross(u)
@@ -1432,26 +1582,22 @@ async def cmd_ref6(update, context):
     if not results:
         await update.message.reply_text("⚪ لا بيانات."); return
     await update.message.reply_text(
-        build_6pct_report(results, "📊 تقرير 6% (عند الطلب)"), parse_mode="HTML")
+        build_6pct_report(results, "📊 تقرير 6%"), parse_mode="HTML")
 
 
 async def cmd_sr(update, context):
-    """🌅 تقرير الدعم والمقاومة عند الطلب"""
     if not _exchange.ok():
         await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text(
-        f"🔍 جمع بيانات {MORNING_REPORT_TF} ...")
+    await update.message.reply_text(f"🔍 جمع بيانات {MORNING_REPORT_TF} ...")
     items = []
     for sym in ALL_SYMBOLS:
         it = await collect_sr_data(sym)
         if it: items.append(it)
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if not items:
-        await update.message.reply_text("⚪ لا بيانات.")
-        return
+        await update.message.reply_text("⚪ لا بيانات."); return
     await update.message.reply_text(
-        build_morning_report(items, "🌅 تقرير الدعم والمقاومة (عند الطلب)"),
-        parse_mode="HTML")
+        build_morning_report(items, "🌅 تقرير الدعم والمقاومة"), parse_mode="HTML")
 
 
 async def cmd_checkranges(update, context):
@@ -1477,36 +1623,34 @@ async def cmd_status(update, context):
     total = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
     jq = context.application.job_queue
     jobs_n = len(jq.jobs()) if jq else 0
+    sd, sn = get_session_info()
     st = _smart.stats()
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.0</b>\n"
+        f"🤖 <b>الحالة v6.2</b>\n"
         f"🔌 {_exchange.primary_name}\n"
-        f"🎯 STRICTNESS: <b>{STRICTNESS}</b>\n"
+        f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
-        f"🚨 خروج نطاق: <b>{_filter_stats['range_breakouts']}</b>\n"
-        f"⚠️ اقتراب: <b>{_filter_stats['range_approaches']}</b>\n"
-        f"📊 تقارير 6%: <b>{_filter_stats['range_6pct_reports']}</b>\n"
-        f"🌅 تقارير صباح: <b>{_filter_stats['morning_reports']}</b>\n"
-        f"📝 إشارات مُتتبّعة: <b>{_filter_stats['signals_tracked']}</b>\n"
+        f"🔄 دايفرجنس: {_filter_stats['signals_divergence']}\n"
+        f"💥 BB: {_filter_stats['signals_bb']}\n"
+        f"🎯 S/R: {_filter_stats['signals_sr']}\n"
+        f"🚨 خروج: {_filter_stats['range_breakouts']}\n"
+        f"⚠️ اقتراب: {_filter_stats['range_approaches']}\n"
+        f"🌅 صباح: {_filter_stats['morning_reports']}\n"
         f"🚫 محجوبة: {total}\n"
+        f"📈 WR: {st['wr']}% ({st['n']})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💾 كاش: {len(_ohlcv_cache)}\n"
         f"📌 نطاقات: {len(_last_range)}\n"
-        f"⏳ إشارات نشطة: {len([s for s in _pending_signals.values() if not s['checked']])}",
-        parse_mode="HTML",
-    )
+        f"⏳ نشطة: {len([s for s in _pending_signals.values() if not s['checked']])}",
+        parse_mode="HTML")
 
 
 async def cmd_stats(update, context):
-    """🆕 إحصائيات الأداء"""
     st = _smart.stats()
     if st["n"] == 0:
         await update.message.reply_text(
-            "📊 <b>لا نتائج بعد</b>\n"
-            "سيبدأ التتبّع بعد أول إشارة تُرسل.",
-            parse_mode="HTML")
+            "📊 <b>لا نتائج بعد</b>\nسيبدأ بعد أول إشارة تُرسل.", parse_mode="HTML")
         return
     bar = "█" * int(st["wr"] / 5) + "░" * (20 - int(st["wr"] / 5))
     await update.message.reply_text(
@@ -1514,25 +1658,38 @@ async def cmd_stats(update, context):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📈 معدل النجاح: <b>{st['wr']}%</b>\n"
         f"<code>{bar}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ فوز: <b>{st['wins']}</b>\n"
-        f"❌ خسارة: <b>{st['losses']}</b>\n"
-        f"📝 المجموع: {st['n']}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 <i>يُستخدم لضبط التشدد تلقائياً</i>",
-        parse_mode="HTML",
-    )
+        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']}\n"
+        f"📝 المجموع: {st['n']}",
+        parse_mode="HTML")
+
+
+async def cmd_perf(update, context):
+    """🆕 أداء كل مصدر على حدة"""
+    rep = _smart.source_report()
+    if not rep:
+        await update.message.reply_text("📊 لا بيانات بعد.")
+        return
+    lines = ["📊 <b>أداء المصادر</b>\n━━━━━━━━━━━━━━━━━━━"]
+    for src, d in rep.items():
+        wr = 0
+        total_res = d["wins"] + d["losses"]
+        if total_res > 0:
+            wr = round(d["wins"] / total_res * 100, 1)
+        name = _source_label(src) if src != "unknown" else "—"
+        lines.append(
+            f"\n🔹 <b>{name}</b>\n"
+            f"   📤 مُرسلة: {d['sent']} | 🚫 محجوبة: {d['filtered']}\n"
+            f"   ✅ {d['wins']} | ❌ {d['losses']} → <b>{wr}%</b>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_jobs(update, context):
     jq = context.application.job_queue
     if jq is None:
-        await update.message.reply_text("❌ job_queue غير متوفر.")
-        return
+        await update.message.reply_text("❌ job_queue غير متوفر."); return
     jobs = jq.jobs()
     if not jobs:
-        await update.message.reply_text("⚠️ لا مهام مسجّلة.")
-        return
+        await update.message.reply_text("⚠️ لا مهام مسجّلة."); return
     lines = [f"⚙️ <b>Jobs ({len(jobs)}):</b>\n"]
     for j in jobs:
         nxt = getattr(j, "next_t", None)
@@ -1543,14 +1700,16 @@ async def cmd_jobs(update, context):
 
 async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
+    sd, sn = get_session_info()
     await update.message.reply_text(
         f"🎯 <b>التشدد:</b> {STRICTNESS.upper()}\n"
+        f"🕐 {sn} ({sd:+d})\n"
         f"• Score ≥ {th['min_score']:.0f}\n"
         f"• Vol ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
-        f"• ATR ≤ {th['max_atr_pct']}%",
-        parse_mode="HTML",
-    )
+        f"• ATR ≤ {th['max_atr_pct']}%\n"
+        f"• SL 5m: {MIN_SL_PCT['5m']}% | 15m: {MIN_SL_PCT['15m']}% | 1h: {MIN_SL_PCT['1h']}%",
+        parse_mode="HTML")
 
 
 async def cmd_clearcache(update, context):
@@ -1571,11 +1730,7 @@ async def error_handler(update, context):
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context):
     if not _exchange.ok(): return
-    detectors = []
-    if ENABLE_PRE_CROSS:  detectors.append(detect_pre_crossover)
-    if ENABLE_LIVE_CROSS: detectors.append(detect_live_crossover)
-    if ENABLE_CONFIRMED:  detectors.append(detect_crossover)
-
+    detectors = _get_detectors()
     total = 0
     for sym in ALL_SYMBOLS:
         for tf in TIMEFRAMES:
@@ -1608,7 +1763,6 @@ async def crossover_job(context):
 
 
 async def signal_tracker_job(context):
-    """🆕 متابعة نتائج الإشارات"""
     if not _exchange.ok(): return
     try:
         await evaluate_pending_signals()
@@ -1645,8 +1799,7 @@ async def range_monitor_job(context):
                 await context.bot.send_message(
                     chat_id=CHAT_ID, text=build_breakout_msg(b), parse_mode="HTML")
                 _filter_stats["range_breakouts"] += 1
-                total += 1
-                continue
+                total += 1; continue
             a = await check_range_approach(symbol)
             if a and CHAT_ID:
                 await context.bot.send_message(
@@ -1674,7 +1827,6 @@ async def six_pct_report_job(context):
 
 
 async def morning_report_job(context):
-    """🌅 تقرير الصباح اليومي 10:00 صباحاً بتوقيت سوريا"""
     if not _exchange.ok() or not CHAT_ID: return
     log.info("🌅 بدء التقرير الصباحي ...")
     try:
@@ -1683,15 +1835,10 @@ async def morning_report_job(context):
             it = await collect_sr_data(sym)
             if it: items.append(it)
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-        
         if not items:
-            log.warning("⚠️ التقرير الصباحي: لا بيانات")
-            return
-        
+            log.warning("⚠️ لا بيانات صباح"); return
         await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=build_morning_report(items),
-            parse_mode="HTML")
+            chat_id=CHAT_ID, text=build_morning_report(items), parse_mode="HTML")
         _filter_stats["morning_reports"] += 1
         log.info(f"📤 التقرير الصباحي ({len(items)})")
     except Exception as e:
@@ -1706,7 +1853,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.0")
+        self.wfile.write(b"OK - Unified Smart Bot v6.2")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -1728,10 +1875,14 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
 
     n = _load_manual_ranges()
+    sd, sn = get_session_info()
     print(f"📌 {n} نطاق يدوي")
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 رموز: {ALL_SYMBOLS}")
-    print(f"📊 تقرير 6%: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات")
+    print(f"🕐 الجلسة: {sn} ({sd:+d})")
+    print(f"🔍 الكواشف: EMA + RSI Div + BB + S/R")
+    print(f"📏 الحد الأدنى SL: 5m={MIN_SL_PCT['5m']}% | "
+          f"15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
     print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00 (سوريا)")
 
     from telegram.request import HTTPXRequest
@@ -1744,8 +1895,7 @@ def main():
     if app.job_queue is None:
         raise RuntimeError(
             "❌ job_queue غير متوفر!\n"
-            "   الحل: pip install 'python-telegram-bot[job-queue]'"
-        )
+            "   الحل: pip install 'python-telegram-bot[job-queue]'")
     print("✅ job_queue متوفر")
 
     # Handlers
@@ -1759,9 +1909,10 @@ def main():
     app.add_handler(CommandHandler("checkranges", cmd_checkranges))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("ref6", cmd_ref6))
-    app.add_handler(CommandHandler("sr", cmd_sr))        # 🆕
+    app.add_handler(CommandHandler("sr", cmd_sr))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("stats", cmd_stats))  # 🆕
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("perf", cmd_perf))    # 🆕
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
@@ -1772,7 +1923,7 @@ def main():
         crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
     app.job_queue.run_repeating(
         signal_tracker_job, interval=SIGNAL_TRACK_INTERVAL_MIN * 60,
-        first=60, name="tracker")  # 🆕
+        first=60, name="tracker")
     app.job_queue.run_repeating(
         price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price")
     app.job_queue.run_repeating(
@@ -1791,12 +1942,11 @@ def main():
     )
     print(f"📊 تقرير 6% دوري: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات")
 
-    # 🌅 تقرير الصباح — يومياً 10:00 صباحاً بتوقيت سوريا
     if MORNING_REPORT_ENABLED:
         morning_time = dt_time(hour=MORNING_REPORT_HOUR_SYRIA, minute=0, tzinfo=SYRIA_TZ)
         app.job_queue.run_daily(
             morning_report_job, time=morning_time, name="morning_report")
-        print(f"🌅 التقرير الصباحي مُسجّل: يومياً "
+        print(f"🌅 التقرير الصباحي: يومياً "
               f"{MORNING_REPORT_HOUR_SYRIA}:00 (Asia/Damascus)")
 
     print("✅ جاهز — بدء polling")
