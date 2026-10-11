@@ -1,15 +1,19 @@
 """
-Unified Smart Trading Bot v7.1 — Binance USDT-M Futures Auto-Trader
+Unified Smart Trading Bot v7.2 — Binance USDT-M Futures Auto-Trader
 ====================================================================
+FIXED v7.2:
+  ✅ Watchdog: accepts ANY STOP_MARKET as SL (fixed -4130 loop)
+  ✅ _place_sl: ignores -4130 (SL already exists)
+  ✅ _bump_fail: threshold 3 → 5 (less aggressive emergency close)
+  ✅ /pause & /resume: rich feedback + status details
 FIXED v7.1:
-  ✅ fetch_open_orders per-symbol (تجنب IP ban من Binance)
+  ✅ fetch_open_orders per-symbol (avoid IP ban)
   ✅ IP ban detection + graceful handling
   ✅ Startup delay 30s + inter-symbol delay 1.5s
-  ✅ Reconcile بدون fetch_open_orders(بدون symbol)
-  ✅ Watchdog per-symbol + تأخير بين الرموز
+  ✅ Reconcile without fetch_open_orders(no symbol)
 Strategy  : EMA cross + RSI div + BB squeeze + S/R breakout
 Execution : Binance USDT-M Futures | 40x ISOLATED | $400 notional
-Limits    : Max 5 positions | SL إلزامي | Daily loss limit
+Limits    : Max 5 positions | mandatory SL | Daily loss limit
 """
 import os, sys, json, hmac, hashlib, asyncio, logging, threading, time as _time
 import random
@@ -97,7 +101,7 @@ MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 SIGNAL_TRACK_MAX_MIN = 90
 LAST_SIGNALS_MAX = 20
 
-# 🆕 Rate limit safety
+# Rate limit safety
 STARTUP_DELAY_SEC       = int(os.getenv("STARTUP_DELAY_SEC", "30"))
 INTER_SYMBOL_DELAY_SEC  = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "1.5"))
 WATCHDOG_INTERVAL_SEC   = int(os.getenv("WATCHDOG_INTERVAL_SEC", "180"))
@@ -380,7 +384,7 @@ def get_thresholds(atr_pct=None, adx=None, tf="15m"):
     return prof
 
 # ═══════════════════════════════════════════════════════════
-# 6) BinanceExecutor — FIXED v7.1
+# 6) BinanceExecutor — FIXED v7.2
 # ═══════════════════════════════════════════════════════════
 class BinanceExecutor:
     def __init__(self):
@@ -392,7 +396,7 @@ class BinanceExecutor:
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
-                "warnOnFetchOpenOrdersWithoutSymbol": False,   # ✅ يكتم التحذير
+                "warnOnFetchOpenOrdersWithoutSymbol": False,
                 "recvWindow": 10000,
             },
         }
@@ -416,7 +420,6 @@ class BinanceExecutor:
             except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as e:
                 last_err = e
                 err_str = str(e)
-                # 🆕 IP ban detection
                 if "418" in err_str or "-1003" in err_str or "banned" in err_str.lower():
                     log.error(f"🚫 IP BANNED → {method_name}")
                     log.error(f"   الانتظار 5 دقائق قبل المحاولة التالية")
@@ -443,7 +446,6 @@ class BinanceExecutor:
         return await self._call("fetch_positions", symbols)
 
     async def fetch_open_orders(self, symbol=None):
-        # ✅ دائماً مع symbol
         return await self._call("fetch_open_orders", symbol)
 
     async def set_leverage(self, symbol, lev):
@@ -670,7 +672,7 @@ class WebSocketManager:
             self._listen_key = None
 
 # ═══════════════════════════════════════════════════════════
-# 8) PositionManager — FIXED v7.1
+# 8) PositionManager — FIXED v7.2
 # ═══════════════════════════════════════════════════════════
 class PositionManager:
     def __init__(self, executor: BinanceExecutor, bot_getter):
@@ -751,7 +753,6 @@ class PositionManager:
         except Exception as e:
             log.error(f"❌ entry order {sym}: {e}"); return None
 
-        # wait for fill
         filled_qty = 0.0; avg_price = 0.0
         for _ in range(8):
             try:
@@ -795,7 +796,6 @@ class PositionManager:
 
         await asyncio.sleep(0.5)
 
-        # SL إلزامي
         sl_ok = await self._place_sl(sym, pos, sl, tag="sl")
         if not sl_ok:
             log.error(f"❌ SL فشل لـ {sym} → إغلاق فوري")
@@ -814,6 +814,7 @@ class PositionManager:
         return pos
 
     async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
+        """✅ v7.2: يتجاهل -4130 (SL موجود مسبقاً)"""
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         try:
             o = await self.executor.create_order(
@@ -826,6 +827,12 @@ class PositionManager:
             pos["sl_last_verified"] = _time.time()
             return True
         except Exception as e:
+            err_str = str(e)
+            # ✅ v7.2: تجاهل إذا SL موجود مسبقاً (خطأ -4130)
+            if "-4130" in err_str or "closePosition in the direction is existing" in err_str:
+                log.warning(f"⚠️ SL موجود مسبقاً لـ {symbol} — تخطي")
+                pos["sl_last_verified"] = _time.time()
+                return True
             log.error(f"SL {symbol}: {e}")
             return False
 
@@ -879,7 +886,6 @@ class PositionManager:
             await self.close_position(s, reason)
             await asyncio.sleep(0.5)
 
-    # ---------- EVENT HANDLERS ----------
     async def on_order_update(self, o: dict):
         ws_sym = o.get("s")
         if not ws_sym: return
@@ -906,7 +912,7 @@ class PositionManager:
 
     async def _after_tp1(self, symbol, pos):
         if not BREAKEVEN_AFTER_TP1: return
-        await asyncio.sleep(1)   # let binance settle
+        await asyncio.sleep(1)
         try: await self.executor.cancel_all_orders(symbol)
         except: pass
         await asyncio.sleep(0.5)
@@ -955,7 +961,6 @@ class PositionManager:
     async def on_margin_call(self, ev):
         await self._notify("🚨 <b>MARGIN CALL</b> — راجع حسابك فوراً!")
 
-    # ---------- WATCHDOG (per-symbol) ----------
     async def watchdog_check(self):
         if not self.positions: return
         for sym, pos in list(self.positions.items()):
@@ -964,7 +969,7 @@ class PositionManager:
             except Exception as e:
                 log.exception(f"watchdog {sym}: {e}")
                 self._bump_fail(sym)
-            await asyncio.sleep(1.0)   # ✅ تأخير بين الرموز
+            await asyncio.sleep(1.0)
 
     async def _watchdog_one(self, symbol, pos):
         # 1) هل الصفقة ما زالت موجودة؟
@@ -994,15 +999,19 @@ class PositionManager:
 
         has_sl = False; tp_ids_seen = set()
         for o in open_orders:
-            otype = o.get("type") or ""
+            otype = (o.get("type") or "").upper()
             cid = o.get("clientOrderId") or ""
-            ctype = o.get("info", {}).get("type") or ""
-            # ✅ قبول أي STOP_MARKET أو TRAILING_STOP_MARKET كـ SL
-            if ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype
-                or ctype in ("STOP_MARKET", "TRAILING_STOP_MARKET")):
+            oinfo = o.get("info") or {}
+            ctype = (oinfo.get("type") or "").upper()
+            # ✅ v7.2: قبول أي STOP_MARKET أو TRAILING_STOP_MARKET كـ SL
+            is_stop = ("STOP_MARKET" in otype or "TRAILING_STOP_MARKET" in otype
+                       or ctype in ("STOP_MARKET", "TRAILING_STOP_MARKET")
+                       or "STOP" in ctype or "TRAILING" in ctype)
+            is_tp = ("TAKE_PROFIT" in otype or "TAKE_PROFIT" in ctype)
+            if is_stop:
                 has_sl = True
                 pos["sl_order_id"] = o.get("id")
-            elif "TAKE_PROFIT" in otype or ctype == "TAKE_PROFIT_MARKET":
+            elif is_tp:
                 if "_tp1" in cid: tp_ids_seen.add("tp1")
                 elif "_tp2" in cid: tp_ids_seen.add("tp2")
                 elif "_tp3" in cid: tp_ids_seen.add("tp3")
@@ -1049,11 +1058,12 @@ class PositionManager:
         pos["sl_last_verified"] = _time.time()
 
     def _bump_fail(self, symbol):
+        """✅ v7.2: threshold 5 بدلاً من 3"""
         n = self._watchdog_fails.get(symbol, 0) + 1
         self._watchdog_fails[symbol] = n
-        log.warning(f"⚠️ watchdog فشل {short(symbol)} ({n}/3)")
-        if n >= 3:
-            log.error(f"🆘 watchdog: 3 فشل → إغلاق طارئ {short(symbol)}")
+        log.warning(f"⚠️ watchdog فشل {short(symbol)} ({n}/5)")
+        if n >= 5:
+            log.error(f"🆘 watchdog: 5 فشل → إغلاق طارئ {short(symbol)}")
             asyncio.create_task(self._watchdog_kill(symbol))
 
     async def _watchdog_kill(self, symbol):
@@ -1064,7 +1074,6 @@ class PositionManager:
     def _reset_fail(self, symbol):
         self._watchdog_fails.pop(symbol, None)
 
-    # ---------- RECONCILE (بدون fetch_open_orders بدون symbol) ----------
     async def reconcile(self):
         try:
             positions = await self.executor.fetch_positions()
@@ -1536,7 +1545,7 @@ def _source_label(src):
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     sd, sn = get_session_info()
     bal = await _positions_mgr._get_balance_usd() if _positions_mgr else 0
-    txt = (f"🤖 <b>Smart Trading Bot v7.1</b>\n"
+    txt = (f"🤖 <b>Smart Trading Bot v7.2</b>\n"
            f"━━━━━━━━━━━━━━━━━━━\n"
            f"💰 الرصيد: <b>${bal:.2f}</b>\n"
            f"📊 Positions: <b>{len(_positions_mgr.positions) if _positions_mgr else 0}</b>/{MAX_CONCURRENT_POSITIONS}\n"
@@ -1602,13 +1611,48 @@ async def cmd_emergency(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await _positions_mgr.close_all("emergency")
 
 async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """⏸️ إيقاف فتح صفقات جديدة (v7.2 محسّن)"""
+    if _positions_mgr.paused:
+        await u.message.reply_text(
+            "⏸️ <b>البوت موقوف بالفعل</b>\n\n"
+            f"📊 Positions المفتوحة: <b>{len(_positions_mgr.positions)}</b>\n"
+            "💡 للاستئناف: <code>/resume</code>",
+            parse_mode="HTML")
+        return
     _positions_mgr.paused = True
-    await u.message.reply_text("⏸️ موقوف")
+    log.warning("⏸️ البوت أوقف عبر /pause")
+    await u.message.reply_text(
+        "⏸️ <b>تم الإيقاف</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "🔒 <b>لن تُفتح صفقات جديدة</b>\n"
+        "✅ <b>الصفقات الحالية تستمر</b>\n"
+        f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>\n"
+        f"🕐 {syria_now_str()}\n\n"
+        "💡 للاستئناف: <code>/resume</code>",
+        parse_mode="HTML")
 
 async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """▶️ استئناف فتح صفقات جديدة (v7.2 محسّن)"""
+    if not _positions_mgr.paused:
+        await u.message.reply_text(
+            "▶️ <b>البوت يعمل بالفعل</b>\n\n"
+            f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>\n"
+            "💡 للإيقاف: <code>/pause</code>",
+            parse_mode="HTML")
+        return
+    old_losses = _positions_mgr.consecutive_losses
     _positions_mgr.paused = False
     _positions_mgr.consecutive_losses = 0
-    await u.message.reply_text("▶️ يعمل")
+    log.info(f"▶️ البوت استؤنف عبر /resume (كان {old_losses} خسائر)")
+    await u.message.reply_text(
+        "▶️ <b>تم الاستئناف</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "✅ <b>سيبدأ فتح صفقات جديدة</b>\n"
+        f"🔄 تصفير الخسائر المتتالية ({old_losses} → 0)\n"
+        f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>\n"
+        f"🕐 {syria_now_str()}\n\n"
+        "⏱️ الدورة التالية خلال ≤ 120 ثانية",
+        parse_mode="HTML")
 
 async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1628,10 +1672,17 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     total = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
     bal = await _positions_mgr._get_balance_usd()
     jq = c.application.job_queue; jobs_n = len(jq.jobs()) if jq else 0
+    status_icon = "⏸️ موقوف" if _positions_mgr.paused else "▶️ يعمل"
+    status_detail = ""
+    if _positions_mgr.paused:
+        if _positions_mgr.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            status_detail = f"\n⚠️ بسبب: {MAX_CONSECUTIVE_LOSSES} خسائر متتالية"
+        else:
+            status_detail = "\n💡 أوقف يدوياً عبر /pause"
     await u.message.reply_text(
-        f"🤖 <b>الحالة v7.1</b>\n"
+        f"🤖 <b>الحالة v7.2</b>\n"
         f"💰 ${bal:.2f} | 📊 {len(_positions_mgr.positions)}/{MAX_CONCURRENT_POSITIONS}\n"
-        f"{'⏸️ موقوف' if _positions_mgr.paused else '▶️ يعمل'}\n"
+        f"{status_icon}{status_detail}\n"
         f"🕐 {sn} ({sd:+d}) | Jobs: {jobs_n}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: {_filter_stats['sent']}\n"
@@ -1696,7 +1747,7 @@ async def cmd_why(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def cmd_strict(u: Update, c: ContextTypes.DEFAULT_TYPE):
     th = get_thresholds(tf="15m")
     await u.message.reply_text(
-        f"🎯 <b>الإعدادات v7.1</b>\n"
+        f"🎯 <b>الإعدادات v7.2</b>\n"
         f"• Leverage: <b>{LEVERAGE}x ISOLATED</b>\n"
         f"• Notional: <b>${POSITION_NOTIONAL_USD}</b>\n"
         f"• Max concurrent: <b>{MAX_CONCURRENT_POSITIONS}</b>\n"
@@ -1707,7 +1758,8 @@ async def cmd_strict(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"• Max consec losses: <b>{MAX_CONSECUTIVE_LOSSES}</b>\n"
         f"• TP splits: <b>{TP_SPLITS}</b>\n"
         f"• Trailing: <b>{TRAIL_CALLBACK_RATE}%</b>\n"
-        f"• Watchdog: كل <b>{WATCHDOG_INTERVAL_SEC}s</b>",
+        f"• Watchdog: كل <b>{WATCHDOG_INTERVAL_SEC}s</b>\n"
+        f"• Watchdog threshold: <b>5 فشل</b>",
         parse_mode="HTML")
 
 async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1728,7 +1780,7 @@ async def error_handler(u, c):
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8")
-        self.end_headers(); self.wfile.write(b"OK - v7.1")
+        self.end_headers(); self.wfile.write(b"OK - v7.2")
     def do_HEAD(self): self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
 
@@ -1746,14 +1798,12 @@ async def _startup_async(app: Application):
     _ws_mgr = WebSocketManager(_executor, _positions_mgr)
     _positions_mgr.ws_ref = _ws_mgr
 
-    # ✅ تأخير 30 ثانية قبل الاتصال بـ Binance
     log.info(f"⏳ انتظار {STARTUP_DELAY_SEC}s قبل مزامنة Binance ...")
     await asyncio.sleep(STARTUP_DELAY_SEC)
 
     await _positions_mgr.reconcile()
     await asyncio.sleep(2)
 
-    # جلب بيانات أولية مع تأخير
     log.info("📊 جلب بيانات أولية ...")
     for sym in ALL_SYMBOLS:
         for tf in TIMEFRAMES:
@@ -1779,7 +1829,7 @@ def main():
     print(f"🛡️ Max positions: {MAX_CONCURRENT_POSITIONS}")
     print(f"🛡️ Max SL: {MAX_SL_PCT}% | Daily loss: {MAX_DAILY_LOSS_PCT}%")
     print(f"⏱️  Startup delay: {STARTUP_DELAY_SEC}s")
-    print(f"🛡️ Watchdog: كل {WATCHDOG_INTERVAL_SEC}s")
+    print(f"🛡️ Watchdog: كل {WATCHDOG_INTERVAL_SEC}s | threshold: 5 فشل")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
@@ -1814,7 +1864,6 @@ def main():
 
     app.post_init = _post_init
 
-    # Jobs — تأخير أول تشغيل لتفادي burst
     app.job_queue.run_repeating(trading_loop, interval=120, first=180, name="trading")
     app.job_queue.run_repeating(watchdog_job, interval=WATCHDOG_INTERVAL_SEC,
                                 first=300, name="watchdog")
