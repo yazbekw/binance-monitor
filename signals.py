@@ -1,17 +1,10 @@
 """
-Unified Smart Bot v6.4 — Tight Filters + Fixed MTF
-==================================================
-  🆕 إصلاح MTF bonus المزدوج
-  🆕 cache أكثر صرامة (60 ثانية)
-  🆕 حد أدنى لفرق EMA
-  🆕 حد أدنى لـ ATR
-  🆕 منع EMA ضد الترند
-  🆕 منع BB Squeeze عندما ADX < 15
-  🆕 منع تكرار الإشارات لنفس العملة خلال 5 دقائق
-  ✓ رسائل متابعة للإشارات
-  ✓ SL/TP مع حد أدنى حسب الإطار
-  ✓ 4 كواشف: EMA + RSI Div + BB + S/R
-  ✓ Multi-TF + Sessions + Morning Report + /perf
+Unified Smart Bot v6.4.1 — Balanced Leniency + /why
+====================================================
+  🆕 تساهل معتدل بعد v6.4 المتشدد جداً
+  🆕 أمر /why للتشخيص الفوري
+  🆕 إمكانية التعديل من ENV
+  ✓ كل ميزات v6.4 (فلاتر + متابعة + تقارير)
 """
 import os, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -109,12 +102,30 @@ SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
-# 🆕 إعدادات v6.4
-MIN_EMA_GAP_PCT = {"5m": 0.03, "15m": 0.02, "1h": 0.01}   # حد أدنى لفرق EMA
-MIN_ATR_PCT     = {"5m": 0.15, "15m": 0.20, "1h": 0.30}   # حد أدنى لـ ATR
-MIN_ADX_FOR_BB  = 15.0                                     # BB Squeeze يحتاج ADX ≥
-SYMBOL_COOLDOWN_SEC = 300                                  # 5 دقائق بين إشارتين لنفس العملة
-SYMBOL_COOLDOWN_SOURCES = {"ema", "rsi_div", "bb_squeeze", "sr_breakout"}  # كلها
+# ═══════════════════════════════════════════════════════════
+# 🆕 v6.4.1 — القيم المتساهلة (قابلة للتعديل من ENV)
+# ═══════════════════════════════════════════════════════════
+def _env_float(key, default):
+    try: return float(os.getenv(key, default))
+    except: return default
+
+def _env_int(key, default):
+    try: return int(os.getenv(key, default))
+    except: return default
+
+MIN_EMA_GAP_PCT = {
+    "5m":  _env_float("MIN_EMA_GAP_5M",  0.02),
+    "15m": _env_float("MIN_EMA_GAP_15M", 0.015),
+    "1h":  _env_float("MIN_EMA_GAP_1H",  0.01),
+}
+MIN_ATR_PCT = {
+    "5m":  _env_float("MIN_ATR_5M",  0.05),
+    "15m": _env_float("MIN_ATR_15M", 0.10),
+    "1h":  _env_float("MIN_ATR_1H",  0.20),
+}
+MIN_ADX_FOR_BB       = _env_float("MIN_ADX_FOR_BB", 8.0)
+SYMBOL_COOLDOWN_SEC  = _env_int("SYMBOL_COOLDOWN_SEC", 180)
+STRICTNESS_MAX_FINAL = _env_int("STRICTNESS_MAX_FINAL", 80)
 
 FOLLOWUP_ENABLED = True
 FOLLOWUP_ON_TP1 = True
@@ -242,7 +253,7 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) محرك التشدد الذكي (cache 60 ثانية)
+# 4) محرك التشدد الذكي (max final = 80)
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -253,10 +264,11 @@ STATIC_PROFILES = {
                  "block_against_htf": True, "score_15m_override": 75},
 }
 
+# 🆕 v6.4.1 — مضاعفات مخففة
 TF_PROFILES = {
-    "5m":  {"score_mult": 1.20, "vol_mult": 1.25, "atr_max": 0.50, "min_hold_min": 5},
-    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 15},
-    "1h":  {"score_mult": 0.90, "vol_mult": 0.80, "atr_max": 1.50, "min_hold_min": 60},
+    "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 5},
+    "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90, "min_hold_min": 15},
+    "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80, "min_hold_min": 60},
 }
 
 SESSIONS = [
@@ -281,7 +293,7 @@ class SmartStrictness:
         self._cached_ts = 0.0
         self._cached_atr = None
         self._cached_adx = None
-        self._cache_ttl = 60.0   # 🆕 60 ثانية بدل 120
+        self._cache_ttl = 60.0
 
     def record(self, passed, score, source="unknown"):
         with self._lock:
@@ -326,7 +338,6 @@ class SmartStrictness:
 
     def compute(self, atr_pct=None, adx=None):
         now = _time.time()
-        # 🆕 cache 60 ثانية + فحص دقيق للقيم
         if (self._cached_profile
             and (now - self._cached_ts) < self._cache_ttl
             and self._cached_atr is not None
@@ -347,14 +358,15 @@ class SmartStrictness:
             elif adx < 18: adx_delta = +5
             elif adx < 22: adx_delta = +2
         fb_delta, pass_ratio, sample_n = self._feedback()
-        final = max(40, min(90, base + adx_delta + fb_delta))
+        # 🆕 v6.4.1 — الحد الأقصى 80 بدل 90
+        final = max(40, min(STRICTNESS_MAX_FINAL, base + adx_delta + fb_delta))
         prof = {"min_score": final,
                 "min_vol_ratio": round(max(0.7, (final - 30) / 30), 2),
                 "min_adx": round(max(12, final * 0.28), 1),
                 "max_atr_pct": round(max(0.35, 1.2 - final / 100), 2),
                 "vwap_slope_pct": round(0.02 + final / 1000, 3),
                 "block_against_htf": final >= 55,
-                "score_15m_override": min(90, final + 10),
+                "score_15m_override": min(80, final + 10),
                 "_debug": {"base": base, "adx_delta": adx_delta,
                            "fb_delta": fb_delta, "atr": atr_pct, "adx": adx}}
         self._cached_profile = prof
@@ -640,7 +652,7 @@ _pending_signals = {}
 _divergence_cache = {}
 _bb_cache = {}
 _sr_cache = {}
-_last_signal_time = {}   # 🆕 symbol → آخر وقت إرسال
+_last_signal_time = {}
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_vol": 0, "filtered_adx": 0,
@@ -741,7 +753,7 @@ def record_signal(symbol, direction):
 
 
 def check_symbol_cooldown(symbol):
-    """🆕 يمنع إرسال إشارتين لنفس العملة خلال SYMBOL_COOLDOWN_SEC"""
+    if SYMBOL_COOLDOWN_SEC <= 0: return True, 0
     now = _time.time()
     last = _last_signal_time.get(symbol, 0)
     if now - last < SYMBOL_COOLDOWN_SEC:
@@ -754,10 +766,9 @@ def mark_symbol_sent(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) حساب Score (بدون MTF — يُضاف لاحقاً مرة واحدة)
+# 10) حساب Score
 # ═══════════════════════════════════════════════════════════
 def compute_score(df, direction, curr_idx=-2):
-    """يُعيد Score أساسي (بدون MTF — يُضاف في passes_filter)"""
     close = df["c"]; vol = df["v"]
     price = float(close.iloc[curr_idx])
     try:
@@ -808,7 +819,7 @@ def compute_score(df, direction, curr_idx=-2):
 
 
 # ═══════════════════════════════════════════════════════════
-# 11) الفلتر (مُشدّد — 12 فلتر)
+# 11) الفلتر (v6.4.1 — متساهل معتدل)
 # ═══════════════════════════════════════════════════════════
 async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
@@ -822,67 +833,67 @@ async def passes_filter(cross, htf_trend=None):
     source = cross.get("source", "ema")
     direction = cross["direction"]
     
-    # ⚙️ 1) فحص cooldown للعملة (قبل أي حساب)
-    ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
-    if not ok_cooldown:
-        return False, f"cooldown {remaining}s", "cooldown"
+    # 1) cooldown
+    if SYMBOL_COOLDOWN_SEC > 0:
+        ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
+        if not ok_cooldown:
+            return False, f"cooldown {remaining}s", "cooldown"
     
-    # ⚙️ 2) حدود أدنى صارمة
-    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.03)
+    # 2) gap
+    min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
     if gap_pct < min_gap and source == "ema":
         return False, f"فرق EMA {gap_pct:.3f}% < {min_gap}%", "ema_gap"
     
-    min_atr = MIN_ATR_PCT.get(tf, 0.15)
+    # 3) ATR منخفض
+    min_atr = MIN_ATR_PCT.get(tf, 0.05)
     if atr < min_atr:
         return False, f"ATR {atr}% < {min_atr}%", "atr_low"
     
-    # ⚙️ 3) حساب MTF مرة واحدة
+    # 4) MTF
     mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
     cross["mtf"] = mtf_desc
     cross["mtf_bonus"] = mtf_bonus
-    score = base_score + mtf_bonus    # 🆕 Score نهائي (base + MTF مرة واحدة)
+    score = base_score + mtf_bonus
     s["score"] = score
     
-    # ⚙️ 4) رفض MTF تعارض كامل
+    # 5) MTF تعارض كامل
     if mtf_bonus <= -15:
         return False, mtf_desc, "mtf"
     
-    # ⚙️ 5) السوق
+    # 6) السوق
     df = cross.get("_df")
     market = cross.get("market") or "UNKNOWN"
     if market == "UNKNOWN":
         market = await classify_market_safe(cross["symbol"], tf, df)
         cross["market"] = market
     
-    # ⚙️ 6) العتبات
+    # 7) العتبات
     th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
     min_score = th["min_score"]
     if tf == "15m":
         min_score = max(min_score, th.get("score_15m_override", min_score))
     
-    passed, reason, cat = True, "", ""
-    
-    # ⚙️ 7) فلتر Score
+    # 8) Score
     if score < min_score:
         return False, f"Score {score} < {min_score:.0f}", "score"
     
-    # ⚙️ 8) فلتر Volume
+    # 9) Volume
     if vol < th["min_vol_ratio"]:
         return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
     
-    # ⚙️ 9) فلتر ADX العام
+    # 10) ADX
     if adx < th["min_adx"]:
         return False, f"ADX {adx} < {th['min_adx']}", "adx"
     
-    # ⚙️ 10) فلتر ATR الأعلى
+    # 11) ATR أعلى
     if atr > th["max_atr_pct"]:
         return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
     
-    # ⚙️ 11) 🆕 فلتر ADX خاص بـ BB Squeeze
+    # 12) BB يحتاج ADX (متساهل الآن)
     if source == "bb_squeeze" and adx < MIN_ADX_FOR_BB:
         return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
     
-    # ⚙️ 12) 🆕 منع EMA ضد الترند
+    # 13) منع EMA ضد الترند
     if source == "ema":
         if market == "TREND_DOWN" and direction == "bullish":
             if mtf_bonus < 5:
@@ -891,32 +902,32 @@ async def passes_filter(cross, htf_trend=None):
             if mtf_bonus < 5:
                 return False, "تقاطع هابط في ترند صاعد", "trend"
     
-    # ⚙️ 13) منع دايفرجنس ضد الترند بدون MTF ≥ 2/3
+    # 14) دايفرجنس ضد الترند
     if source == "rsi_div":
         if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 3:
-            return False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+            return False, "دايفرجنس ضد الترند", "trend"
         elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 3:
-            return False, "دايفرجنس ضد الترند بدون تأكيد", "trend"
+            return False, "دايفرجنس ضد الترند", "trend"
     
-    # ⚙️ 14) رفض EMA في الرينج
+    # 15) EMA في الرينج
     if market == "RANGE" and source == "ema" \
        and cross.get("alert_type") == "confirmed":
         return False, "سوق عرضي — تقاطع وهمي", "range"
     
-    # ⚙️ 15) HTF block
+    # 16) HTF
     if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
         if direction == "bullish" and htf_trend == "DOWN":
             return False, "HTF=DOWN ضد LONG", "htf"
         elif direction == "bearish" and htf_trend == "UP":
             return False, "HTF=UP ضد SHORT", "htf"
     
-    # ⚙️ 16) VWAP slope
+    # 17) VWAP
     if df is not None:
         ok, slope = check_vwap_slope(df, direction, th, tf=tf)
         if not ok:
             return False, f"VWAP {slope:+.2f}% ضد", "vwap"
     
-    # ⚙️ 17) تعارض
+    # 18) تعارض
     if cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], direction):
             return False, "تعارض", "conflict"
@@ -941,14 +952,14 @@ async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
     cts = int(df["ts"].iloc[curr])
     levels = compute_levels(df, direction, curr, tf=tf)
     market = await classify_market_safe(symbol, tf, df)
-    support = compute_score(df, direction, curr)   # Score أساسي (بدون MTF)
+    support = compute_score(df, direction, curr)
     out = {"symbol": symbol, "timeframe": tf, "direction": direction,
            "ema_fast": round(cf, 8), "ema_slow": round(cs, 8),
            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
            "gap_pct": round(abs(cf - cs) / cs * 100, 3) if cs else 0,
            "strength": strength, "alert_type": alert_type,
            "support": support,
-           "base_score": support["score"],   # 🆕 Score أساسي
+           "base_score": support["score"],
            "_df": df, "exchange": _exchange.primary_name,
            "levels": levels, "source": source,
            "market": market}
@@ -1653,17 +1664,21 @@ async def cmd_start(update, context):
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.4</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.4.1</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
         f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🛡️ فلاتر v6.4:</b>\n"
-        f"• EMA gap ≥ {MIN_EMA_GAP_PCT['5m']}% (5m)\n"
-        f"• ATR ≥ {MIN_ATR_PCT['5m']}% (5m)\n"
-        f"• BB يحتاج ADX ≥ {MIN_ADX_FOR_BB}\n"
-        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n\n"
+        f"<b>🛡️ فلاتر v6.4.1 (متساهل):</b>\n"
+        f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}% | "
+        f"15m≥{MIN_EMA_GAP_PCT['15m']}% | 1h≥{MIN_EMA_GAP_PCT['1h']}%\n"
+        f"• ATR: 5m≥{MIN_ATR_PCT['5m']}% | "
+        f"15m≥{MIN_ATR_PCT['15m']}% | 1h≥{MIN_ATR_PCT['1h']}%\n"
+        f"• BB ADX ≥ {MIN_ADX_FOR_BB}\n"
+        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n"
+        f"• max final: {STRICTNESS_MAX_FINAL}\n\n"
         f"<b>الأوامر:</b>\n"
+        f"/why — تشخيص فوري\n"
         f"/sr /ref6 /ranges /checkranges /refresh\n"
         f"/cross /cross5 /cross15 /cross1h /checkprice\n"
         f"/status /stats /perf /jobs /strict /clearcache",
@@ -1725,6 +1740,76 @@ async def cmd_cross(u, c):   await _run_cross(u)
 async def cmd_cross5(u, c):  await _run_cross(u, ["5m"])
 async def cmd_cross15(u, c): await _run_cross(u, ["15m"])
 async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
+
+
+async def cmd_why(update, context):
+    """🆕 تشخيص: لماذا لا تصل إشارات؟"""
+    if not _exchange.ok():
+        await update.message.reply_text("❌ لا منصة."); return
+    
+    target = "BTC/USDT:USDT"
+    if target not in ALL_SYMBOLS:
+        target = ALL_SYMBOLS[0]
+    
+    await update.message.reply_text(f"🔍 تشخيص {short(target)} ...")
+    
+    lines = [f"📊 <b>تشخيص {short(target)}</b>", "━━━━━━━━━━━━━━━━━━━"]
+    
+    for tf in ["5m", "15m", "1h"]:
+        try:
+            df = await _df_for(target, tf)
+            if df is None:
+                lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
+            df["ef"] = calc_ema(df["c"], EMA_FAST)
+            df["es"] = calc_ema(df["c"], EMA_SLOW)
+            curr = -2
+            cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+            gap = abs(cf - cs) / cs * 100 if cs else 0
+            atr = float(calc_atr(df).iloc[curr])
+            price = float(df["c"].iloc[curr])
+            atr_pct = (atr / price) * 100 if price else 0
+            adx = float(calc_adx(df).iloc[curr])
+            rsi = float(calc_rsi(df["c"]).iloc[curr])
+            vol_ratio = 0
+            try:
+                vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
+            except: pass
+            
+            th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
+            score_bull = compute_score(df, "bullish", curr)["score"]
+            score_bear = compute_score(df, "bearish", curr)["score"]
+            best_score = max(score_bull, score_bear)
+            
+            min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
+            min_atr = MIN_ATR_PCT.get(tf, 0.05)
+            
+            g_ok = "✅" if gap >= min_gap else "❌"
+            a_ok = "✅" if atr_pct >= min_atr else "❌"
+            s_ok = "✅" if best_score >= th["min_score"] else "❌"
+            v_ok = "✅" if vol_ratio >= th["min_vol_ratio"] else "❌"
+            x_ok = "✅" if adx >= th["min_adx"] else "❌"
+            
+            lines.append(
+                f"\n<b>[{tf}]</b>\n"
+                f"💰 السعر: {fmt_price(price)}\n"
+                f"📏 فرق EMA: <b>{gap:.3f}%</b> / {min_gap}% {g_ok}\n"
+                f"📊 ATR: <b>{atr_pct:.3f}%</b> / {min_atr}% {a_ok}\n"
+                f"📈 ADX: <b>{adx:.1f}</b> / {th['min_adx']:.1f} {x_ok}\n"
+                f"📊 Vol: <b>{vol_ratio:.2f}×</b> / {th['min_vol_ratio']}× {v_ok}\n"
+                f"🎯 Score: <b>{best_score}</b> / {th['min_score']:.0f} {s_ok}\n"
+                f"📉 RSI: {rsi:.1f}"
+            )
+        except Exception as e:
+            lines.append(f"\n<b>[{tf}]</b> ❌ {e}")
+    
+    # cooldown
+    ok_cd, rem = check_symbol_cooldown(target)
+    cd_txt = "✅" if ok_cd else f"❌ متبقي {rem}s"
+    lines.append(f"\n⏳ Cooldown: {cd_txt}")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <i>أي ❌ = فلتر يمنع الإشارة</i>")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_checkprice(update, context):
@@ -1810,30 +1895,26 @@ async def cmd_status(update, context):
     st = _smart.stats()
     active = len([s for s in _pending_signals.values() if not s["checked"]])
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.4</b>\n"
+        f"🤖 <b>الحالة v6.4.1</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
         f"📬 متابعات: <b>{_filter_stats['followups_sent']}</b>\n"
-        f"🔄 دايفرجنس: {_filter_stats['signals_divergence']}\n"
-        f"💥 BB: {_filter_stats['signals_bb']}\n"
-        f"🎯 S/R: {_filter_stats['signals_sr']}\n"
-        f"🚨 خروج: {_filter_stats['range_breakouts']}\n"
-        f"⚠️ اقتراب: {_filter_stats['range_approaches']}\n"
-        f"🌅 صباح: {_filter_stats['morning_reports']}\n"
         f"🚫 محجوبة: {total}\n"
         f"  • trend: {_filter_stats['filtered_trend']}\n"
         f"  • ema_gap: {_filter_stats['filtered_ema_gap']}\n"
         f"  • atr_low: {_filter_stats['filtered_atr_low']}\n"
         f"  • cooldown: {_filter_stats['filtered_cooldown']}\n"
         f"  • mtf: {_filter_stats['filtered_mtf']}\n"
+        f"  • score: {_filter_stats['filtered_score']}\n"
+        f"  • vol: {_filter_stats['filtered_vol']}\n"
+        f"  • adx: {_filter_stats['filtered_adx']}\n"
         f"📈 WR: <b>{st['wr']}%</b> "
         f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 نطاقات: {len(_last_range)}\n"
-        f"⏳ إشارات نشطة: {active}",
+        f"⏳ نشطة: {active}",
         parse_mode="HTML")
 
 
@@ -1849,8 +1930,7 @@ async def cmd_stats(update, context):
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📈 معدل النجاح: <b>{st['wr']}%</b>\n"
         f"<code>{bar}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']} | ⏰ منتهية: {st['expired']}\n"
+        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']} | ⏰ {st['expired']}\n"
         f"📝 المجموع: {st['n']}",
         parse_mode="HTML")
 
@@ -1867,9 +1947,9 @@ async def cmd_perf(update, context):
         name = _source_label(src) if src != "unknown" else "—"
         lines.append(
             f"\n🔹 <b>{name}</b>\n"
-            f"   📤 مُرسلة: {d['sent']} | 🚫 محجوبة: {d['filtered']}\n"
+            f"   📤 {d['sent']} | 🚫 {d['filtered']}\n"
             f"   ✅ {d['wins']} | ❌ {d['losses']} | ⏰ {d.get('expired',0)}\n"
-            f"   📈 WR: <b>{wr}%</b> (decisive)")
+            f"   📈 WR: <b>{wr}%</b>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -1892,21 +1972,30 @@ async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
     sd, sn = get_session_info()
     await update.message.reply_text(
-        f"🎯 <b>التشدد v6.4</b>\n"
+        f"🎯 <b>التشدد v6.4.1</b>\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>عتبات ديناميكية:</b>\n"
         f"• Score ≥ {th['min_score']:.0f}\n"
         f"• Vol ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>حدود v6.4:</b>\n"
-        f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}% | "
-        f"15m≥{MIN_EMA_GAP_PCT['15m']}% | 1h≥{MIN_EMA_GAP_PCT['1h']}%\n"
-        f"• ATR: 5m≥{MIN_ATR_PCT['5m']}% | 15m≥{MIN_ATR_PCT['15m']}% | 1h≥{MIN_ATR_PCT['1h']}%\n"
+        f"<b>🛡️ حدود ثابتة v6.4.1:</b>\n"
+        f"• EMA gap: 5m={MIN_EMA_GAP_PCT['5m']}% | "
+        f"15m={MIN_EMA_GAP_PCT['15m']}% | 1h={MIN_EMA_GAP_PCT['1h']}%\n"
+        f"• ATR min: 5m={MIN_ATR_PCT['5m']}% | "
+        f"15m={MIN_ATR_PCT['15m']}% | 1h={MIN_ATR_PCT['1h']}%\n"
         f"• BB: ADX ≥ {MIN_ADX_FOR_BB}\n"
+        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n"
+        f"• max final: {STRICTNESS_MAX_FINAL}\n"
         f"• SL: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%\n"
-        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s",
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>تعديل من ENV:</b>\n"
+        f"<code>MIN_ATR_5M=0.05\n"
+        f"MIN_ADX_FOR_BB=8\n"
+        f"SYMBOL_COOLDOWN_SEC=180\n"
+        f"STRICTNESS_MAX_FINAL=80</code>",
         parse_mode="HTML")
 
 
@@ -2053,7 +2142,7 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.4")
+        self.wfile.write(b"OK - Unified Smart Bot v6.4.1")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -2080,13 +2169,14 @@ def main():
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 رموز: {ALL_SYMBOLS}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
-    print(f"🛡️ فلاتر v6.4:")
+    print(f"🛡️ فلاتر v6.4.1 (متساهل):")
     print(f"   • EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}% | "
           f"15m≥{MIN_EMA_GAP_PCT['15m']}% | 1h≥{MIN_EMA_GAP_PCT['1h']}%")
     print(f"   • ATR min: 5m≥{MIN_ATR_PCT['5m']}% | "
           f"15m≥{MIN_ATR_PCT['15m']}% | 1h≥{MIN_ATR_PCT['1h']}%")
-    print(f"   • BB يحتاج ADX ≥ {MIN_ADX_FOR_BB}")
+    print(f"   • BB ADX ≥ {MIN_ADX_FOR_BB}")
     print(f"   • cooldown: {SYMBOL_COOLDOWN_SEC}s")
+    print(f"   • max final: {STRICTNESS_MAX_FINAL}")
     print(f"📏 SL min: 5m={MIN_SL_PCT['5m']}% | 15m={MIN_SL_PCT['15m']}% | 1h={MIN_SL_PCT['1h']}%")
     print(f"📬 متابعة: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
     print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00")
@@ -2110,6 +2200,7 @@ def main():
     app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
     app.add_handler(CommandHandler("cross1h", cmd_cross1h))
+    app.add_handler(CommandHandler("why", cmd_why))    # 🆕
     app.add_handler(CommandHandler("checkprice", cmd_checkprice))
     app.add_handler(CommandHandler("ranges", cmd_ranges))
     app.add_handler(CommandHandler("checkranges", cmd_checkranges))
