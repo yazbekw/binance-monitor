@@ -16,3 +16,7 @@ supabase
 
 python-binance
 APScheduler==3.10.4
+
+
+
+websockets>=12.0
