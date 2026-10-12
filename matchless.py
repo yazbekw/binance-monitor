@@ -1228,32 +1228,45 @@ class PositionManager:
         self._watchdog_fails.pop(symbol, None)
 
     async def reconcile(self):
+        """مزامنة مع Binance — يتجاهل الصفقات اليدوية"""
         try:
             positions = await self.executor.fetch_positions()
         except Exception as e:
             log.error(f"reconcile fetch_positions: {e}"); return
+    
         binance_pos = {}
         for p in positions:
             contracts = float(p.get("contracts") or 0)
             if abs(contracts) < 1e-12: continue
             binance_pos[p["symbol"]] = p
 
+        # ✅ جديد: فقط سجّل الصفقات، لا تتدخل
+        orphans = []
         for sym, p in binance_pos.items():
-            if sym in self.positions: continue
-            log.warning(f"⚠️ orphan {sym} → SL طارئ")
-            side = "sell" if p.get("side") == "long" else "buy"
-            entry = float(p.get("entryPrice") or 0)
-            if entry <= 0: continue
-            sl_price = entry * (0.985 if p.get("side") == "long" else 1.015)
-            try:
-                await self.executor.create_order(
-                    sym, "STOP_MARKET", side, None, None,
-                    {"stopPrice": self.executor.price_to_precision(sym, sl_price),
-                     "closePosition": True, "workingType": "MARK_PRICE"})
-                log.info(f"🛡️ SL طارئ {short(sym)} @ {sl_price}")
-            except Exception as e:
-                log.error(f"emergency SL {sym}: {e}")
-            await asyncio.sleep(0.5)
+            if sym in self.positions:
+                continue  # ← البوت يعرفها، اتركها
+            # صفقة لا يعرفها البوت (يدوية) → سجّل وتجاهل
+            orphans.append(sym)
+    
+        if orphans:
+            log.info(f"ℹ️  {len(orphans)} صفقة يدوية (orphan) — لن يتدخل البوت:")
+            for sym in orphans:
+                p = binance_pos[sym]
+                entry = float(p.get("entryPrice") or 0)
+                side = p.get("side", "?")
+                contracts = float(p.get("contracts") or 0)
+                log.info(f"   • {short(sym)} {side.upper()} @ {entry} ({contracts})")
+            log.info(f"💡 لإدارة هذه الصفقات يدوياً — تجاهلها البوت")
+
+        # ✅ إزالة الصفقات التي أُغلقت من ذاكرة البوت
+        for sym in list(self.positions.keys()):
+            if sym not in binance_pos:
+                log.info(f"♻️ إزالة {short(sym)} — أُغلقت على Binance")
+                async with self._lock:
+                    self.positions.pop(sym, None)
+    
+        log.info(f"♻️ Reconcile: {len(self.positions)} صفقة بوت | "
+                 f"{len(orphans)} صفقة يدوية (متجاهلة)")
 
         for sym in list(self.positions.keys()):
             if sym not in binance_pos:
