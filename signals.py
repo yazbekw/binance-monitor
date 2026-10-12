@@ -1,30 +1,40 @@
 """
-Unified Smart Bot v6.4.3 — Score 52 + /why Multi-Coin
-======================================================
+Unified Smart Bot v6.5.0 — Score 52 + /why + 📊 Charts + 🎛️ UI
+================================================================
+  🆕 v6.5.0 — رسوم بيانية احترافية للدعم والمقاومة
+  🆕 v6.5.0 — واجهة أزرار تفاعلية (Inline Keyboard)
   🆕 ABS_MIN_SCORE = 52 (كان 55)
   🆕 /why — فحص كل العملات
   🆕 /why XRP — تفاصيل عملة
   🆕 /last — آخر 5 إشارات
   🆕 /pending — الإشارات النشطة
-  ✓ كل ميزات v6.4.2
+  ✓ كل ميزات v6.4.3
 """
-import os, asyncio, logging, threading, time as _time
+import os, io, asyncio, logging, threading, time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 from collections import deque, defaultdict
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler"):
+for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler", "matplotlib"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("unified")
 
 import ccxt
 import pandas as pd
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, ContextTypes,
+                          CallbackQueryHandler)
 from telegram.error import NetworkError, TimedOut
+
+# ── matplotlib (رسم بياني بدون واجهة) ──────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import matplotlib.ticker as mticker
 
 load_dotenv()
 
@@ -104,7 +114,13 @@ SIGNAL_TRACK_MAX_MIN = 90
 SIGNAL_TRACK_INTERVAL_MIN = 2
 MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
-LAST_SIGNALS_MAX = 20   # 🆕 عدد الإشارات المحفوظة للتاريخ
+LAST_SIGNALS_MAX = 20
+
+# ── إعدادات الرسوم ──────────────────────────────────
+CHART_LOOKBACK = 120
+CHART_DPI      = 110
+CHART_ENABLED  = True
+SEND_SR_CHARTS = True
 
 
 # ═══════════════════════════════════════════════════════════
@@ -132,7 +148,6 @@ MIN_ADX_FOR_BB       = _env_float("MIN_ADX_FOR_BB", 8.0)
 SYMBOL_COOLDOWN_SEC  = _env_int("SYMBOL_COOLDOWN_SEC", 180)
 STRICTNESS_MAX_FINAL = _env_int("STRICTNESS_MAX_FINAL", 80)
 
-# 🆕 v6.4.3 — 52 بدل 55
 ABS_MIN_SCORE        = _env_int("ABS_MIN_SCORE", 52)
 BB_MIN_VOL           = _env_float("BB_MIN_VOL", 1.0)
 BB_MIN_ADX_IN_RANGE  = _env_float("BB_MIN_ADX_IN_RANGE", 20)
@@ -354,7 +369,7 @@ class SmartStrictness:
             and abs(self._cached_atr - (atr_pct or 0)) < 0.05
             and abs(self._cached_adx - (adx or 0)) < 2.0):
             return self._cached_profile
-        
+
         if atr_pct is None or atr_pct <= 0: atr_pct = 0.5
         if atr_pct < 0.15:   base = 50
         elif atr_pct < 0.30: base = 55
@@ -473,15 +488,12 @@ def fmt_price(v):
 
 
 def find_symbol_by_name(name):
-    """🆕 يبحث عن عملة بالاسم (BTC, btc, BTC/USDT)"""
     if not name: return None
     name = name.upper().strip()
     for sym in ALL_SYMBOLS:
         if short(sym) == name: return sym
-    # بحث جزئي
     for sym in ALL_SYMBOLS:
         if name in sym.upper(): return sym
-    # بحث في العملات الإضافية (فقط إذا لم تكن في النطاقات)
     if "/" not in name:
         candidate = f"{name}/USDT:USDT"
         return candidate
@@ -678,7 +690,7 @@ _divergence_cache = {}
 _bb_cache = {}
 _sr_cache = {}
 _last_signal_time = {}
-_last_signals = deque(maxlen=LAST_SIGNALS_MAX)   # 🆕 تاريخ الإشارات
+_last_signals = deque(maxlen=LAST_SIGNALS_MAX)
 
 _filter_stats = {
     "sent": 0, "filtered_score": 0, "filtered_score_abs": 0,
@@ -690,7 +702,7 @@ _filter_stats = {
     "range_breakouts": 0, "range_approaches": 0,
     "range_6pct_reports": 0, "morning_reports": 0, "signals_tracked": 0,
     "signals_divergence": 0, "signals_bb": 0, "signals_sr": 0,
-    "followups_sent": 0,
+    "followups_sent": 0, "charts_sent": 0,
 }
 
 
@@ -859,56 +871,56 @@ async def passes_filter(cross, htf_trend=None):
     gap_pct = s.get("gap_pct", 0)
     source = cross.get("source", "ema")
     direction = cross["direction"]
-    
+
     if SYMBOL_COOLDOWN_SEC > 0:
         ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
         if not ok_cooldown:
             return False, f"cooldown {remaining}s", "cooldown"
-    
+
     min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
     if gap_pct < min_gap and source == "ema":
         return False, f"فرق EMA {gap_pct:.3f}% < {min_gap}%", "ema_gap"
-    
+
     min_atr = MIN_ATR_PCT.get(tf, 0.05)
     if atr < min_atr:
         return False, f"ATR {atr}% < {min_atr}%", "atr_low"
-    
+
     mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
     cross["mtf"] = mtf_desc
     cross["mtf_bonus"] = mtf_bonus
     score = base_score + mtf_bonus
     s["score"] = score
     cross["final_score"] = score
-    
+
     if mtf_bonus <= -15:
         return False, mtf_desc, "mtf"
-    
+
     if score < ABS_MIN_SCORE:
         return False, f"Score {score} < {ABS_MIN_SCORE} (مطلق)", "score_abs"
-    
+
     df = cross.get("_df")
     market = cross.get("market") or "UNKNOWN"
     if market == "UNKNOWN":
         market = await classify_market_safe(cross["symbol"], tf, df)
         cross["market"] = market
-    
+
     th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
     min_score = th["min_score"]
     if tf == "15m":
         min_score = max(min_score, th.get("score_15m_override", min_score))
-    
+
     if score < min_score:
         return False, f"Score {score} < {min_score:.0f}", "score"
-    
+
     if vol < th["min_vol_ratio"]:
         return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
-    
+
     if adx < th["min_adx"]:
         return False, f"ADX {adx} < {th['min_adx']}", "adx"
-    
+
     if atr > th["max_atr_pct"]:
         return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
-    
+
     if source == "bb_squeeze":
         if adx < MIN_ADX_FOR_BB:
             return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
@@ -920,7 +932,7 @@ async def passes_filter(cross, htf_trend=None):
             confirmed = (mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)
             if not confirmed:
                 return False, "BB بدون تأكيد (MTF/ADX/Vol)", "bb_confirm"
-    
+
     if source == "ema":
         if market == "TREND_DOWN" and direction == "bullish":
             if mtf_bonus < 5:
@@ -928,32 +940,32 @@ async def passes_filter(cross, htf_trend=None):
         elif market == "TREND_UP" and direction == "bearish":
             if mtf_bonus < 5:
                 return False, "تقاطع هابط في ترند صاعد", "trend"
-    
+
     if source == "rsi_div":
         if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 3:
             return False, "دايفرجنس ضد الترند", "trend"
         elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 3:
             return False, "دايفرجنس ضد الترند", "trend"
-    
+
     if market == "RANGE" and source == "ema" \
        and cross.get("alert_type") == "confirmed":
         return False, "سوق عرضي — تقاطع وهمي", "range"
-    
+
     if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
         if direction == "bullish" and htf_trend == "DOWN":
             return False, "HTF=DOWN ضد LONG", "htf"
         elif direction == "bearish" and htf_trend == "UP":
             return False, "HTF=UP ضد SHORT", "htf"
-    
+
     if df is not None:
         ok, slope = check_vwap_slope(df, direction, th, tf=tf)
         if not ok:
             return False, f"VWAP {slope:+.2f}% ضد", "vwap"
-    
+
     if cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], direction):
             return False, "تعارض", "conflict"
-    
+
     if STRICTNESS == "auto":
         _smart.record(True, score, source=source)
     return True, "", ""
@@ -986,7 +998,7 @@ async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
            "_df": df, "exchange": _exchange.primary_name,
            "levels": levels, "source": source,
            "market": market,
-           "created_at": _time.time()}   # 🆕 للتاريخ
+           "created_at": _time.time()}
     if extra: out.update(extra)
     return out
 
@@ -1646,7 +1658,7 @@ async def evaluate_pending_signals(bot=None):
             else:
                 sig["max_favorable"] = min(sig["max_favorable"], price)
                 sig["max_adverse"] = max(sig["max_adverse"], price)
-            
+
             new_result = None
             if sig["direction"] == "bullish":
                 if price <= lv["stop_loss"]:
@@ -1666,7 +1678,7 @@ async def evaluate_pending_signals(bot=None):
                     new_result = "win_tp2"; sig["result"] = "win_tp2"
                 elif price <= lv["tp1"] and not sig.get("result"):
                     new_result = "win_tp1"; sig["result"] = "win_tp1"
-            
+
             if new_result:
                 if sig["checked"]:
                     _smart.record_result(sig["result"], sig["direction"],
@@ -1683,7 +1695,6 @@ async def evaluate_pending_signals(bot=None):
 
 
 def _record_history(sig, result, price, age_min):
-    """🆕 يحفظ الإشارة في التاريخ"""
     cross = sig["cross"]
     entry = sig["levels"]["entry"]
     bull = sig["direction"] == "bullish"
@@ -1704,7 +1715,390 @@ def _record_history(sig, result, price, age_min):
 
 
 # ═══════════════════════════════════════════════════════════
-# 19) الأوامر
+# 19) 🆕 وحدة الرسوم البيانية الاحترافية
+# ═══════════════════════════════════════════════════════════
+C_BG     = "#0d1117"
+C_PANEL  = "#131722"
+C_GRID   = "#1f2430"
+C_UP     = "#26a69a"
+C_DOWN   = "#ef5350"
+C_TEXT   = "#d1d4dc"
+C_MUTED  = "#7a7f8a"
+C_PIVOT  = "#ffeb3b"
+C_R1     = "#ff9800"
+C_R2     = "#ff5722"
+C_R3     = "#f44336"
+C_S1     = "#8bc34a"
+C_S2     = "#4caf50"
+C_S3     = "#00bcd4"
+C_PRICE  = "#ffffff"
+C_ENTRY  = "#00e5ff"
+
+
+def _chart_generate_sync(symbol, df, sr_data, signal=None, lookback=CHART_LOOKBACK):
+    """إنشاء رسم بياني احترافي (شموع + Pivot + S/R)."""
+    df = df.iloc[-lookback:].reset_index(drop=True)
+    if df.empty:
+        return None
+
+    fig = plt.figure(figsize=(14, 7.5), dpi=CHART_DPI, facecolor=C_BG)
+    ax  = fig.add_axes([0.06, 0.10, 0.76, 0.82])
+    ax.set_facecolor(C_PANEL)
+
+    n = len(df)
+
+    # الشموع
+    for i, row in df.iterrows():
+        is_up = row["c"] >= row["o"]
+        color = C_UP if is_up else C_DOWN
+        ax.plot([i, i], [row["l"], row["h"]],
+                color=color, linewidth=0.8, zorder=2, solid_capstyle="round")
+        low_body = min(row["o"], row["c"])
+        body_h   = abs(row["c"] - row["o"])
+        if body_h <= 0:
+            body_h = (row["h"] - row["l"]) * 0.01 or row["c"] * 0.0001
+        ax.add_patch(Rectangle((i - 0.35, low_body), 0.7, body_h,
+                                facecolor=color, edgecolor=color,
+                                linewidth=0, zorder=3))
+
+    # خط السعر الحالي
+    price_now = float(df["c"].iloc[-1])
+    ax.axhline(price_now, color=C_PRICE, linestyle="-",
+               linewidth=0.9, alpha=0.55, zorder=1)
+    ax.text(n + 0.3, price_now, f"  {price_now:.6f}",
+            color=C_PRICE, fontsize=10, va="center", ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.25",
+                      facecolor=C_PANEL, edgecolor=C_PRICE,
+                      linewidth=0.6))
+
+    # مستويات Pivot
+    p = (sr_data or {}).get("pivots")
+    if p:
+        levels = [
+            ("R3", p["r3"], C_R3),
+            ("R2", p["r2"], C_R2),
+            ("R1", p["r1"], C_R1),
+            ("P",  p["pivot"], C_PIVOT),
+            ("S1", p["s1"], C_S1),
+            ("S2", p["s2"], C_S2),
+            ("S3", p["s3"], C_S3),
+        ]
+        for name, lvl, col in levels:
+            ax.axhline(lvl, color=col, linestyle="--",
+                       linewidth=1.0, alpha=0.75, zorder=1)
+            ax.text(n + 0.3, lvl, f"  {name}  {lvl:.6f}",
+                    color=col, fontsize=9, va="center", ha="left",
+                    fontweight="bold")
+
+    # القمم السابقة
+    for h, _ts in (sr_data or {}).get("highs", []):
+        ax.axhline(h, color=C_DOWN, linestyle=":",
+                   linewidth=0.9, alpha=0.55, zorder=1)
+        ax.scatter([n - 1], [h], marker="v", s=42,
+                   color=C_DOWN, zorder=4, edgecolors="white", linewidths=0.5)
+        ax.text(-1.5, h, f"{h:.6f}  H", color=C_DOWN,
+                fontsize=8, va="center", ha="left", alpha=0.85)
+
+    # القيعان السابقة
+    for l, _ts in (sr_data or {}).get("lows", []):
+        ax.axhline(l, color=C_UP, linestyle=":",
+                   linewidth=0.9, alpha=0.55, zorder=1)
+        ax.scatter([n - 1], [l], marker="^", s=42,
+                   color=C_UP, zorder=4, edgecolors="white", linewidths=0.5)
+        ax.text(-1.5, l, f"{l:.6f}  L", color=C_UP,
+                fontsize=8, va="center", ha="left", alpha=0.85)
+
+    # إشارة تداول (اختياري)
+    if signal:
+        lv = signal.get("levels") or {}
+        entry = lv.get("entry"); sl = lv.get("stop_loss")
+        tp1 = lv.get("tp1"); tp2 = lv.get("tp2"); tp3 = lv.get("tp3")
+        if entry:
+            ax.axhline(entry, color=C_ENTRY, linestyle="-",
+                       linewidth=1.4, alpha=0.9, zorder=5)
+            ax.text(n + 0.3, entry, f"  ENTRY {entry:.6f}",
+                    color=C_ENTRY, fontsize=9, va="center", ha="left",
+                    fontweight="bold")
+        if sl:
+            ax.axhline(sl, color=C_DOWN, linestyle="-",
+                       linewidth=1.2, alpha=0.85, zorder=5)
+            ax.text(n + 0.3, sl, f"  SL {sl:.6f}",
+                    color=C_DOWN, fontsize=9, va="center", ha="left",
+                    fontweight="bold")
+        for tp, lbl in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
+            if tp:
+                ax.axhline(tp, color=C_UP, linestyle="-",
+                           linewidth=1.0, alpha=0.7, zorder=5)
+                ax.text(n + 0.3, tp, f"  {lbl} {tp:.6f}",
+                        color=C_UP, fontsize=9, va="center", ha="left")
+
+    # التنسيق
+    tf = (sr_data or {}).get("tf", "1h")
+    ax.set_title(f"  {symbol}   ·   {tf}", color=C_TEXT, fontsize=13,
+                 fontweight="bold", loc="left", pad=14)
+
+    ax.tick_params(axis="x", colors=C_MUTED, labelsize=9)
+    ax.tick_params(axis="y", colors=C_MUTED, labelsize=9)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.5f"))
+    ax.grid(True, color=C_GRID, alpha=0.55, linewidth=0.5)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    for sp in ("bottom", "left"):
+        ax.spines[sp].set_color(C_GRID)
+
+    ax.set_xlim(-3, n + 18)
+
+    fig.text(0.06, 0.025, f"SY {syria_now_str()}",
+             color=C_MUTED, fontsize=9)
+    fig.text(0.94, 0.025,
+             f"{_exchange.primary_name.upper()}  ·  {MARKET_TYPE}",
+             color=C_MUTED, fontsize=9, ha="right")
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", facecolor=C_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def generate_sr_chart(symbol, signal=None, tf=None):
+    """نسخة async — تجلب البيانات وترسم الرسم البياني"""
+    if not CHART_ENABLED:
+        return None
+    try:
+        tf = tf or MORNING_REPORT_TF
+        data = await fetch_ohlcv_cached(symbol, tf, MORNING_REPORT_LIMIT)
+        if not data or len(data) < 60:
+            return None
+        df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
+        sr_data = {
+            "pivots": calc_pivots_classic(df),
+            "highs":  find_swing_levels(df)["highs"],
+            "lows":   find_swing_levels(df)["lows"],
+            "tf":     tf,
+        }
+        buf = await asyncio.to_thread(
+            _chart_generate_sync, symbol, df, sr_data, signal
+        )
+        return buf
+    except Exception as e:
+        log.exception(f"generate_sr_chart {symbol}: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════
+# 20) 🆕 الواجهة الاحترافية (Inline Keyboards)
+# ═══════════════════════════════════════════════════════════
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("📊 الدعم والمقاومة", callback_data="menu:sr"),
+         InlineKeyboardButton("📈 فحص الإشارات",   callback_data="menu:cross")],
+        [InlineKeyboardButton("🎯 تشخيص العملات",  callback_data="menu:why"),
+         InlineKeyboardButton("📋 آخر الإشارات",   callback_data="menu:last")],
+        [InlineKeyboardButton("⏳ الإشارات النشطة", callback_data="menu:pending"),
+         InlineKeyboardButton("📐 نطاقات 6%",      callback_data="menu:ref6")],
+        [InlineKeyboardButton("🗺️ النطاقات",       callback_data="menu:ranges"),
+         InlineKeyboardButton("🔍 فحص النطاقات",   callback_data="menu:checkranges")],
+        [InlineKeyboardButton("📊 الأداء",          callback_data="menu:stats"),
+         InlineKeyboardButton("⚙️ الحالة",          callback_data="menu:status")],
+        [InlineKeyboardButton("🔧 التشدد",          callback_data="menu:strict"),
+         InlineKeyboardButton("🔄 تحديث",            callback_data="menu:refresh")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def coin_menu_kb(symbol: str) -> InlineKeyboardMarkup:
+    s = short(symbol)
+    kb = [
+        [InlineKeyboardButton(f"📈 رسم {s}",       callback_data=f"chart:{s}"),
+         InlineKeyboardButton(f"🔍 تشخيص {s}",     callback_data=f"why:{s}")],
+        [InlineKeyboardButton("📊 كل العملات",      callback_data="menu:why"),
+         InlineKeyboardButton("⬅️ القائمة",          callback_data="menu:main")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def back_kb(target="menu:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ رجوع", callback_data=target)
+    ]])
+
+
+async def cmd_menu(update, context):
+    txt = (
+        f"🎛️ <b>القائمة الرئيسية</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <b>Unified Smart Bot v6.5.0</b>\n"
+        f"🔌 {_exchange.primary_name} · {len(ALL_SYMBOLS)} عملة\n"
+        f"🇸🇾 {syria_now_str()}\n\n"
+        f"👇 اختر العملية:"
+    )
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                txt, parse_mode="HTML", reply_markup=main_menu_kb())
+        except Exception:
+            await update.callback_query.message.reply_text(
+                txt, parse_mode="HTML", reply_markup=main_menu_kb())
+    else:
+        await update.message.reply_text(
+            txt, parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+async def cmd_chart_coin(update, context):
+    rows, row = [], []
+    for sym in ALL_SYMBOLS:
+        row.append(InlineKeyboardButton(
+            short(sym), callback_data=f"chart:{short(sym)}"))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu:main")])
+    await update.message.reply_text(
+        "📈 <b>اختر عملة لعرض رسمها البياني:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def on_callback(update, context):
+    q = update.callback_query
+    data = q.data or ""
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    if data == "menu:main":
+        return await cmd_menu(update, context)
+
+    if data == "menu:cross":
+        try:
+            await q.edit_message_text("🔍 جارٍ فحص الإشارات...")
+        except Exception:
+            pass
+        for tf in ["5m", "15m", "1h"]:
+            await _run_cross(update, [tf])
+        return
+
+    if data == "menu:sr":
+        try:
+            await q.edit_message_text("📊 جارٍ توليد الرسوم البيانية...")
+        except Exception:
+            pass
+        return await _send_sr_charts(update, context)
+
+    if data == "menu:why":
+        try:
+            await q.edit_message_text("🔍 فحص شامل...")
+        except Exception:
+            pass
+        return await _diagnose_all(update)
+
+    if data == "menu:last":
+        return await cmd_last(update, context)
+    if data == "menu:pending":
+        return await cmd_pending(update, context)
+    if data == "menu:ref6":
+        return await cmd_ref6(update, context)
+    if data == "menu:ranges":
+        return await cmd_ranges(update, context)
+    if data == "menu:checkranges":
+        return await cmd_checkranges(update, context)
+    if data == "menu:stats":
+        return await cmd_stats(update, context)
+    if data == "menu:status":
+        return await cmd_status(update, context)
+    if data == "menu:strict":
+        return await cmd_strict(update, context)
+    if data == "menu:refresh":
+        return await cmd_refresh(update, context)
+
+    if data.startswith("chart:"):
+        coin = data.split(":", 1)[1]
+        target = find_symbol_by_name(coin)
+        if not target:
+            try:
+                return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception:
+                return
+        try:
+            await q.edit_message_text(f"📈 جارٍ رسم {coin}...")
+        except Exception:
+            pass
+        buf = await generate_sr_chart(target)
+        if not buf:
+            try:
+                return await q.message.reply_text("⚪ لا بيانات")
+            except Exception:
+                return
+        try:
+            await q.message.reply_photo(
+                photo=buf,
+                caption=f"📈 <b>{short(target)}</b> — {MORNING_REPORT_TF}\n"
+                        f"🇸🇾 {syria_now_str()}",
+                parse_mode="HTML",
+                reply_markup=back_kb("menu:main"))
+            _filter_stats["charts_sent"] += 1
+        except Exception as e:
+            log.error(f"chart send: {e}")
+            try:
+                await q.message.reply_text("❌ فشل إرسال الرسم")
+            except Exception:
+                pass
+        return
+
+    if data.startswith("why:"):
+        coin = data.split(":", 1)[1]
+        target = find_symbol_by_name(coin)
+        if not target:
+            try:
+                return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception:
+                return
+        return await _diagnose_coin(update, target)
+
+
+async def _send_sr_charts(update, context):
+    """يولّد رسم لكل عملة ويرسلها مع أزرار"""
+    if not _exchange.ok():
+        try:
+            return await update.effective_message.reply_text("❌ لا منصة.")
+        except Exception:
+            return
+
+    chat_id = update.effective_chat.id
+    ok = 0
+    for sym in ALL_SYMBOLS:
+        buf = await generate_sr_chart(sym)
+        if buf:
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=buf,
+                    caption=(
+                        f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
+                        f"🇸🇾 {syria_now_str()}\n"
+                        f"<i>R3..S3 = Pivot Levels  ·  H/L = القمم/القيعان</i>"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=coin_menu_kb(sym))
+                ok += 1
+                _filter_stats["charts_sent"] += 1
+            except Exception as e:
+                log.error(f"send_sr_chart {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+
+    if ok == 0:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text="⚪ لا بيانات لرسمها.")
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════
+# 21) الأوامر
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update, context):
     sd, sn = get_session_info()
@@ -1712,31 +2106,32 @@ async def cmd_start(update, context):
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.4.3</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.5.0</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔌 <b>{_exchange.primary_name}</b>\n"
         f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🛡️ فلاتر v6.4.3:</b>\n"
+        f"<b>🛡️ فلاتر v6.5.0:</b>\n"
         f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
         f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%\n"
         f"• ATR: 5m≥{MIN_ATR_PCT['5m']}%\n"
         f"• BB: Vol≥{BB_MIN_VOL}× | ADX≥{MIN_ADX_FOR_BB}\n\n"
-        f"<b>الأوامر:</b>\n"
-        f"/why [عملة] — تشخيص\n"
-        f"/last — آخر الإشارات\n"
-        f"/pending — النشطة\n"
-        f"/sr /ref6 /ranges /checkranges /refresh\n"
-        f"/cross /cross5 /cross15 /cross1h /checkprice\n"
-        f"/status /stats /perf /jobs /strict /clearcache",
-        parse_mode="HTML")
+        f"👇 استخدم الأزرار:",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb())
 
 
 async def _run_cross(update, tfs=None):
+    msg_target = update.effective_message or update.message
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
+        try: await msg_target.reply_text("❌ لا منصة.")
+        except Exception: pass
+        return
     tfs = tfs or TIMEFRAMES
-    await update.message.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
+    try:
+        await msg_target.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
+    except Exception:
+        pass
     clear_caches()
     detectors = _get_detectors()
     found = filtered = 0
@@ -1756,7 +2151,8 @@ async def _run_cross(update, tfs=None):
                 if not passed:
                     filtered += 1; continue
                 try:
-                    await update.message.reply_text(build_signal_message(cross), parse_mode="HTML")
+                    await msg_target.reply_text(
+                        build_signal_message(cross), parse_mode="HTML")
                     mark_symbol_sent(sym)
                     if cross["alert_type"] == "confirmed":
                         record_signal(sym, cross["direction"])
@@ -1769,7 +2165,8 @@ async def _run_cross(update, tfs=None):
     if filtered: msg += f"\n🚫 {filtered} محجوبة."
     if found == 0 and filtered == 0:
         msg = f"⚪ لا إشارات على {', '.join(tfs)}"
-    await update.message.reply_text(msg)
+    try: await msg_target.reply_text(msg)
+    except Exception: pass
 
 
 def _get_detectors():
@@ -1789,11 +2186,8 @@ async def cmd_cross15(u, c): await _run_cross(u, ["15m"])
 async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
 
 
-# ═══════════════════════════════════════════════════════════
-# 🆕 /why — دالة مساعدة للحصول على تشخيص عملة واحدة
-# ═══════════════════════════════════════════════════════════
+# ── /why ────────────────────────────────────────────────
 async def _get_diagnosis(symbol, tf):
-    """يُعيد dict بتشخيص عملة واحدة على إطار واحد"""
     try:
         df = await _df_for(symbol, tf)
         if df is None: return None
@@ -1810,15 +2204,15 @@ async def _get_diagnosis(symbol, tf):
         try:
             vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
         except: vol_ratio = 0
-        
+
         th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
         score_bull = compute_score(df, "bullish", curr)["score"]
         score_bear = compute_score(df, "bearish", curr)["score"]
         best_score = max(score_bull, score_bear)
-        
+
         min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
         min_atr = MIN_ATR_PCT.get(tf, 0.05)
-        
+
         checks = {
             "EMA gap":       gap >= min_gap,
             "ATR":           atr_pct >= min_atr,
@@ -1854,89 +2248,90 @@ async def _get_diagnosis(symbol, tf):
 
 
 async def _diagnose_coin(update, target):
-    """🆕 تشخيص كامل لعملة واحدة على 3 أطر"""
+    msg_target = update.effective_message or update.message
     lines = [f"📊 <b>تشخيص {short(target)}</b>", "━━━━━━━━━━━━━━━━━━━"]
-    
     for tf in ["5m", "15m", "1h"]:
         r = await _get_diagnosis(target, tf)
         if r is None:
             lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
-        
         lines.append(f"\n<b>[{tf}]</b>  💰 {fmt_price(r['price'])}")
         for k in r["checks"]:
             ok = "✅" if r["checks"][k] else "❌"
             lines.append(
                 f"{ok} {k}: <b>{r['values'][k]}</b> / {r['thresholds'][k]}")
         lines.append(f"📉 RSI: {r['rsi']:.1f}")
-    
     ok_cd, rem = check_symbol_cooldown(target)
     cd_txt = "✅" if ok_cd else f"❌ متبقي {rem}s"
     lines.append(f"\n⏳ Cooldown: {cd_txt}")
     lines.append("━━━━━━━━━━━━━━━━━━━")
     lines.append("💡 <i>أي ❌ = فلتر يمنع الإشارة</i>")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    try:
+        await msg_target.reply_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=coin_menu_kb(target))
+    except Exception as e:
+        log.error(f"_diagnose_coin: {e}")
 
 
 async def _diagnose_all(update):
-    """🆕 تشخيص كل العملات + ترتيب بالأقرب للنجاح"""
+    msg_target = update.effective_message or update.message
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    
-    await update.message.reply_text(
-        f"🔍 فحص شامل لـ {len(ALL_SYMBOLS)} عملة (15m) ...")
-    
+        try: await msg_target.reply_text("❌ لا منصة.")
+        except Exception: pass
+        return
+    try:
+        await msg_target.reply_text(
+            f"🔍 فحص شامل لـ {len(ALL_SYMBOLS)} عملة (15m) ...")
+    except Exception:
+        pass
+
     results = []
     for sym in ALL_SYMBOLS:
         r = await _get_diagnosis(sym, "15m")
         if r: results.append(r)
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    
+
     if not results:
-        await update.message.reply_text("⚪ لا بيانات."); return
-    
-    # ترتيب: الأقرب للنجاح أولاً (عدد النجاحات - عدد الفشل)
+        try: await msg_target.reply_text("⚪ لا بيانات.")
+        except Exception: pass
+        return
+
     def sort_key(r):
         fails = sum(1 for v in r["checks"].values() if not v)
         return (fails, -r["score"])
     results.sort(key=sort_key)
-    
+
     sd, sn = get_session_info()
     lines = [f"📊 <b>تشخيص شامل ({len(results)})</b>",
              f"🕐 {sn}",
              "━━━━━━━━━━━━━━━━━━━"]
-    
+
     for r in results:
         fails = [k for k, v in r["checks"].items() if not v]
-        if not fails:
-            icon = "🌟"
-        elif len(fails) == 1:
-            icon = "⚠️"
-        elif len(fails) == 2:
-            icon = "❌"
-        else:
-            icon = "🚫"
-        
+        if not fails:      icon = "🌟"
+        elif len(fails) == 1: icon = "⚠️"
+        elif len(fails) == 2: icon = "❌"
+        else:              icon = "🚫"
         lines.append(
             f"\n{icon} <b>{short(r['symbol'])}</b>  "
             f"Score={r['score']}  💰{fmt_price(r['price'])}")
-        
         if not fails:
             lines.append("   ✅ كل الفلاتر مرّت")
         else:
             for k in fails:
                 lines.append(
                     f"   ❌ {k}: {r['values'][k]} / {r['thresholds'][k]}")
-    
+
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
     lines.append(f"💡 <code>/why BTC</code> لتفاصيل عملة محددة")
     lines.append(f"🌟=جاهز | ⚠️=قريب | ❌=بعيد | 🚫=مستحيل")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    try:
+        await msg_target.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        log.error(f"_diagnose_all: {e}")
 
 
 async def cmd_why(update, context):
-    """🆕 /why → كل العملات | /why BTC → BTC فقط"""
     args = context.args or []
     if args:
         coin_name = args[0]
@@ -1954,13 +2349,11 @@ async def cmd_why(update, context):
 
 
 async def cmd_last(update, context):
-    """🆕 آخر الإشارات"""
     if not _last_signals:
         await update.message.reply_text(
             "📭 لا إشارات بعد.\n"
             "ستُحفظ الإشارات المُتابَعة هنا.", parse_mode="HTML")
         return
-    
     lines = ["📋 <b>آخر الإشارات</b>", "━━━━━━━━━━━━━━━━━━━"]
     for s in reversed(list(_last_signals)):
         icon = {"win_tp3": "🌟", "win_tp2": "✅", "win_tp1": "🎯",
@@ -1970,47 +2363,36 @@ async def cmd_last(update, context):
         lines.append(
             f"\n{icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
             f"{dir_icon} {_source_label(s['source'])}")
-        lines.append(
-            f"   🕐 {ts_str} | Score={s['score']}")
+        lines.append(f"   🕐 {ts_str} | Score={s['score']}")
         lines.append(
             f"   💰 {fmt_price(s['entry'])} → {fmt_price(s['exit'])} "
             f"<b>{s['pnl_pct']:+.2f}%</b>")
         lines.append(
             f"   ⏱️ {s['duration_min']} د | نتيجة: <b>{s['result']}</b>")
-    
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
     lines.append(f"📊 المجموع: {len(_last_signals)} إشارة")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_pending(update, context):
-    """🆕 الإشارات النشطة"""
     active = {sid: s for sid, s in _pending_signals.items() if not s["checked"]}
     if not active:
         await update.message.reply_text("📭 لا إشارات نشطة.")
         return
-    
     lines = [f"⏳ <b>إشارات نشطة ({len(active)})</b>", "━━━━━━━━━━━━━━━━━━━"]
     now = _time.time()
-    
     for sid, sig in active.items():
         cross = sig["cross"]
-        sym = short(cross["symbol"])
-        tf = cross["timeframe"]
+        sym = short(cross["symbol"]); tf = cross["timeframe"]
         bull = sig["direction"] == "bullish"
         lv = sig["levels"]
-        
-        # جلب السعر الحالي
         try:
             data, _ = await _exchange.fetch_ohlcv(cross["symbol"], "1m", 2)
             price = float(data[-1][4]) if data else lv["entry"]
         except Exception:
             price = lv["entry"]
-        
         pnl = ((price - lv["entry"]) / lv["entry"] * 100) * (1 if bull else -1)
         age_min = int((now - sig["entry_ts"]) / 60)
-        
-        # حالة الأهداف
         tp_status = []
         if bull:
             if price >= lv["tp1"]: tp_status.append("TP1 ✅")
@@ -2021,17 +2403,14 @@ async def cmd_pending(update, context):
             if price <= lv["tp2"]: tp_status.append("TP2 ✅")
             if price <= lv["tp3"]: tp_status.append("TP3 ✅")
         tp_txt = " | ".join(tp_status) if tp_status else "لا هدف بعد"
-        
         dir_icon = "🟢" if bull else "🔴"
         pnl_icon = "🟢" if pnl >= 0 else "🔴"
-        
         lines.append(
             f"\n{dir_icon} <b>{sym}</b> [{tf}] {_source_label(cross.get('source','ema'))}")
         lines.append(f"   💰 دخول: {fmt_price(lv['entry'])} → حالي: {fmt_price(price)}")
         lines.append(f"   {pnl_icon} P&L: <b>{pnl:+.2f}%</b> | ⏱️ {age_min} د")
         lines.append(f"   🎯 {tp_txt}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    
     lines.append("\n━━━━━━━━━━━━━━━━━━━")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -2067,29 +2446,64 @@ async def cmd_refresh(update, context):
 
 
 async def cmd_ref6(update, context):
+    msg_target = update.effective_message or update.message
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text("🔍 حساب 6% ...")
+        try: await msg_target.reply_text("❌ لا منصة.")
+        except Exception: pass
+        return
+    try: await msg_target.reply_text("🔍 حساب 6% ...")
+    except Exception: pass
     results = await compute_6pct_ranges()
     if not results:
-        await update.message.reply_text("⚪ لا بيانات."); return
-    await update.message.reply_text(
-        build_6pct_report(results, "📊 تقرير 6%"), parse_mode="HTML")
+        try: await msg_target.reply_text("⚪ لا بيانات.")
+        except Exception: pass
+        return
+    try:
+        await msg_target.reply_text(
+            build_6pct_report(results, "📊 تقرير 6%"), parse_mode="HTML")
+    except Exception as e:
+        log.error(f"cmd_ref6: {e}")
 
 
 async def cmd_sr(update, context):
+    """🆕 يرسل الرسوم البيانية مع الأزرار"""
+    msg_target = update.effective_message or update.message
     if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text(f"🔍 جمع بيانات {MORNING_REPORT_TF} ...")
-    items = []
+        try: await msg_target.reply_text("❌ لا منصة.")
+        except Exception: pass
+        return
+    try:
+        await msg_target.reply_text(
+            f"📊 جارٍ توليد رسوم {MORNING_REPORT_TF} لـ {len(ALL_SYMBOLS)} عملة...")
+    except Exception:
+        pass
+
+    chat_id = update.effective_chat.id
+    ok = 0
     for sym in ALL_SYMBOLS:
-        it = await collect_sr_data(sym)
-        if it: items.append(it)
+        buf = await generate_sr_chart(sym)
+        if buf:
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=buf,
+                    caption=(
+                        f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
+                        f"🇸🇾 {syria_now_str()}"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=coin_menu_kb(sym))
+                ok += 1
+                _filter_stats["charts_sent"] += 1
+            except Exception as e:
+                log.error(f"sr send {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if not items:
-        await update.message.reply_text("⚪ لا بيانات."); return
-    await update.message.reply_text(
-        build_morning_report(items, "🌅 تقرير الدعم والمقاومة"), parse_mode="HTML")
+
+    if ok == 0:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
+        except Exception:
+            pass
 
 
 async def cmd_checkranges(update, context):
@@ -2119,13 +2533,14 @@ async def cmd_status(update, context):
     st = _smart.stats()
     active = len([s for s in _pending_signals.values() if not s["checked"]])
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.4.3</b>\n"
+        f"🤖 <b>الحالة v6.5.0</b>\n"
         f"🔌 {_exchange.primary_name}\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
         f"📬 متابعات: <b>{_filter_stats['followups_sent']}</b>\n"
+        f"🖼️ رسوم: <b>{_filter_stats['charts_sent']}</b>\n"
         f"🚫 محجوبة: {total}\n"
         f"  • score_abs: {_filter_stats['filtered_score_abs']}\n"
         f"  • score: {_filter_stats['filtered_score']}\n"
@@ -2196,7 +2611,7 @@ async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
     sd, sn = get_session_info()
     await update.message.reply_text(
-        f"🎯 <b>التشدد v6.4.3</b>\n"
+        f"🎯 <b>التشدد v6.5.0</b>\n"
         f"🕐 {sn} ({sd:+d})\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<b>ديناميكي (15m):</b>\n"
@@ -2205,7 +2620,7 @@ async def cmd_strict(update, context):
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🛡️ ثوابت v6.4.3:</b>\n"
+        f"<b>🛡️ ثوابت v6.5.0:</b>\n"
         f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
         f"• EMA gap: 5m={MIN_EMA_GAP_PCT['5m']}%\n"
         f"• ATR min: 5m={MIN_ATR_PCT['5m']}%\n"
@@ -2233,7 +2648,7 @@ async def error_handler(update, context):
 
 
 # ═══════════════════════════════════════════════════════════
-# 20) Jobs
+# 22) Jobs
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context):
     if not _exchange.ok(): return
@@ -2335,33 +2750,51 @@ async def six_pct_report_job(context):
 
 
 async def morning_report_job(context):
+    """🌅 يرسل رسم بياني + ملخص لكل عملة"""
     if not _exchange.ok() or not CHAT_ID: return
-    log.info("🌅 بدء التقرير الصباحي ...")
+    log.info("🌅 بدء التقرير الصباحي المصوّر ...")
+
     try:
-        items = []
-        for sym in ALL_SYMBOLS:
-            it = await collect_sr_data(sym)
-            if it: items.append(it)
-            await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-        if not items:
-            log.warning("⚠️ لا بيانات صباح"); return
         await context.bot.send_message(
-            chat_id=CHAT_ID, text=build_morning_report(items), parse_mode="HTML")
-        _filter_stats["morning_reports"] += 1
-        log.info(f"📤 التقرير الصباحي ({len(items)})")
+            chat_id=CHAT_ID,
+            text=(f"🌅 <b>تقرير الصباح</b>\n"
+                  f"🇸🇾 {syria_now_str()}\n"
+                  f"📊 {len(ALL_SYMBOLS)} عملة · {MORNING_REPORT_TF}"),
+            parse_mode="HTML")
     except Exception as e:
-        log.exception(f"morning_report: {e}")
+        log.error(f"morning header: {e}")
+
+    ok = 0
+    for sym in ALL_SYMBOLS:
+        try:
+            buf = await generate_sr_chart(sym)
+            if not buf:
+                continue
+            await context.bot.send_photo(
+                chat_id=CHAT_ID, photo=buf,
+                caption=(f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
+                         f"<i>R3..S3 = Pivot  ·  H/L = قمم/قيعان</i>"),
+                parse_mode="HTML",
+                reply_markup=coin_menu_kb(sym))
+            ok += 1
+            _filter_stats["charts_sent"] += 1
+        except Exception as e:
+            log.error(f"morning {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+
+    _filter_stats["morning_reports"] += 1
+    log.info(f"📤 التقرير الصباحي: {ok}/{len(ALL_SYMBOLS)}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 21) Health
+# 23) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.4.3")
+        self.wfile.write(b"OK - Unified Smart Bot v6.5.0")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -2373,7 +2806,7 @@ def run_health():
 
 
 # ═══════════════════════════════════════════════════════════
-# 22) Main
+# 24) Main
 # ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
@@ -2388,7 +2821,7 @@ def main():
     print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
     print(f"📊 رموز: {ALL_SYMBOLS}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
-    print(f"🛡️ فلاتر v6.4.3:")
+    print(f"🛡️ فلاتر v6.5.0:")
     print(f"   • Score مطلق ≥ {ABS_MIN_SCORE}")
     print(f"   • EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%")
     print(f"   • ATR min: 5m≥{MIN_ATR_PCT['5m']}%")
@@ -2400,6 +2833,7 @@ def main():
     print(f"📏 SL min: 5m={MIN_SL_PCT['5m']}%")
     print(f"📬 متابعة: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
     print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00")
+    print(f"📊 الرسوم: {'مُفعّلة' if CHART_ENABLED else 'معطّلة'} | lookback={CHART_LOOKBACK}")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
@@ -2414,8 +2848,10 @@ def main():
             "   الحل: pip install 'python-telegram-bot[job-queue]'")
     print("✅ job_queue متوفر")
 
-    # Handlers
+    # ── Handlers ─────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("chart", cmd_chart_coin))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
@@ -2435,9 +2871,13 @@ def main():
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
+
+    # ── معالج الأزرار ─────────────────────────────────
+    app.add_handler(CallbackQueryHandler(on_callback))
+
     app.add_error_handler(error_handler)
 
-    # Jobs
+    # ── Jobs ─────────────────────────────────────────
     app.job_queue.run_repeating(
         crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
     app.job_queue.run_repeating(
