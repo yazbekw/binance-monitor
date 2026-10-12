@@ -816,7 +816,7 @@ class PositionManager:
         log.info(f"✅ فتح {short(sym)} {direction} @ {entry_price} | SL={sl} | qty={filled_qty}")
         return pos
 
-async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
+    async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
         # ✅ v7.3: تخطى إذا تم التحقق مؤخراً
         last = pos.get("sl_verified_at", 0)
