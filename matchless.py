@@ -60,7 +60,7 @@ LEVERAGE                = int(os.getenv("LEVERAGE", "40"))
 POSITION_NOTIONAL_USD   = float(os.getenv("POSITION_NOTIONAL_USD", "400"))
 MAX_CONCURRENT_POSITIONS= int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
 MARGIN_MODE             = os.getenv("MARGIN_MODE", "isolated")
-MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "1.0"))
+MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "2.0"))
 TRADE_ON_CONFIRMED_ONLY = os.getenv("TRADE_ON_CONFIRMED_ONLY", "true").lower() == "true"
 ENABLE_LONG             = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT            = os.getenv("ENABLE_SHORT", "true").lower() == "true"
@@ -69,7 +69,7 @@ MAX_DAILY_LOSS_PCT       = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
 MAX_CONSECUTIVE_LOSSES   = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 
 # ✅ v7.3: TP splits جديدة
-TP_SPLITS                = [0.40, 0.35, 0.25]
+TP_SPLITS                = [0.50, 0.40, 0.10]
 TP1_R_MULTIPLE           = 1.2    # TP1 = 1.2R
 TP2_R_MULTIPLE           = 2.0
 TP3_R_MULTIPLE           = 3.5
@@ -126,7 +126,7 @@ ABS_MIN_SCORE        = 52
 BB_MIN_VOL           = 1.0
 BB_MIN_ADX_IN_RANGE  = 20
 BB_CONFIRM_ENABLED   = True
-MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
+MIN_SL_PCT = {"5m": 1.0, "15m": 1.5, "1h": 2.0}
 SIGNAL_TRACK_MAX_MIN = 90
 LAST_SIGNALS_MAX = 20
 
@@ -261,14 +261,14 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
         price = float(df["c"].iloc[curr_idx])
         atr = float(calc_atr(df).iloc[curr_idx])
         ema_slow = float(calc_ema(df["c"], EMA_SLOW).iloc[curr_idx])
-        min_sl_pct = MIN_SL_PCT.get(tf, 0.50)
+        min_sl_pct = MIN_SL_PCT.get(tf, 1.0)
         lookback = min(20, len(df) + curr_idx - 1)
         if lookback < 2: return None
         recent_high = float(df["h"].iloc[curr_idx-lookback:curr_idx].max())
         recent_low  = float(df["l"].iloc[curr_idx-lookback:curr_idx].min())
         if direction == "bullish":
-            sl_atr = price - atr * 1.5
-            sl_struct = min(recent_low, ema_slow) * 0.998
+            sl_atr = price - atr * 3
+            sl_struct = min(recent_low, ema_slow) * 0.995
             stop_loss = max(sl_atr, sl_struct)
             min_dist = price * (min_sl_pct / 100)
             if (price - stop_loss) < min_dist: stop_loss = price - min_dist
@@ -278,8 +278,8 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
             tp2 = price + risk * TP2_R_MULTIPLE
             tp3 = price + risk * TP3_R_MULTIPLE
         else:
-            sl_atr = price + atr * 1.5
-            sl_struct = max(recent_high, ema_slow) * 1.002
+            sl_atr = price + atr * 3.0
+            sl_struct = max(recent_high, ema_slow) * 1.005
             stop_loss = min(sl_atr, sl_struct)
             min_dist = price * (min_sl_pct / 100)
             if (stop_loss - price) < min_dist: stop_loss = price + min_dist
