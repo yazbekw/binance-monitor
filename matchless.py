@@ -105,6 +105,8 @@ LAST_SIGNALS_MAX = 20
 STARTUP_DELAY_SEC       = int(os.getenv("STARTUP_DELAY_SEC", "30"))
 INTER_SYMBOL_DELAY_SEC  = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "1.5"))
 WATCHDOG_INTERVAL_SEC   = int(os.getenv("WATCHDOG_INTERVAL_SEC", "180"))
+SL_VERIFIED_TTL_SEC     = int(os.getenv("SL_VERIFIED_TTL_SEC", "1800"))
+TP_VERIFIED_TTL_SEC     = int(os.getenv("TP_VERIFIED_TTL_SEC", "900"))
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
 
@@ -683,6 +685,7 @@ class PositionManager:
         self.daily_reset_ts = _time.time()
         self.consecutive_losses = 0
         self.paused = False
+        self.monitor_paused = False   # v7.3
         self.ws_ref = None
         self._lock = asyncio.Lock()
         self._watchdog_fails: Dict[str, int] = {}
@@ -813,9 +816,13 @@ class PositionManager:
         log.info(f"✅ فتح {short(sym)} {direction} @ {entry_price} | SL={sl} | qty={filled_qty}")
         return pos
 
-    async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
-        """✅ v7.2: يتجاهل -4130 (SL موجود مسبقاً)"""
+async def _place_sl(self, symbol, pos, price, tag="sl") -> bool:
         sl_side = "sell" if pos["direction"] == "bullish" else "buy"
+        # ✅ v7.3: تخطى إذا تم التحقق مؤخراً
+        last = pos.get("sl_verified_at", 0)
+        if last and (_time.time() - last) < SL_VERIFIED_TTL_SEC:
+            log.debug(f"✓ SL محقَّق ({int(_time.time()-last)}s) {symbol}")
+            return True
         try:
             o = await self.executor.create_order(
                 symbol, "STOP_MARKET", sl_side, None, None,
@@ -825,13 +832,17 @@ class PositionManager:
                  "newClientOrderId": f"{pos['signal_id']}_{tag}"[:36]})
             pos["sl_order_id"] = o.get("id")
             pos["sl_last_verified"] = _time.time()
+            pos["sl_verified_at"] = _time.time()
+            pos["sl_verified_via"] = "created"
+            log.info(f"✅ SL وُضع {symbol}")
             return True
         except Exception as e:
             err_str = str(e)
-            # ✅ v7.2: تجاهل إذا SL موجود مسبقاً (خطأ -4130)
             if "-4130" in err_str or "closePosition in the direction is existing" in err_str:
-                log.warning(f"⚠️ SL موجود مسبقاً لـ {symbol} — تخطي")
+                log.warning(f"⚠️ SL موجود مسبقاً {symbol} — سجّل")
                 pos["sl_last_verified"] = _time.time()
+                pos["sl_verified_at"] = _time.time()
+                pos["sl_verified_via"] = "4130"
                 return True
             log.error(f"SL {symbol}: {e}")
             return False
@@ -960,9 +971,10 @@ class PositionManager:
 
     async def on_margin_call(self, ev):
         await self._notify("🚨 <b>MARGIN CALL</b> — راجع حسابك فوراً!")
-
     async def watchdog_check(self):
         if not self.positions: return
+        if self.monitor_paused:
+            return
         for sym, pos in list(self.positions.items()):
             try:
                 await self._watchdog_one(sym, pos)
@@ -972,6 +984,10 @@ class PositionManager:
             await asyncio.sleep(1.0)
 
     async def _watchdog_one(self, symbol, pos):
+        # ✅ v7.3: تخطى إذا SL محقَّق حديثاً
+        last = pos.get("sl_verified_at", 0)
+        if last and (_time.time() - last) < SL_VERIFIED_TTL_SEC:
+            return
         # 1) هل الصفقة ما زالت موجودة؟
         try:
             bpos_list = await self.executor.fetch_positions([symbol])
@@ -1011,6 +1027,8 @@ class PositionManager:
             if is_stop:
                 has_sl = True
                 pos["sl_order_id"] = o.get("id")
+                pos["sl_verified_at"] = _time.time()
+                pos["sl_verified_via"] = "fetch"
             elif is_tp:
                 if "_tp1" in cid: tp_ids_seen.add("tp1")
                 elif "_tp2" in cid: tp_ids_seen.add("tp2")
@@ -1606,7 +1624,7 @@ async def cmd_closeall(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("✅ تم")
 
 async def cmd_emergency(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    _positions_mgr.paused = True
+    _positions_mgr.monitor_paused = True
     await u.message.reply_text("🆘 إغلاق طارئ + إيقاف")
     await _positions_mgr.close_all("emergency")
 
@@ -1641,7 +1659,7 @@ async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML")
         return
     old_losses = _positions_mgr.consecutive_losses
-    _positions_mgr.paused = False
+    _positions_mgr.monitor_paused = False
     _positions_mgr.consecutive_losses = 0
     log.info(f"▶️ البوت استؤنف عبر /resume (كان {old_losses} خسائر)")
     await u.message.reply_text(
@@ -1652,6 +1670,38 @@ async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>\n"
         f"🕐 {syria_now_str()}\n\n"
         "⏱️ الدورة التالية خلال ≤ 120 ثانية",
+        parse_mode="HTML")
+
+async def cmd_monitor_off(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """🔕 إيقاف متابعة SL/TP"""
+    if _positions_mgr.monitor_paused:
+        await u.message.reply_text("🔕 المتابعة موقوفة بالفعل.")
+        return
+    _positions_mgr.monitor_paused = True
+    log.warning("🔕 متابعة الصفقات موقوفة")
+    await u.message.reply_text(
+        "🔕 <b>تم إيقاف المتابعة</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "⏸️ Watchdog لن يفحص SL/TP\n"
+        "🛡️ أوامر Binance تعمل بشكل طبيعي\n"
+        f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>\n\n"
+        "💡 للتشغيل: <code>/monitor_on</code>",
+        parse_mode="HTML")
+
+
+async def cmd_monitor_on(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """🔔 تشغيل متابعة SL/TP"""
+    if not _positions_mgr.monitor_paused:
+        await u.message.reply_text("🔔 المتابعة مُفعَّلة بالفعل.")
+        return
+    _positions_mgr.monitor_paused = False
+    _positions_mgr._watchdog_fails.clear()
+    log.info("🔔 متابعة الصفقات مُفعَّلة")
+    await u.message.reply_text(
+        "🔔 <b>تم تشغيل المتابعة</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "✅ Watchdog سيبدأ الفحص\n"
+        f"📊 Positions: <b>{len(_positions_mgr.positions)}</b>",
         parse_mode="HTML")
 
 async def cmd_balance(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1674,7 +1724,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     jq = c.application.job_queue; jobs_n = len(jq.jobs()) if jq else 0
     status_icon = "⏸️ موقوف" if _positions_mgr.paused else "▶️ يعمل"
     status_detail = ""
-    if _positions_mgr.paused:
+    if _positions_mgr.paused and _positions_mgr.monitor_paused:
         if _positions_mgr.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             status_detail = f"\n⚠️ بسبب: {MAX_CONSECUTIVE_LOSSES} خسائر متتالية"
         else:
@@ -1847,6 +1897,8 @@ def main():
     app.add_handler(CommandHandler("closeall", cmd_closeall))
     app.add_handler(CommandHandler("emergency", cmd_emergency))
     app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("monitor_off", cmd_monitor_off))
+    app.add_handler(CommandHandler("monitor_on", cmd_monitor_on))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("status", cmd_status))
