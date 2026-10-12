@@ -60,7 +60,7 @@ LEVERAGE                = int(os.getenv("LEVERAGE", "40"))
 POSITION_NOTIONAL_USD   = float(os.getenv("POSITION_NOTIONAL_USD", "400"))
 MAX_CONCURRENT_POSITIONS= int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
 MARGIN_MODE             = os.getenv("MARGIN_MODE", "isolated")
-MAX_SL_PCT              = float(os.getenv("MAX_SL_PCT", "2.0"))
+MAX_SL_PCT              = 3.0
 TRADE_ON_CONFIRMED_ONLY = os.getenv("TRADE_ON_CONFIRMED_ONLY", "true").lower() == "true"
 ENABLE_LONG             = os.getenv("ENABLE_LONG", "true").lower() == "true"
 ENABLE_SHORT            = os.getenv("ENABLE_SHORT", "true").lower() == "true"
@@ -69,21 +69,21 @@ MAX_DAILY_LOSS_PCT       = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
 MAX_CONSECUTIVE_LOSSES   = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 
 # ✅ v7.3: TP splits جديدة
-TP_SPLITS                = [0.50, 0.40, 0.10]
+TP_SPLITS                = [0.50, 0.30, 0.20]
 TP1_R_MULTIPLE           = 1.2    # TP1 = 1.2R
 TP2_R_MULTIPLE           = 2.0
 TP3_R_MULTIPLE           = 3.5
 
 # ✅ v7.3: Trailing من TP1 بدل Breakeven
 BREAKEVEN_AFTER_TP1      = False   # معطّل
-TRAIL_FROM_TP1           = True    # جديد
+TRAIL_FROM_TP1           = False    # جديد
 TRAIL_AFTER_TP2          = True
 TRAIL_CALLBACK_RATE      = float(os.getenv("TRAIL_CALLBACK_RATE", "0.4"))
-TRAIL_CALLBACK_TP1       = float(os.getenv("TRAIL_CALLBACK_TP1", "0.6"))
+TRAIL_CALLBACK_TP1       = 1.5
 
 # ✅ v7.3: Correlation & BTC bias
 CORRELATION_FILTER_ENABLED = True
-MAX_SAME_DIRECTION_POS     = 2
+MAX_SAME_DIRECTION_POS     = 3
 BTC_BIAS_FILTER_ENABLED    = True
 BTC_SYMBOL                 = "BTC/USDT:USDT"
 
@@ -138,7 +138,7 @@ SYMBOL_COOLDOWN_SEC = 900  # default fallback
 STARTUP_DELAY_SEC       = int(os.getenv("STARTUP_DELAY_SEC", "30"))
 INTER_SYMBOL_DELAY_SEC  = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "1.5"))
 WATCHDOG_INTERVAL_SEC   = int(os.getenv("WATCHDOG_INTERVAL_SEC", "45"))  # ✅ v7.3: 45s
-SL_VERIFIED_TTL_SEC     = int(os.getenv("SL_VERIFIED_TTL_SEC", "1800"))
+SL_VERIFIED_TTL_SEC     = 300
 TP_VERIFIED_TTL_SEC     = int(os.getenv("TP_VERIFIED_TTL_SEC", "900"))
 
 SYRIA_TZ = ZoneInfo("Asia/Damascus")
