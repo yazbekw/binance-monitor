@@ -76,7 +76,7 @@ TP3_R_MULTIPLE           = 3.5
 
 # ✅ v7.3: Trailing من TP1 بدل Breakeven
 BREAKEVEN_AFTER_TP1      = False   # معطّل
-TRAIL_FROM_TP1           = False    # جديد
+TRAIL_FROM_TP1           = True    # جديد
 TRAIL_AFTER_TP2          = True
 TRAIL_CALLBACK_RATE      = float(os.getenv("TRAIL_CALLBACK_RATE", "0.4"))
 TRAIL_CALLBACK_TP1       = 1.5
