@@ -2365,4 +2365,937 @@ async def cmd_positions(update, context):
         age = int((now - t["opened_at"]) / 60)
         lines.append(
             f"\n{'🟢 LONG' if t['side']=='LONG' else '🔴 SHORT'} "
-            f"<b>{short(t['symbol'])}</b> [{t['tf
+            f"<b>{short(t['symbol'])}</b> [{t['tf']}]"
+            f"{' 🔧' if t.get('manual') else ''}\n"
+            f"   💰 {fmt_price(t['entry'])} → {fmt_price(cur)}\n"
+            f"   {pnl_icon} {pnl_pct:+.2f}% | ⏱️ {age} د\n"
+            f"   🎯 TP {fmt_price(t['tp'])} | 🛑 SL {fmt_price(t['sl'])}\n"
+            f"   📦 {t['qty']} | 🆔 <code>{t['id'][-20:]}</code>")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_close(update, context):
+    if not _binance.ok:
+        await _reply(update,
+            f"❌ Binance غير متصل.\n"
+            f"السبب: <code>{_binance.error_msg or 'غير معروف'}</code>",
+            parse_mode="HTML")
+        return
+    args = context.args or []
+    if not args:
+        await _reply(update, "الاستخدام: <code>/close XRP</code>", parse_mode="HTML")
+        return
+    coin = args[0].upper()
+    target_sym = None
+    for s in ALL_SYMBOLS:
+        if short(s) == coin: target_sym = _to_binance_symbol(s); break
+    if not target_sym: target_sym = coin + "USDT"
+    tickets = _tickets_for(target_sym)
+    if not tickets:
+        await _reply(update, f"⚠️ لا صفقات على {coin}."); return
+    total_qty = sum(t["qty"] for t in tickets)
+    side = tickets[0]["side"]
+    close_side = "SELL" if side == "LONG" else "BUY"
+    info = _binance.info(target_sym)
+    qty_s = _binance.fmt_qty(_binance.round_qty(total_qty, info["step_size"]),
+                             info["qty_precision"]) if info else f"{total_qty}"
+    try:
+        res = await asyncio.to_thread(_binance.close_market, target_sym,
+                                      close_side, qty_s)
+    except Exception as e:
+        await _reply(update, f"❌ فشل: {e}"); return
+    close_price = res["avg_price"] or 0
+    for t in tickets:
+        if t["side"] == "LONG": pnl_pct = (close_price - t["entry"]) / t["entry"] * 100
+        else: pnl_pct = (t["entry"] - close_price) / t["entry"] * 100
+        age_min = (_time.time() - t["opened_at"]) / 60
+        _remove_ticket(t["id"])
+        _filter_stats["trades_closed"] += 1
+        _filter_stats["trades_manual_close"] += 1
+        try:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=build_close_msg(t, close_price, 0.0, pnl_pct,
+                                     "MANUAL", age_min),
+                parse_mode="HTML")
+        except Exception: pass
+
+
+async def cmd_closeall(update, context):
+    if not _binance.ok:
+        await _reply(update,
+            f"❌ Binance غير متصل.\n"
+            f"السبب: <code>{_binance.error_msg or 'غير معروف'}</code>",
+            parse_mode="HTML")
+        return
+    with _ticket_lock:
+        symbols = [s for s, ids in _symbol_ticket_index.items() if ids]
+    if not symbols:
+        await _reply(update, "📭 لا صفقات مفتوحة."); return
+    await _reply(update, f"🔒 جارٍ إغلاق {len(symbols)} رمز...")
+    for bsym in symbols:
+        tickets = _tickets_for(bsym)
+        if not tickets: continue
+        total_qty = sum(t["qty"] for t in tickets)
+        side = tickets[0]["side"]
+        close_side = "SELL" if side == "LONG" else "BUY"
+        info = _binance.info(bsym)
+        qty_s = _binance.fmt_qty(_binance.round_qty(total_qty, info["step_size"]),
+                                 info["qty_precision"]) if info else f"{total_qty}"
+        try:
+            res = await asyncio.to_thread(_binance.close_market, bsym,
+                                          close_side, qty_s)
+            cp = res["avg_price"] or 0
+            for t in tickets:
+                age_min = (_time.time() - t["opened_at"]) / 60
+                _remove_ticket(t["id"])
+                _filter_stats["trades_closed"] += 1
+                _filter_stats["trades_manual_close"] += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=build_close_msg(t, cp, 0.0, 0.0, "MANUAL", age_min),
+                        parse_mode="HTML")
+                except Exception: pass
+        except Exception as e:
+            await _reply(update, f"❌ {bsym}: {e}")
+        await asyncio.sleep(0.3)
+
+
+async def cmd_pnl(update, context):
+    if not _binance.ok:
+        await _reply(update,
+            f"❌ Binance غير متصل.\n"
+            f"السبب: <code>{_binance.error_msg or 'غير معروف'}</code>",
+            parse_mode="HTML")
+        return
+    bal = await asyncio.to_thread(_binance.usdt_balance)
+    if not bal:
+        await _reply(update, "❌ فشل جلب الرصيد."); return
+    with _ticket_lock:
+        tickets = list(TRADE_TICKETS.values())
+    total_unrealized = 0.0
+    lines = [f"💵 <b>حالة الحساب</b>", "━━━━━━━━━━━━━━━━━━━",
+             f"• رصيد المحفظة: <b>{bal['wallet']:.3f} USDT</b>",
+             f"• متاح: <b>{bal['available']:.3f} USDT</b>"]
+    if tickets:
+        lines.append(f"\n<b>📊 صفقات مفتوحة ({len(tickets)}):</b>")
+        for t in tickets:
+            try:
+                cur = await asyncio.to_thread(_binance.last_price, t["binance_symbol"])
+            except Exception:
+                cur = t["entry"]
+            if t["side"] == "LONG": pu = (cur - t["entry"]) * t["qty"]
+            else: pu = (t["entry"] - cur) * t["qty"]
+            total_unrealized += pu
+            ico = "🟢" if pu >= 0 else "🔴"
+            lines.append(f"{ico} {short(t['symbol'])} "
+                         f"{'L' if t['side']=='LONG' else 'S'} {pu:+.3f} USDT")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📈 Unrealized: <b>{total_unrealized:+.3f} USDT</b>")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_syncnow(update, context):
+    if not _binance.ok:
+        await _reply(update,
+            f"❌ Binance غير متصل.\n"
+            f"السبب: <code>{_binance.error_msg or 'غير معروف'}</code>",
+            parse_mode="HTML")
+        return
+    await _reply(update, "🔄 مزامنة...")
+    await _sync_manual_positions(context.bot)
+    with _ticket_lock:
+        n = len(TRADE_TICKETS)
+    await _reply(update, f"✅ انتهت. Tickets: {n}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 21) الواجهة
+# ═══════════════════════════════════════════════════════════
+def main_menu_kb() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton("💼 الصفقات",   callback_data="menu:positions"),
+         InlineKeyboardButton("💵 الرصيد",     callback_data="menu:pnl")],
+        [InlineKeyboardButton("🔄 مزامنة",     callback_data="menu:syncnow"),
+         InlineKeyboardButton("🔐 فحص Binance", callback_data="menu:bcheck")],
+        [InlineKeyboardButton("🧹 إغلاق الكل", callback_data="menu:closeall"),
+         InlineKeyboardButton("📊 S/R",         callback_data="menu:sr")],
+        [InlineKeyboardButton("📈 فحص الإشارات", callback_data="menu:cross"),
+         InlineKeyboardButton("🎯 تشخيص",       callback_data="menu:why")],
+        [InlineKeyboardButton("📋 آخر الإشارات", callback_data="menu:last"),
+         InlineKeyboardButton("⏳ النشطة",       callback_data="menu:pending")],
+        [InlineKeyboardButton("📐 نطاقات 6%", callback_data="menu:ref6"),
+         InlineKeyboardButton("🗺️ النطاقات",   callback_data="menu:ranges")],
+        [InlineKeyboardButton("🔍 فحص النطاقات", callback_data="menu:checkranges"),
+         InlineKeyboardButton("📊 الأداء",      callback_data="menu:stats")],
+        [InlineKeyboardButton("⚙️ الحالة",      callback_data="menu:status"),
+         InlineKeyboardButton("🔧 التشدد",      callback_data="menu:strict")],
+        [InlineKeyboardButton("🔄 تحديث",       callback_data="menu:refresh")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def coin_menu_kb(symbol: str) -> InlineKeyboardMarkup:
+    s = short(symbol)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📈 رسم {s}", callback_data=f"chart:{s}"),
+         InlineKeyboardButton(f"🔍 تشخيص {s}", callback_data=f"why:{s}")],
+        [InlineKeyboardButton("📊 كل العملات", callback_data="menu:why"),
+         InlineKeyboardButton("⬅️ القائمة", callback_data="menu:main")],
+    ])
+
+
+def back_kb(target="menu:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ رجوع", callback_data=target)
+    ]])
+
+
+async def cmd_menu(update, context):
+    txt = (f"🎛️ <b>القائمة الرئيسية — v6.6.1</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"🤖 Unified Smart Bot\n"
+           f"💸 Binance Futures: {'✅' if _binance.ok else '❌'}\n"
+           f"🔌 {_exchange.primary_name} · {len(ALL_SYMBOLS)} عملة\n"
+           f"🇸🇾 {syria_now_str()}\n\n"
+           f"👇 اختر:")
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                txt, parse_mode="HTML", reply_markup=main_menu_kb())
+        except Exception:
+            try:
+                await update.callback_query.message.reply_text(
+                    txt, parse_mode="HTML", reply_markup=main_menu_kb())
+            except Exception as e:
+                log.error(f"cmd_menu callback: {e}")
+    else:
+        await _reply(update, txt, parse_mode="HTML",
+                     reply_markup=main_menu_kb())
+
+
+async def on_callback(update, context):
+    q = update.callback_query
+    data = q.data or ""
+    try: await q.answer()
+    except Exception: pass
+
+    if data == "menu:main": return await cmd_menu(update, context)
+    if data == "menu:positions": return await cmd_positions(update, context)
+    if data == "menu:pnl": return await cmd_pnl(update, context)
+    if data == "menu:syncnow": return await cmd_syncnow(update, context)
+    if data == "menu:closeall": return await cmd_closeall(update, context)
+    if data == "menu:bcheck": return await cmd_bcheck(update, context)
+
+    if data == "menu:cross":
+        try: await q.edit_message_text("🔍 فحص...")
+        except Exception: pass
+        for tf in ["5m", "15m", "1h"]: await _run_cross(update, [tf])
+        return
+    if data == "menu:sr":
+        try: await q.edit_message_text("📊 توليد رسوم...")
+        except Exception: pass
+        return await _send_sr_charts(update, context)
+    if data == "menu:why":
+        try: await q.edit_message_text("🔍 فحص شامل...")
+        except Exception: pass
+        return await _diagnose_all(update)
+    if data == "menu:last": return await cmd_last(update, context)
+    if data == "menu:pending": return await cmd_pending(update, context)
+    if data == "menu:ref6": return await cmd_ref6(update, context)
+    if data == "menu:ranges": return await cmd_ranges(update, context)
+    if data == "menu:checkranges": return await cmd_checkranges(update, context)
+    if data == "menu:stats": return await cmd_stats(update, context)
+    if data == "menu:status": return await cmd_status(update, context)
+    if data == "menu:strict": return await cmd_strict(update, context)
+    if data == "menu:refresh": return await cmd_refresh(update, context)
+
+    if data.startswith("chart:"):
+        coin = data.split(":", 1)[1]
+        target = find_symbol_by_name(coin)
+        if not target:
+            try: return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception: return
+        try: await q.edit_message_text(f"📈 جارٍ رسم {coin}...")
+        except Exception: pass
+        buf = await generate_sr_chart(target)
+        if not buf:
+            try: return await q.message.reply_text("⚪ لا بيانات")
+            except Exception: return
+        try:
+            await q.message.reply_photo(photo=buf,
+                caption=f"📈 <b>{short(target)}</b>\n🇸🇾 {syria_now_str()}",
+                parse_mode="HTML", reply_markup=back_kb("menu:main"))
+            _filter_stats["charts_sent"] += 1
+        except Exception as e: log.error(f"chart send: {e}")
+        return
+
+    if data.startswith("why:"):
+        coin = data.split(":", 1)[1]
+        target = find_symbol_by_name(coin)
+        if not target:
+            try: return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception: return
+        return await _diagnose_coin(update, target)
+
+
+async def _send_sr_charts(update, context):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    chat_id = _get_chat_id(update); ok = 0
+    for sym in ALL_SYMBOLS:
+        buf = await generate_sr_chart(sym)
+        if buf:
+            try:
+                await context.bot.send_photo(chat_id=chat_id, photo=buf,
+                    caption=f"📊 <b>{short(sym)}</b>",
+                    parse_mode="HTML", reply_markup=coin_menu_kb(sym))
+                ok += 1; _filter_stats["charts_sent"] += 1
+            except Exception as e: log.error(f"send_sr {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if ok == 0:
+        try: await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
+        except Exception: pass
+
+
+# ═══════════════════════════════════════════════════════════
+# 22) أوامر عامة
+# ═══════════════════════════════════════════════════════════
+async def cmd_start(update, context):
+    sd, sn = get_session_info()
+    ranges_txt = "\n".join(
+        f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
+        for s, r in _last_range.items()) or "  (لا نطاقات)"
+    binance_status = "✅ متصل" if _binance.ok else f"❌ {_binance.error_msg or 'غير متصل'}"
+    await _reply(update,
+        f"🔀 <b>Unified Smart Bot v6.6.1</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💸 Binance Futures: <b>{binance_status}</b>\n"
+        f"• الرافعة: {LEVERAGE}x | Notional: {NOTIONAL_USDT}$\n"
+        f"• الهامش: {MARGIN_TYPE}\n"
+        f"• صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 {_exchange.primary_name}\n"
+        f"🕐 {sn} ({sd:+d})\n\n"
+        f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
+        f"👇",
+        parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+async def _run_cross(update, tfs=None):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    tfs = tfs or TIMEFRAMES
+    await _reply(update, f"🔍 فحص: {', '.join(tfs)} ...")
+    clear_caches()
+    detectors = _get_detectors()
+    found = filtered = 0
+    chat_id = _get_chat_id(update)
+    bot = update.get_bot() if update else None
+    for sym in ALL_SYMBOLS:
+        for tf in tfs:
+            for k in [(sym, tf), (sym, tf, "pre"), (sym, tf, "live"),
+                      (sym, tf, "div"), (sym, tf, "bb"), (sym, tf, "sr")]:
+                _crossover_cache.pop(k, None)
+            _divergence_cache.pop((sym, tf, "div"), None)
+            _bb_cache.pop((sym, tf, "bb"), None)
+            _sr_cache.pop((sym, tf, "sr"), None)
+            for det in detectors:
+                cross = await det(sym, tf)
+                if not cross: continue
+                htf = await get_htf_trend(sym)
+                passed, _r, _c = await passes_filter(cross, htf)
+                if not passed: filtered += 1; continue
+                try:
+                    if bot:
+                        await bot.send_message(chat_id=chat_id,
+                            text=build_signal_message(cross), parse_mode="HTML")
+                    mark_symbol_sent(sym)
+                    if cross["alert_type"] == "confirmed":
+                        record_signal(sym, cross["direction"])
+                        register_signal_for_tracking(cross)
+                        exe = await execute_binance_trade(cross, bot=bot)
+                        if not exe.get("ok"):
+                            log.info(f"exec skip {sym}: {exe.get('error')}")
+                    found += 1
+                except Exception as e: log.error(f"send {sym} {tf}: {e}")
+            await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    msg = f"✅ {found} إشارة."
+    if filtered: msg += f"\n🚫 {filtered} محجوبة."
+    await _reply(update, msg)
+
+
+def _get_detectors():
+    dets = []
+    if ENABLE_PRE_CROSS:  dets.append(detect_pre_crossover)
+    if ENABLE_LIVE_CROSS: dets.append(detect_live_crossover)
+    if ENABLE_CONFIRMED:  dets.append(detect_crossover)
+    if ENABLE_RSI_DIVERGENCE: dets.append(detect_rsi_divergence)
+    if ENABLE_BB_SQUEEZE:     dets.append(detect_bb_squeeze_breakout)
+    if ENABLE_SR_BREAKOUT:    dets.append(detect_sr_breakout)
+    return dets
+
+
+async def cmd_cross(u, c):   await _run_cross(u)
+async def cmd_cross5(u, c):  await _run_cross(u, ["5m"])
+async def cmd_cross15(u, c): await _run_cross(u, ["15m"])
+async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
+
+
+async def _get_diagnosis(symbol, tf):
+    try:
+        df = await _df_for(symbol, tf)
+        if df is None: return None
+        df["ef"] = calc_ema(df["c"], EMA_FAST)
+        df["es"] = calc_ema(df["c"], EMA_SLOW)
+        curr = -2
+        cf = float(df["ef"].iloc[curr]); cs = float(df["es"].iloc[curr])
+        gap = abs(cf - cs) / cs * 100 if cs else 0
+        atr = float(calc_atr(df).iloc[curr])
+        price = float(df["c"].iloc[curr])
+        atr_pct = (atr / price) * 100 if price else 0
+        adx = float(calc_adx(df).iloc[curr])
+        rsi = float(calc_rsi(df["c"]).iloc[curr])
+        try: vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
+        except: vol_ratio = 0
+        th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
+        sb = compute_score(df, "bullish", curr)["score"]
+        sr = compute_score(df, "bearish", curr)["score"]
+        best = max(sb, sr)
+        min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
+        min_atr = MIN_ATR_PCT.get(tf, 0.05)
+        checks = {"EMA gap": gap >= min_gap, "ATR": atr_pct >= min_atr,
+                  "ADX": adx >= th["min_adx"],
+                  "Volume": vol_ratio >= th["min_vol_ratio"],
+                  "Score مطلق": best >= ABS_MIN_SCORE,
+                  "Score ديناميكي": best >= th["min_score"]}
+        values = {"EMA gap": f"{gap:.3f}%", "ATR": f"{atr_pct:.3f}%",
+                  "ADX": f"{adx:.1f}", "Volume": f"{vol_ratio:.2f}×",
+                  "Score مطلق": f"{best}", "Score ديناميكي": f"{best}"}
+        thresholds = {"EMA gap": f"{min_gap}%", "ATR": f"{min_atr}%",
+                      "ADX": f"{th['min_adx']:.1f}",
+                      "Volume": f"{th['min_vol_ratio']}×",
+                      "Score مطلق": f"{ABS_MIN_SCORE}",
+                      "Score ديناميكي": f"{th['min_score']:.0f}"}
+        return {"symbol": symbol, "tf": tf, "score": best, "checks": checks,
+                "values": values, "thresholds": thresholds,
+                "price": price, "rsi": rsi}
+    except Exception as e:
+        log.warning(f"_get_diagnosis {symbol} {tf}: {e}"); return None
+
+
+async def _diagnose_coin(update, target):
+    lines = [f"📊 <b>تشخيص {short(target)}</b>", "━━━━━━━━━━━━━━━━━━━"]
+    for tf in ["5m", "15m", "1h"]:
+        r = await _get_diagnosis(target, tf)
+        if r is None: lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
+        lines.append(f"\n<b>[{tf}]</b>  💰 {fmt_price(r['price'])}")
+        for k in r["checks"]:
+            ok = "✅" if r["checks"][k] else "❌"
+            lines.append(f"{ok} {k}: <b>{r['values'][k]}</b> / {r['thresholds'][k]}")
+        lines.append(f"📉 RSI: {r['rsi']:.1f}")
+    ok_cd, rem = check_symbol_cooldown(target)
+    lines.append(f"\n⏳ Cooldown: {'✅' if ok_cd else f'❌ {rem}s'}")
+    await _reply(update, "\n".join(lines), parse_mode="HTML",
+                 reply_markup=coin_menu_kb(target))
+
+
+async def _diagnose_all(update):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    await _reply(update, f"🔍 فحص {len(ALL_SYMBOLS)} عملة ...")
+    results = []
+    for sym in ALL_SYMBOLS:
+        r = await _get_diagnosis(sym, "15m")
+        if r: results.append(r)
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if not results:
+        await _reply(update, "⚪ لا بيانات."); return
+    results.sort(key=lambda r: (sum(1 for v in r["checks"].values() if not v), -r["score"]))
+    sd, sn = get_session_info()
+    lines = [f"📊 <b>تشخيص شامل ({len(results)})</b>", f"🕐 {sn}",
+             "━━━━━━━━━━━━━━━━━━━"]
+    for r in results:
+        fails = [k for k, v in r["checks"].items() if not v]
+        icon = "🌟" if not fails else ("⚠️" if len(fails)==1 else "❌" if len(fails)==2 else "🚫")
+        lines.append(f"\n{icon} <b>{short(r['symbol'])}</b>  Score={r['score']}  "
+                     f"💰{fmt_price(r['price'])}")
+        if not fails: lines.append("   ✅ كل الفلاتر مرّت")
+        else:
+            for k in fails:
+                lines.append(f"   ❌ {k}: {r['values'][k]} / {r['thresholds'][k]}")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_why(update, context):
+    args = context.args or []
+    if args:
+        target = find_symbol_by_name(args[0])
+        if not target:
+            await _reply(update, f"❌ {args[0]} غير معروف.", parse_mode="HTML"); return
+        await _diagnose_coin(update, target)
+    else:
+        await _diagnose_all(update)
+
+
+async def cmd_last(update, context):
+    if not _last_signals:
+        await _reply(update, "📭 لا إشارات بعد."); return
+    lines = ["📋 <b>آخر الإشارات</b>", "━━━━━━━━━━━━━━━━━━━"]
+    for s in reversed(list(_last_signals)):
+        icon = {"win_tp3": "🌟", "win_tp2": "✅", "win_tp1": "🎯",
+                "loss_sl": "❌", "expired": "⏰", None: "⏳"}.get(s["result"], "?")
+        ts_str = datetime.fromtimestamp(s["ts"], tz=SYRIA_TZ).strftime("%H:%M")
+        dir_icon = "🟢" if s["direction"] == "bullish" else "🔴"
+        lines.append(f"\n{icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
+                     f"{dir_icon} {_source_label(s['source'])}")
+        lines.append(f"   🕐 {ts_str} | Score={s['score']}")
+        lines.append(f"   💰 {fmt_price(s['entry'])} → {fmt_price(s['exit'])} "
+                     f"<b>{s['pnl_pct']:+.2f}%</b>")
+        lines.append(f"   ⏱️ {s['duration_min']} د | <b>{s['result']}</b>")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_pending(update, context):
+    active = {sid: s for sid, s in _pending_signals.items() if not s["checked"]}
+    if not active:
+        await _reply(update, "📭 لا إشارات نشطة."); return
+    lines = [f"⏳ <b>إشارات نشطة ({len(active)})</b>", "━━━━━━━━━━━━━━━━━━━"]
+    now = _time.time()
+    for sid, sig in active.items():
+        cross = sig["cross"]; lv = sig["levels"]
+        bull = sig["direction"] == "bullish"
+        try:
+            data, _ = await _exchange.fetch_ohlcv(cross["symbol"], "1m", 2)
+            price = float(data[-1][4]) if data else lv["entry"]
+        except Exception: price = lv["entry"]
+        pnl = ((price - lv["entry"]) / lv["entry"] * 100) * (1 if bull else -1)
+        age = int((now - sig["entry_ts"]) / 60)
+        lines.append(f"\n{'🟢' if bull else '🔴'} <b>{short(cross['symbol'])}</b> "
+                     f"[{cross['timeframe']}]")
+        lines.append(f"   💰 {fmt_price(lv['entry'])} → {fmt_price(price)}")
+        lines.append(f"   <b>{pnl:+.2f}%</b> | ⏱️ {age} د")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_checkprice(update, context):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    await _reply(update, "🔍 ...")
+    found = 0
+    for sym in ALL_SYMBOLS:
+        a = await detect_sudden_change(sym)
+        if a:
+            await _reply(update, build_price_alert_msg(a), parse_mode="HTML")
+            found += 1
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if found == 0: await _reply(update, "⚪ لا تغيرات.")
+
+
+async def cmd_ranges(update, context):
+    await _reply(update, build_ranges_report(), parse_mode="HTML")
+
+
+async def cmd_refresh(update, context):
+    global _MANUAL_RANGES, ALL_SYMBOLS
+    _MANUAL_RANGES = _detect_manual_ranges()
+    ALL_SYMBOLS = list(_MANUAL_RANGES.keys()) if _MANUAL_RANGES else ALL_SYMBOLS
+    _last_range.clear()
+    n = _load_manual_ranges()
+    await _reply(update, f"✅ تم تحديث {n} نطاق.")
+
+
+async def cmd_ref6(update, context):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    await _reply(update, "🔍 حساب 6% ...")
+    results = await compute_6pct_ranges()
+    if not results:
+        await _reply(update, "⚪ لا بيانات."); return
+    await _reply(update, build_6pct_report(results), parse_mode="HTML")
+
+
+async def cmd_sr(update, context):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    await _reply(update, f"📊 {len(ALL_SYMBOLS)} رسم ...")
+    chat_id = _get_chat_id(update); ok = 0
+    for sym in ALL_SYMBOLS:
+        buf = await generate_sr_chart(sym)
+        if buf:
+            try:
+                await context.bot.send_photo(chat_id=chat_id, photo=buf,
+                    caption=f"📊 <b>{short(sym)}</b>", parse_mode="HTML",
+                    reply_markup=coin_menu_kb(sym))
+                ok += 1; _filter_stats["charts_sent"] += 1
+            except Exception as e: log.error(f"sr {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if ok == 0:
+        try: await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
+        except Exception: pass
+
+
+async def cmd_checkranges(update, context):
+    if not _exchange.ok():
+        await _reply(update, "❌ لا منصة."); return
+    await _reply(update, "🔍 ...")
+    alerts = 0
+    for symbol in list(_last_range.keys()):
+        b = await check_range_breakout(symbol)
+        if b:
+            await _reply(update, build_breakout_msg(b), parse_mode="HTML")
+            _filter_stats["range_breakouts"] += 1; alerts += 1; continue
+        a = await check_range_approach(symbol)
+        if a:
+            await _reply(update, build_approach_msg(a), parse_mode="HTML")
+            _filter_stats["range_approaches"] += 1; alerts += 1
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if alerts == 0:
+        await _reply(update, "✅ كل الأسعار داخل النطاقات.")
+
+
+async def cmd_status(update, context):
+    total = sum(v for k, v in _filter_stats.items() if k.startswith("filtered_"))
+    jq = context.application.job_queue
+    jobs_n = len(jq.jobs()) if jq else 0
+    sd, sn = get_session_info()
+    st = _smart.stats()
+    active = len([s for s in _pending_signals.values() if not s["checked"]])
+    with _ticket_lock:
+        open_tickets = len(TRADE_TICKETS)
+    await _reply(update,
+        f"🤖 <b>الحالة v6.6.1</b>\n"
+        f"💸 Binance: {'✅' if _binance.ok else f'❌ {_binance.error_msg or \"\"}'}\n"
+        f"🔌 {_exchange.primary_name} | 🕐 {sn}\n"
+        f"⚙️ Jobs: <b>{jobs_n}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 صفقات مفتوحة: <b>{open_tickets}</b>\n"
+        f"💸 فُتحت: {_filter_stats['trades_opened']} | "
+        f"أُغلقت: {_filter_stats['trades_closed']}\n"
+        f"🎯 TP: {_filter_stats['trades_tp']} | "
+        f"🛑 SL: {_filter_stats['trades_sl']}\n"
+        f"❌ فشل: {_filter_stats['trades_failed']}\n"
+        f"🔍 يدوي: {_filter_stats['trades_manual_sync']}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 إشارات: {_filter_stats['sent']}\n"
+        f"🚫 محجوبة: {total}\n"
+        f"📈 WR: <b>{st['wr']}%</b> "
+        f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})",
+        parse_mode="HTML")
+
+
+async def cmd_stats(update, context):
+    st = _smart.stats()
+    if st["n"] == 0:
+        await _reply(update, "📊 لا نتائج بعد."); return
+    bar = "█" * int(st["wr"] / 5) + "░" * (20 - int(st["wr"] / 5))
+    await _reply(update,
+        f"📊 <b>الأداء</b>\n📈 WR: <b>{st['wr']}%</b>\n"
+        f"<code>{bar}</code>\n"
+        f"✅ {st['wins']} | ❌ {st['losses']} | ⏰ {st['expired']}\n"
+        f"📝 {st['n']} إشارة", parse_mode="HTML")
+
+
+async def cmd_perf(update, context):
+    rep = _smart.source_report()
+    if not rep:
+        await _reply(update, "📊 لا بيانات."); return
+    lines = ["📊 <b>أداء المصادر</b>\n━━━━━━━━━━━━━━━━━━━"]
+    for src, d in rep.items():
+        tot = d["wins"] + d["losses"]
+        wr = round(d["wins"] / tot * 100, 1) if tot else 0
+        lines.append(f"\n🔹 <b>{_source_label(src) if src != 'unknown' else '—'}</b>\n"
+                     f"   📤 {d['sent']} | 🚫 {d['filtered']}\n"
+                     f"   ✅ {d['wins']} | ❌ {d['losses']}\n"
+                     f"   📈 WR: <b>{wr}%</b>")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_jobs(update, context):
+    jq = context.application.job_queue
+    if jq is None:
+        await _reply(update, "❌ غير متوفر."); return
+    jobs = jq.jobs()
+    if not jobs:
+        await _reply(update, "⚠️ لا مهام."); return
+    lines = [f"⚙️ <b>Jobs ({len(jobs)}):</b>\n"]
+    for j in jobs:
+        nxt = getattr(j, "next_t", None)
+        nxt_str = nxt.strftime("%H:%M:%S") if nxt else "—"
+        lines.append(f"• <b>{j.name or 'unnamed'}</b> → {nxt_str}")
+    await _reply(update, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_strict(update, context):
+    th = get_thresholds(tf="15m")
+    sd, sn = get_session_info()
+    await _reply(update,
+        f"🎯 <b>التشدد v6.6.1</b>\n🕐 {sn}\n━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>ديناميكي (15m):</b>\n"
+        f"• Score ≥ {th['min_score']:.0f}\n"
+        f"• Vol ≥ {th['min_vol_ratio']}×\n"
+        f"• ADX ≥ {th['min_adx']}\n"
+        f"• ATR ≤ {th['max_atr_pct']}%\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>🛡️ ثوابت:</b>\n"
+        f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
+        f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>💸 Binance:</b>\n"
+        f"• Notional: {NOTIONAL_USDT}$\n"
+        f"• الرافعة: {LEVERAGE}x\n"
+        f"• الهامش: {MARGIN_TYPE}\n"
+        f"• صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}\n"
+        f"• فحص كل: {POSITION_MONITOR_SEC}s",
+        parse_mode="HTML")
+
+
+async def cmd_clearcache(update, context):
+    clear_caches(); _smart.reset_feedback(); _last_signal_time.clear()
+    await _reply(update, "✅ تم تفريغ الكاش.")
+
+
+async def error_handler(update, context):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning(f"⚠️ network: {err}"); return
+    log.error(f"❌ error: {err}", exc_info=err)
+
+
+# ═══════════════════════════════════════════════════════════
+# 23) Jobs
+# ═══════════════════════════════════════════════════════════
+async def crossover_job(context):
+    if not _exchange.ok(): return
+    detectors = _get_detectors()
+    total = 0
+    for sym in ALL_SYMBOLS:
+        for tf in TIMEFRAMES:
+            for det in detectors:
+                try:
+                    cross = await det(sym, tf)
+                    if not cross: continue
+                    htf = await get_htf_trend(sym)
+                    passed, _r, cat = await passes_filter(cross, htf)
+                    if not passed:
+                        key = f"filtered_{cat}"
+                        if key in _filter_stats: _filter_stats[key] += 1
+                        continue
+                    if CHAT_ID:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=CHAT_ID, text=build_signal_message(cross),
+                                parse_mode="HTML")
+                            total += 1
+                            _filter_stats["sent"] += 1
+                            mark_symbol_sent(sym)
+                            if cross["alert_type"] == "confirmed":
+                                record_signal(sym, cross["direction"])
+                                register_signal_for_tracking(cross)
+                                exe = await execute_binance_trade(
+                                    cross, bot=context.bot)
+                                if not exe.get("ok"):
+                                    log.info(f"exec skip {sym}: {exe.get('error')}")
+                        except Exception as e:
+                            log.error(f"send {sym} {tf}: {e}")
+                except Exception as e:
+                    log.exception(f"job {sym} {tf}: {e}")
+            await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if total: log.info(f"📤 {total} إشارة")
+
+
+async def signal_tracker_job(context):
+    if not _exchange.ok(): return
+    try: await evaluate_pending_signals(bot=context.bot)
+    except Exception as e: log.exception(f"tracker: {e}")
+
+
+async def price_alert_job(context):
+    if not _exchange.ok(): return
+    total = 0
+    for sym in ALL_SYMBOLS:
+        try:
+            a = await detect_sudden_change(sym)
+            if a and CHAT_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=CHAT_ID, text=build_price_alert_msg(a),
+                        parse_mode="HTML")
+                    total += 1
+                except Exception: pass
+        except Exception as e: log.exception(f"price_alert {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+    if total: log.info(f"📤 {total} تنبيه")
+
+
+async def range_monitor_job(context):
+    if not _exchange.ok() or not _last_range: return
+    for symbol in list(_last_range.keys()):
+        try:
+            b = await check_range_breakout(symbol)
+            if b and CHAT_ID:
+                await context.bot.send_message(chat_id=CHAT_ID,
+                    text=build_breakout_msg(b), parse_mode="HTML")
+                _filter_stats["range_breakouts"] += 1; continue
+            a = await check_range_approach(symbol)
+            if a and CHAT_ID:
+                await context.bot.send_message(chat_id=CHAT_ID,
+                    text=build_approach_msg(a), parse_mode="HTML")
+                _filter_stats["range_approaches"] += 1
+        except Exception as e: log.exception(f"range_monitor {symbol}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+
+
+async def six_pct_report_job(context):
+    if not _exchange.ok() or not CHAT_ID: return
+    results = await compute_6pct_ranges()
+    if not results: return
+    try:
+        await context.bot.send_message(chat_id=CHAT_ID,
+            text=build_6pct_report(results), parse_mode="HTML")
+    except Exception as e: log.error(f"6pct: {e}")
+
+
+async def morning_report_job(context):
+    if not _exchange.ok() or not CHAT_ID: return
+    log.info("🌅 التقرير الصباحي ...")
+    try:
+        await context.bot.send_message(chat_id=CHAT_ID,
+            text=(f"🌅 <b>تقرير الصباح</b>\n🇸🇾 {syria_now_str()}\n"
+                  f"📊 {len(ALL_SYMBOLS)} عملة"), parse_mode="HTML")
+    except Exception: pass
+    for sym in ALL_SYMBOLS:
+        try:
+            buf = await generate_sr_chart(sym)
+            if not buf: continue
+            await context.bot.send_photo(chat_id=CHAT_ID, photo=buf,
+                caption=f"📊 <b>{short(sym)}</b>", parse_mode="HTML",
+                reply_markup=coin_menu_kb(sym))
+            _filter_stats["charts_sent"] += 1
+        except Exception as e: log.error(f"morning {sym}: {e}")
+        await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
+
+
+async def binance_position_monitor_job(context):
+    if not _binance.ok: return
+    try: await manage_open_positions(bot=context.bot)
+    except Exception as e: log.exception(f"position_monitor: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 24) Health
+# ═══════════════════════════════════════════════════════════
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - Unified Smart Bot v6.6.1")
+    def do_HEAD(self):
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+
+
+def run_health():
+    port = int(os.getenv("PORT", "8081"))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+
+# ═══════════════════════════════════════════════════════════
+# 25) Main
+# ═══════════════════════════════════════════════════════════
+def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        print("❌ TELEGRAM_REPORT_BOT_TOKEN و CHAT_ID مطلوبان"); return
+
+    threading.Thread(target=run_health, daemon=True).start()
+
+    n = _load_manual_ranges()
+    sd, sn = get_session_info()
+    print(f"📌 {n} نطاق | 🔌 {_exchange.primary_name}")
+    print(f"🕐 الجلسة: {sn} ({sd:+d})")
+    print(f"💸 Binance: {'✅' if _binance.ok else '❌ ' + (str(_binance.error_msg) or '')}")
+    print(f"   • Notional: {NOTIONAL_USDT}$ | Lev: {LEVERAGE}x | {MARGIN_TYPE}")
+    print(f"   • صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}")
+    print(f"   • مراقبة: كل {POSITION_MONITOR_SEC}s")
+
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
+                           connect_timeout=30.0, pool_timeout=30.0)
+    app = (Application.builder().token(BOT_TOKEN)
+           .request(request).get_updates_request(request).build())
+
+    if app.job_queue is None:
+        raise RuntimeError("❌ job_queue غير متوفر! "
+                           "pip install 'python-telegram-bot[job-queue]'")
+
+    # ── Handlers ────────────────────────────────────
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("cross", cmd_cross))
+    app.add_handler(CommandHandler("cross5", cmd_cross5))
+    app.add_handler(CommandHandler("cross15", cmd_cross15))
+    app.add_handler(CommandHandler("cross1h", cmd_cross1h))
+    app.add_handler(CommandHandler("why", cmd_why))
+    app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("checkprice", cmd_checkprice))
+    app.add_handler(CommandHandler("ranges", cmd_ranges))
+    app.add_handler(CommandHandler("checkranges", cmd_checkranges))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
+    app.add_handler(CommandHandler("ref6", cmd_ref6))
+    app.add_handler(CommandHandler("sr", cmd_sr))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("perf", cmd_perf))
+    app.add_handler(CommandHandler("jobs", cmd_jobs))
+    app.add_handler(CommandHandler("strict", cmd_strict))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
+    # 💰 Binance
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("closeall", cmd_closeall))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("syncnow", cmd_syncnow))
+    app.add_handler(CommandHandler("bcheck", cmd_bcheck))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(error_handler)
+
+    # ── Jobs ────────────────────────────────────────
+    app.job_queue.run_repeating(crossover_job,
+        interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
+    app.job_queue.run_repeating(signal_tracker_job,
+        interval=SIGNAL_TRACK_INTERVAL_MIN * 60, first=60, name="tracker")
+    app.job_queue.run_repeating(price_alert_job,
+        interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price")
+    app.job_queue.run_repeating(range_monitor_job,
+        interval=RANGE_MONITOR_INTERVAL_MIN * 60, first=30, name="range_monitor")
+
+    if _binance.ok:
+        app.job_queue.run_repeating(binance_position_monitor_job,
+            interval=POSITION_MONITOR_SEC, first=20, name="binance_monitor")
+        print(f"💼 مراقبة Binance: كل {POSITION_MONITOR_SEC} ثانية")
+
+    if SEND_STARTUP_REPORT:
+        app.job_queue.run_once(six_pct_report_job, when=45, name="six_pct_startup")
+
+    app.job_queue.run_repeating(six_pct_report_job,
+        interval=RANGE_REPORT_INTERVAL_HOURS * 3600,
+        first=RANGE_REPORT_INTERVAL_HOURS * 3600, name="six_pct_periodic")
+
+    if MORNING_REPORT_ENABLED:
+        morning_time = dt_time(hour=MORNING_REPORT_HOUR_SYRIA, minute=0,
+                                tzinfo=SYRIA_TZ)
+        app.job_queue.run_daily(morning_report_job, time=morning_time,
+                                name="morning_report")
+
+    print("✅ جاهز — بدء polling")
+    app.run_polling(allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True, bootstrap_retries=5)
+
+
+if __name__ == "__main__":
+    main()
