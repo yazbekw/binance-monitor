@@ -2098,26 +2098,22 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
 
     print(f"📊 Symbols: {ALL_SYMBOLS}")
-    print(f"⚙️ Leverage: {LEVERAGE}x ISOLATED | ${POSITION_NOTIONAL_USD}/trade")
-    print(f"🛡️ Max positions: {MAX_CONCURRENT_POSITIONS} | max same-dir: {MAX_SAME_DIRECTION_POS}")
-    print(f"🎯 TP: {TP1_R_MULTIPLE}R / {TP2_R_MULTIPLE}R / {TP3_R_MULTIPLE}R  splits={TP_SPLITS}")
-    print(f"🔄 Trailing TP1: {TRAIL_CALLBACK_TP1}% | TP2: {TRAIL_CALLBACK_RATE}%")
-    print(f"🛡️ Max SL: {MAX_SL_PCT}% | Daily loss: {MAX_DAILY_LOSS_PCT}%")
-    print(f"⏱️  Startup delay: {STARTUP_DELAY_SEC}s")
-    print(f"🛡️ Watchdog: كل {WATCHDOG_INTERVAL_SEC}s | threshold: 5 فشل")
-    print(f"₿ BTC Bias filter: {BTC_BIAS_FILTER_ENABLED}")
-    print(f"🔗 Correlation filter: {CORRELATION_FILTER_ENABLED} (max {MAX_SAME_DIRECTION_POS})")
+    print(f"⚙️ Leverage: {LEVERAGE}x ISOLATED")
+    print(f"🎯 TP: {TP1_R_MULTIPLE}R / {TP2_R_MULTIPLE}R / {TP3_R_MULTIPLE}R")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
                            connect_timeout=30.0, pool_timeout=30.0)
 
     app = (Application.builder().token(BOT_TOKEN)
-           .request(request).get_updates_request(request).build())
+           .request(request).get_updates_request(request)
+           .concurrent_updates(False)   # ✅ يمنع fork
+           .build())
 
     if app.job_queue is None:
         raise RuntimeError("job_queue غير متوفر")
 
+    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("positions", cmd_positions))
     app.add_handler(CommandHandler("close", cmd_close))
@@ -2137,9 +2133,9 @@ def main():
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_error_handler(error_handler)
 
-    async def _post_init(app):
-        _bot_ref[0] = app.bot
-        await _startup_async(app)
+    async def _post_init(application):
+        _bot_ref[0] = application.bot
+        await _startup_async(application)
 
     app.post_init = _post_init
 
@@ -2147,9 +2143,31 @@ def main():
     app.job_queue.run_repeating(watchdog_job, interval=WATCHDOG_INTERVAL_SEC,
                                 first=300, name="watchdog")
 
+    # ✅ v7.3.8: حل جذري — استخدام updater.start_polling بدون run_polling
     print("✅ Start polling")
-    app.run_polling(allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True, bootstrap_retries=5)
+    import asyncio as _aio
+    async def _main():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            bootstrap_retries=0,
+        )
+        try:
+            while True:
+                await _aio.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+    
+    try:
+        _aio.run(_main())
+    except KeyboardInterrupt:
+        print("⏹️ إيقاف")
 
 
 if __name__ == "__main__":
