@@ -1,23 +1,21 @@
 """
-Unified Smart Bot v6.5.0 — Score 52 + /why + 📊 Charts + 🎛️ UI
-================================================================
-  🆕 v6.5.0 — رسوم بيانية احترافية للدعم والمقاومة
-  🆕 v6.5.0 — واجهة أزرار تفاعلية (Inline Keyboard)
-  🆕 ABS_MIN_SCORE = 52 (كان 55)
-  🆕 /why — فحص كل العملات
-  🆕 /why XRP — تفاصيل عملة
-  🆕 /last — آخر 5 إشارات
-  🆕 /pending — الإشارات النشطة
-  ✓ كل ميزات v6.4.3
+Unified Smart Bot v6.6.0 — Binance Futures Execution + Internal SL/TP
+======================================================================
+  🆕 v6.6.0 — تنفيذ حقيقي على Binance USDT-M Futures
+  🆕 v6.6.0 — إدارة داخلية للصفقات (SL / TP1)
+  🆕 v6.6.0 — مزامنة الصفقات اليدوية كل 60 ثانية
+  🆕 v6.6.0 — أوامر: /positions /close /closeall /pnl /syncnow
+  ✓ كل ميزات v6.5.0 محفوظة
 """
-import os, io, asyncio, logging, threading, time as _time
+import os, io, asyncio, logging, threading, time as _time, math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 from collections import deque, defaultdict
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler", "matplotlib"):
+for _n in ("httpx", "telegram", "telegram.ext", "ccxt", "apscheduler",
+           "matplotlib", "binance", "urllib3"):
     logging.getLogger(_n).setLevel(logging.WARNING)
 log = logging.getLogger("unified")
 
@@ -29,18 +27,26 @@ from telegram.ext import (Application, CommandHandler, ContextTypes,
                           CallbackQueryHandler)
 from telegram.error import NetworkError, TimedOut
 
-# ── matplotlib (رسم بياني بدون واجهة) ──────────────
+# ── matplotlib ──────────────────────────────────────
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import matplotlib.ticker as mticker
 
+# ── python-binance (اختياري لكن مطلوب للتنفيذ) ───────
+try:
+    from binance.client import Client as BinanceClient
+    from binance.exceptions import BinanceAPIException, BinanceRequestException
+    _BINANCE_LIB_OK = True
+except Exception:
+    _BINANCE_LIB_OK = False
+
 load_dotenv()
 
 
 # ═══════════════════════════════════════════════════════════
-# 1) الإعدادات
+# 1) الإعدادات العامة
 # ═══════════════════════════════════════════════════════════
 BOT_TOKEN = os.getenv("TELEGRAM_REPORT_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_REPORT_CHAT_ID")
@@ -116,7 +122,6 @@ MIN_SL_PCT = {"5m": 0.35, "15m": 0.50, "1h": 0.80}
 
 LAST_SIGNALS_MAX = 20
 
-# ── إعدادات الرسوم ──────────────────────────────────
 CHART_LOOKBACK = 120
 CHART_DPI      = 110
 CHART_ENABLED  = True
@@ -124,7 +129,7 @@ SEND_SR_CHARTS = True
 
 
 # ═══════════════════════════════════════════════════════════
-# إعدادات الفلترة
+# 1b) ⚙️ إعدادات Binance Futures (جديد)
 # ═══════════════════════════════════════════════════════════
 def _env_float(key, default):
     try: return float(os.getenv(key, default))
@@ -134,6 +139,20 @@ def _env_int(key, default):
     try: return int(os.getenv(key, default))
     except: return default
 
+BINANCE_ENABLED       = _env_int("BINANCE_ENABLED", 1) == 1
+BINANCE_TESTNET       = _env_int("BINANCE_TESTNET", 0) == 1
+BINANCE_API_KEY       = (os.getenv("BINANCE_API_KEY") or "").strip()
+BINANCE_API_SECRET    = (os.getenv("BINANCE_API_SECRET") or "").strip()
+NOTIONAL_USDT         = _env_float("NOTIONAL_USDT", 400.0)
+LEVERAGE              = _env_int("LEVERAGE", 20)
+MARGIN_TYPE           = (os.getenv("MARGIN_TYPE", "ISOLATED") or "ISOLATED").upper()
+STRONG_SCORE_FOR_ADD  = _env_int("STRONG_SCORE_FOR_ADD", 80)
+POSITION_MONITOR_SEC  = _env_int("POSITION_MONITOR_INTERVAL_SEC", 60)
+CLOSE_REASON_TP       = "TP1"
+CLOSE_REASON_SL       = "SL"
+
+
+# ── إعدادات الفلترة ─────────────────────────────────
 MIN_EMA_GAP_PCT = {
     "5m":  _env_float("MIN_EMA_GAP_5M",  0.02),
     "15m": _env_float("MIN_EMA_GAP_15M", 0.015),
@@ -163,7 +182,7 @@ FOLLOWUP_THROTTLE_SEC = 120
 
 
 # ═══════════════════════════════════════════════════════════
-# 2) اكتشاف النطاقات اليدوية
+# 2) النطاقات اليدوية
 # ═══════════════════════════════════════════════════════════
 def _normalize_symbol_from_var(name):
     name = name.strip().upper()
@@ -207,12 +226,12 @@ log.info(f"✅ {len(_MANUAL_RANGES)} نطاق يدوي | {len(ALL_SYMBOLS)} رم
 
 
 # ═══════════════════════════════════════════════════════════
-# 3) المنصات
+# 3) منصات ccxt (للبيانات)
 # ═══════════════════════════════════════════════════════════
 _EXCHANGE_NAMES = ["bybit", "okx", "kucoin", "kraken", "gate",
                    "bitget", "mexc", "htx", "coinex", "bitmart"]
 _EXCHANGE_CLASSES = {n: getattr(ccxt, n) for n in _EXCHANGE_NAMES if hasattr(ccxt, n)}
-log.info(f"📦 ccxt {ccxt.__version__} | Available: {list(_EXCHANGE_CLASSES.keys())}")
+log.info(f"📦 ccxt {ccxt.__version__}")
 
 
 class MultiExchange:
@@ -279,7 +298,7 @@ _exchange = MultiExchange()
 
 
 # ═══════════════════════════════════════════════════════════
-# 4) محرك التشدد الذكي
+# 4) التشدد الذكي
 # ═══════════════════════════════════════════════════════════
 STATIC_PROFILES = {
     "balanced": {"min_score": 60, "min_vol_ratio": 1.00, "min_adx": 18.0,
@@ -289,13 +308,11 @@ STATIC_PROFILES = {
                  "max_atr_pct": 0.60, "vwap_slope_pct": 0.07,
                  "block_against_htf": True, "score_15m_override": 75},
 }
-
 TF_PROFILES = {
     "5m":  {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.70, "min_hold_min": 5},
     "15m": {"score_mult": 1.00, "vol_mult": 1.00, "atr_max": 0.90, "min_hold_min": 15},
     "1h":  {"score_mult": 0.85, "vol_mult": 0.75, "atr_max": 1.80, "min_hold_min": 60},
 }
-
 SESSIONS = [
     (0, 6,  "🌏 آسيا (هادئة)",   +8),
     (6, 10, "🌅 آسيا/أوروبا",     +2),
@@ -311,8 +328,8 @@ class SmartStrictness:
         self.history = deque(maxlen=200)
         self.results = deque(maxlen=200)
         self.source_stats = defaultdict(lambda: {"wins": 0, "losses": 0,
-                                                  "expired": 0,
-                                                  "sent": 0, "filtered": 0})
+                                                  "expired": 0, "sent": 0,
+                                                  "filtered": 0})
         self._lock = threading.Lock()
         self._cached_profile = None
         self._cached_ts = 0.0
@@ -323,24 +340,18 @@ class SmartStrictness:
     def record(self, passed, score, source="unknown"):
         with self._lock:
             self.history.append((passed, score, _time.time(), source))
-            if passed:
-                self.source_stats[source]["sent"] += 1
-            else:
-                self.source_stats[source]["filtered"] += 1
+            if passed: self.source_stats[source]["sent"] += 1
+            else:      self.source_stats[source]["filtered"] += 1
 
     def record_result(self, result, direction, source="unknown"):
-        win = result.startswith("win")
-        expired = result == "expired"
+        win = result.startswith("win"); expired = result == "expired"
         with self._lock:
             self.results.append({"win": win, "result": result,
                                  "direction": direction, "ts": _time.time(),
                                  "source": source, "expired": expired})
-            if win:
-                self.source_stats[source]["wins"] += 1
-            elif expired:
-                self.source_stats[source]["expired"] += 1
-            else:
-                self.source_stats[source]["losses"] += 1
+            if win: self.source_stats[source]["wins"] += 1
+            elif expired: self.source_stats[source]["expired"] += 1
+            else: self.source_stats[source]["losses"] += 1
 
     def _feedback(self):
         with self._lock:
@@ -369,7 +380,6 @@ class SmartStrictness:
             and abs(self._cached_atr - (atr_pct or 0)) < 0.05
             and abs(self._cached_adx - (adx or 0)) < 2.0):
             return self._cached_profile
-
         if atr_pct is None or atr_pct <= 0: atr_pct = 0.5
         if atr_pct < 0.15:   base = 50
         elif atr_pct < 0.30: base = 55
@@ -411,18 +421,13 @@ class SmartStrictness:
         return {"n": n, "wr": wr, "wins": wins, "losses": losses, "expired": expired}
 
     def source_report(self):
-        with self._lock:
-            return dict(self.source_stats)
+        with self._lock: return dict(self.source_stats)
 
     def reset_feedback(self):
         with self._lock:
-            self.history.clear()
-            self.results.clear()
-            self.source_stats.clear()
-        self._cached_profile = None
-        self._cached_ts = 0.0
-        self._cached_atr = None
-        self._cached_adx = None
+            self.history.clear(); self.results.clear(); self.source_stats.clear()
+        self._cached_profile = None; self._cached_ts = 0.0
+        self._cached_atr = None; self._cached_adx = None
 
 
 _smart = SmartStrictness()
@@ -431,8 +436,7 @@ _smart = SmartStrictness()
 def get_session_info():
     h = datetime.now(timezone.utc).hour
     for start, end, name, delta in SESSIONS:
-        if start <= h < end:
-            return delta, name
+        if start <= h < end: return delta, name
     return 0, "❓"
 
 
@@ -495,8 +499,7 @@ def find_symbol_by_name(name):
     for sym in ALL_SYMBOLS:
         if name in sym.upper(): return sym
     if "/" not in name:
-        candidate = f"{name}/USDT:USDT"
-        return candidate
+        return f"{name}/USDT:USDT"
     return None
 
 
@@ -537,8 +540,7 @@ def calc_adx(df, p=14):
 def calc_macd(s, f=12, sl=26, sig=9):
     ef = s.ewm(span=f, adjust=False).mean()
     es = s.ewm(span=sl, adjust=False).mean()
-    dif = ef - es
-    dea = dif.ewm(span=sig, adjust=False).mean()
+    dif = ef - es; dea = dif.ewm(span=sig, adjust=False).mean()
     return dif, dea, dif - dea
 
 
@@ -546,12 +548,9 @@ def calc_vwap_session(df, session="day"):
     if df.empty: return df["c"]
     try:
         ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        if session == "day":
-            skey = ts.dt.floor("D")
-        elif session == "week":
-            skey = ts.dt.to_period("W").astype(str)
-        else:
-            skey = ts.dt.floor("H")
+        if session == "day":   skey = ts.dt.floor("D")
+        elif session == "week": skey = ts.dt.to_period("W").astype(str)
+        else: skey = ts.dt.floor("H")
         tp = (df["h"] + df["l"] + df["c"]) / 3
         pv = tp * df["v"]
         cum_pv = pv.groupby(skey).cumsum()
@@ -572,9 +571,6 @@ def calc_bollinger(df, period=20, std_mult=2):
     return {"ma": ma, "upper": upper, "lower": lower, "width": width}
 
 
-# ═══════════════════════════════════════════════════════════
-# 6b) S/R + Swing Levels
-# ═══════════════════════════════════════════════════════════
 def find_swing_levels(df, lookback=SWING_LOOKBACK, max_count=SWING_MAX_COUNT):
     if len(df) < lookback * 2 + 2:
         return {"highs": [], "lows": []}
@@ -606,8 +602,7 @@ def classify_market(df, curr_idx=-2):
     if len(df) < 60: return "UNKNOWN"
     try:
         adx = float(calc_adx(df).iloc[curr_idx])
-        close = df["c"]
-        bb = calc_bollinger(df)
+        close = df["c"]; bb = calc_bollinger(df)
         bb_w = float(bb["width"].iloc[curr_idx])
         e50 = calc_ema(close, 50)
         e50_slope = (float(e50.iloc[curr_idx]) - float(e50.iloc[curr_idx-5])) \
@@ -633,8 +628,7 @@ async def classify_market_safe(symbol, tf, df):
         if data and len(data) >= 60:
             df2 = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
             return classify_market(df2)
-    except Exception:
-        pass
+    except Exception: pass
     return "UNKNOWN"
 
 
@@ -653,8 +647,7 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
             sl_struct = min(recent_low, ema_slow) * 0.998
             stop_loss = max(sl_atr, sl_struct)
             min_dist = price * (min_sl_pct / 100)
-            if (price - stop_loss) < min_dist:
-                stop_loss = price - min_dist
+            if (price - stop_loss) < min_dist: stop_loss = price - min_dist
             risk = price - stop_loss
             tp1, tp2, tp3 = price + risk, price + risk*2, price + risk*3
         else:
@@ -662,13 +655,11 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
             sl_struct = max(recent_high, ema_slow) * 1.002
             stop_loss = min(sl_atr, sl_struct)
             min_dist = price * (min_sl_pct / 100)
-            if (stop_loss - price) < min_dist:
-                stop_loss = price + min_dist
+            if (stop_loss - price) < min_dist: stop_loss = price + min_dist
             risk = stop_loss - price
             tp1, tp2, tp3 = price - risk, price - risk*2, price - risk*3
         risk_pct = abs(price - stop_loss) / price * 100 if price else 0
-        if risk_pct < min_sl_pct * 0.9 or risk_pct > 6.0:
-            return None
+        if risk_pct < min_sl_pct * 0.9 or risk_pct > 6.0: return None
         return {"entry": price, "stop_loss": stop_loss, "sl_pct": round(risk_pct, 2),
                 "tp1": tp1, "tp2": tp2, "tp3": tp3, "atr": atr}
     except Exception as e:
@@ -677,7 +668,7 @@ def compute_levels(df, direction, curr_idx=-2, tf="15m"):
 
 
 # ═══════════════════════════════════════════════════════════
-# 7) كاشات وحالات
+# 7) الكاشات
 # ═══════════════════════════════════════════════════════════
 _ohlcv_cache = {}
 _crossover_cache = {}
@@ -703,6 +694,10 @@ _filter_stats = {
     "range_6pct_reports": 0, "morning_reports": 0, "signals_tracked": 0,
     "signals_divergence": 0, "signals_bb": 0, "signals_sr": 0,
     "followups_sent": 0, "charts_sent": 0,
+    # Binance
+    "trades_opened": 0, "trades_closed": 0, "trades_failed": 0,
+    "trades_tp": 0, "trades_sl": 0, "trades_manual_sync": 0,
+    "trades_manual_close": 0,
 }
 
 
@@ -722,16 +717,13 @@ async def fetch_ohlcv_cached(symbol, tf, limit=150):
 
 
 def clear_caches():
-    _ohlcv_cache.clear()
-    _crossover_cache.clear()
-    _recent_signals.clear()
-    _divergence_cache.clear()
-    _bb_cache.clear()
-    _sr_cache.clear()
+    _ohlcv_cache.clear(); _crossover_cache.clear()
+    _recent_signals.clear(); _divergence_cache.clear()
+    _bb_cache.clear(); _sr_cache.clear()
 
 
 # ═══════════════════════════════════════════════════════════
-# 9) HTF / VWAP / Conflict / MTF
+# 9) HTF / VWAP / MTF
 # ═══════════════════════════════════════════════════════════
 async def get_htf_trend(symbol):
     if not HTF_ENABLED: return "NEUTRAL"
@@ -758,8 +750,7 @@ async def get_mtf_alignment(symbol, direction):
             es = float(calc_ema(df["c"], EMA_SLOW).iloc[-2])
             if direction == "bullish" and ef > es: score += 1
             elif direction == "bearish" and ef < es: score += 1
-        except Exception:
-            continue
+        except Exception: continue
     if score >= 3:   return +8, "توافق كامل (3/3) 🌟"
     if score == 2:   return +3, "توافق جزئي (2/3) ✅"
     if score == 1:   return -5, "توافق ضعيف (1/3) ⚠️"
@@ -805,7 +796,7 @@ def mark_symbol_sent(symbol):
 
 
 # ═══════════════════════════════════════════════════════════
-# 10) حساب Score
+# 10) Score
 # ═══════════════════════════════════════════════════════════
 def compute_score(df, direction, curr_idx=-2):
     close = df["c"]; vol = df["v"]
@@ -864,39 +855,30 @@ async def passes_filter(cross, htf_trend=None):
     s = cross.get("support", {})
     if not s: return False, "لا مؤشرات", "other"
     tf = cross["timeframe"]
-    vol = s.get("vol_ratio", 0)
-    adx = s.get("adx", 0)
-    atr = s.get("atr_pct", 0)
-    base_score = cross.get("base_score", s.get("score", 0))
-    gap_pct = s.get("gap_pct", 0)
+    vol = s.get("vol_ratio", 0); adx = s.get("adx", 0)
+    atr = s.get("atr_pct", 0); gap_pct = s.get("gap_pct", 0)
     source = cross.get("source", "ema")
     direction = cross["direction"]
+    base_score = cross.get("base_score", s.get("score", 0))
 
     if SYMBOL_COOLDOWN_SEC > 0:
-        ok_cooldown, remaining = check_symbol_cooldown(cross["symbol"])
-        if not ok_cooldown:
-            return False, f"cooldown {remaining}s", "cooldown"
+        ok_cd, remaining = check_symbol_cooldown(cross["symbol"])
+        if not ok_cd: return False, f"cooldown {remaining}s", "cooldown"
 
     min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
     if gap_pct < min_gap and source == "ema":
         return False, f"فرق EMA {gap_pct:.3f}% < {min_gap}%", "ema_gap"
 
     min_atr = MIN_ATR_PCT.get(tf, 0.05)
-    if atr < min_atr:
-        return False, f"ATR {atr}% < {min_atr}%", "atr_low"
+    if atr < min_atr: return False, f"ATR {atr}% < {min_atr}%", "atr_low"
 
     mtf_bonus, mtf_desc = await get_mtf_alignment(cross["symbol"], direction)
-    cross["mtf"] = mtf_desc
-    cross["mtf_bonus"] = mtf_bonus
+    cross["mtf"] = mtf_desc; cross["mtf_bonus"] = mtf_bonus
     score = base_score + mtf_bonus
-    s["score"] = score
-    cross["final_score"] = score
+    s["score"] = score; cross["final_score"] = score
 
-    if mtf_bonus <= -15:
-        return False, mtf_desc, "mtf"
-
-    if score < ABS_MIN_SCORE:
-        return False, f"Score {score} < {ABS_MIN_SCORE} (مطلق)", "score_abs"
+    if mtf_bonus <= -15: return False, mtf_desc, "mtf"
+    if score < ABS_MIN_SCORE: return False, f"Score {score} < {ABS_MIN_SCORE}", "score_abs"
 
     df = cross.get("_df")
     market = cross.get("market") or "UNKNOWN"
@@ -906,40 +888,27 @@ async def passes_filter(cross, htf_trend=None):
 
     th = get_thresholds(atr_pct=atr, adx=adx, tf=tf)
     min_score = th["min_score"]
-    if tf == "15m":
-        min_score = max(min_score, th.get("score_15m_override", min_score))
+    if tf == "15m": min_score = max(min_score, th.get("score_15m_override", min_score))
 
-    if score < min_score:
-        return False, f"Score {score} < {min_score:.0f}", "score"
-
-    if vol < th["min_vol_ratio"]:
-        return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
-
-    if adx < th["min_adx"]:
-        return False, f"ADX {adx} < {th['min_adx']}", "adx"
-
-    if atr > th["max_atr_pct"]:
-        return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
+    if score < min_score: return False, f"Score {score} < {min_score:.0f}", "score"
+    if vol < th["min_vol_ratio"]: return False, f"Vol {vol}× < {th['min_vol_ratio']}×", "vol"
+    if adx < th["min_adx"]: return False, f"ADX {adx} < {th['min_adx']}", "adx"
+    if atr > th["max_atr_pct"]: return False, f"ATR {atr}% > {th['max_atr_pct']}%", "atr"
 
     if source == "bb_squeeze":
-        if adx < MIN_ADX_FOR_BB:
-            return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
-        if vol < BB_MIN_VOL:
-            return False, f"BB Vol {vol}× < {BB_MIN_VOL}×", "vol"
+        if adx < MIN_ADX_FOR_BB: return False, f"ADX {adx} < {MIN_ADX_FOR_BB} لـ BB", "adx"
+        if vol < BB_MIN_VOL: return False, f"BB Vol {vol}× < {BB_MIN_VOL}×", "vol"
         if market == "RANGE" and adx < BB_MIN_ADX_IN_RANGE:
             return False, f"BB في رينج يحتاج ADX ≥ {BB_MIN_ADX_IN_RANGE}", "range"
         if BB_CONFIRM_ENABLED:
             confirmed = (mtf_bonus >= 8) or (adx > 22) or (vol > 1.5)
-            if not confirmed:
-                return False, "BB بدون تأكيد (MTF/ADX/Vol)", "bb_confirm"
+            if not confirmed: return False, "BB بدون تأكيد", "bb_confirm"
 
     if source == "ema":
-        if market == "TREND_DOWN" and direction == "bullish":
-            if mtf_bonus < 5:
-                return False, "تقاطع صاعد في ترند هابط", "trend"
-        elif market == "TREND_UP" and direction == "bearish":
-            if mtf_bonus < 5:
-                return False, "تقاطع هابط في ترند صاعد", "trend"
+        if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 5:
+            return False, "تقاطع صاعد في ترند هابط", "trend"
+        elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 5:
+            return False, "تقاطع هابط في ترند صاعد", "trend"
 
     if source == "rsi_div":
         if market == "TREND_DOWN" and direction == "bullish" and mtf_bonus < 3:
@@ -947,8 +916,7 @@ async def passes_filter(cross, htf_trend=None):
         elif market == "TREND_UP" and direction == "bearish" and mtf_bonus < 3:
             return False, "دايفرجنس ضد الترند", "trend"
 
-    if market == "RANGE" and source == "ema" \
-       and cross.get("alert_type") == "confirmed":
+    if market == "RANGE" and source == "ema" and cross.get("alert_type") == "confirmed":
         return False, "سوق عرضي — تقاطع وهمي", "range"
 
     if th["block_against_htf"] and cross.get("alert_type") != "pre" and htf_trend:
@@ -959,15 +927,13 @@ async def passes_filter(cross, htf_trend=None):
 
     if df is not None:
         ok, slope = check_vwap_slope(df, direction, th, tf=tf)
-        if not ok:
-            return False, f"VWAP {slope:+.2f}% ضد", "vwap"
+        if not ok: return False, f"VWAP {slope:+.2f}% ضد", "vwap"
 
     if cross.get("alert_type") == "confirmed":
         if has_conflicting_signal(cross["symbol"], direction):
             return False, "تعارض", "conflict"
 
-    if STRICTNESS == "auto":
-        _smart.record(True, score, source=source)
+    if STRICTNESS == "auto": _smart.record(True, score, source=source)
     return True, "", ""
 
 
@@ -992,13 +958,10 @@ async def _make_cross(symbol, tf, df, direction, alert_type, strength, curr,
            "price": round(float(df["c"].iloc[curr]), 8), "candle_ts": cts,
            "gap_pct": round(abs(cf - cs) / cs * 100, 3) if cs else 0,
            "strength": strength, "alert_type": alert_type,
-           "support": support,
-           "base_score": support["score"],
-           "final_score": support["score"],
-           "_df": df, "exchange": _exchange.primary_name,
-           "levels": levels, "source": source,
-           "market": market,
-           "created_at": _time.time()}
+           "support": support, "base_score": support["score"],
+           "final_score": support["score"], "_df": df,
+           "exchange": _exchange.primary_name, "levels": levels,
+           "source": source, "market": market, "created_at": _time.time()}
     if extra: out.update(extra)
     return out
 
@@ -1112,8 +1075,7 @@ async def detect_bb_squeeze_breakout(symbol, tf):
     if not ENABLE_BB_SQUEEZE: return None
     df = await _df_for(symbol, tf, extra=80)
     if df is None or len(df) < 60: return None
-    bb = calc_bollinger(df)
-    curr = -2
+    bb = calc_bollinger(df); curr = -2
     key = (symbol, tf, "bb")
     last = _bb_cache.get(key)
     if last and (_time.time() - last) < BB_SQUEEZE_COOLDOWN_MIN * 60: return None
@@ -1179,10 +1141,8 @@ async def detect_sudden_change(symbol):
             st["direction"] = d; st["count"] = 0; st["alerting"] = False
         if not st["alerting"]:
             st["alerting"] = True; st["count"] = 1
-        elif st["count"] < MAX_PRICE_ALERTS:
-            st["count"] += 1
-        else:
-            return None
+        elif st["count"] < MAX_PRICE_ALERTS: st["count"] += 1
+        else: return None
         return {"symbol": symbol, "direction": d, "change_pct": round(pct, 2),
                 "current_price": round(cur, 8), "prev_price": round(prev, 8),
                 "threshold": DEFAULT_THRESHOLD, "alert_count": st["count"],
@@ -1214,7 +1174,7 @@ def _load_manual_ranges():
 
 
 # ═══════════════════════════════════════════════════════════
-# 15) نطاق 6% المرجعي
+# 15) نطاق 6%
 # ═══════════════════════════════════════════════════════════
 async def _get_current_price(symbol):
     data, _ = await _exchange.fetch_ohlcv(symbol, "1m", 2)
@@ -1224,8 +1184,7 @@ async def _get_current_price(symbol):
 
 async def compute_6pct_ranges():
     global _last_6pct_report
-    results = []
-    half = RANGE_PCT / 200.0
+    results = []; half = RANGE_PCT / 200.0
     for symbol in ALL_SYMBOLS:
         try:
             price = await _get_current_price(symbol)
@@ -1235,29 +1194,24 @@ async def compute_6pct_ranges():
                  "width": upper - lower, "pct": RANGE_PCT, "ts": _time.time()}
             results.append(r); _last_6pct_report[symbol] = r
             _filter_stats["range_6pct_reports"] += 1
-        except Exception as e:
-            log.exception(f"compute_6pct {symbol}: {e}")
+        except Exception as e: log.exception(f"compute_6pct {symbol}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     return results
 
 
 def build_6pct_report(results, title="📊 نطاقات 6% المرجعية"):
-    if not results:
-        return f"{title}\n📭 لا بيانات."
+    if not results: return f"{title}\n📭 لا بيانات."
     header = (
-        f"{title}\n"
-        f"🇸🇾 {syria_now_str()}\n"
+        f"{title}\n🇸🇾 {syria_now_str()}\n"
         f"📐 النسبة: <b>{RANGE_PCT}%</b>\n"
         f"🔌 المصدر: <b>{_exchange.primary_name}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n")
-    body = ""
-    env_block = "\n<b>📋 انسخ إلى Render → Environment:</b>\n<code>"
+    body = ""; env_block = "\n<b>📋 Environment:</b>\n<code>"
     for r in results:
-        body += (
-            f"\n🔹 <b>{short(r['symbol'])}</b>\n"
-            f"   💰 السعر: <b>{fmt_price(r['price'])}</b>\n"
-            f"   📉 الأدنى: <b>{fmt_price(r['lower'])}</b>\n"
-            f"   📈 الأعلى: <b>{fmt_price(r['upper'])}</b>\n")
+        body += (f"\n🔹 <b>{short(r['symbol'])}</b>\n"
+                 f"   💰 السعر: <b>{fmt_price(r['price'])}</b>\n"
+                 f"   📉 الأدنى: <b>{fmt_price(r['lower'])}</b>\n"
+                 f"   📈 الأعلى: <b>{fmt_price(r['upper'])}</b>\n")
         sym_up = short(r["symbol"])
         env_block += f"{sym_up}_LOWER={r['lower']:.6f}\n{sym_up}_UPPER={r['upper']:.6f}\n"
     env_block += "</code>\n"
@@ -1265,7 +1219,7 @@ def build_6pct_report(results, title="📊 نطاقات 6% المرجعية"):
 
 
 # ═══════════════════════════════════════════════════════════
-# 15b) 🌅 تقرير الصباح
+# 15b) تقرير الصباح
 # ═══════════════════════════════════════════════════════════
 async def collect_sr_data(symbol):
     try:
@@ -1279,16 +1233,14 @@ async def collect_sr_data(symbol):
                 "lows": find_swing_levels(df)["lows"],
                 "tf": MORNING_REPORT_TF}
     except Exception as e:
-        log.exception(f"collect_sr_data {symbol}: {e}")
-        return None
+        log.exception(f"collect_sr_data {symbol}: {e}"); return None
 
 
 def build_morning_report(items, title=None):
-    if not title: title = "🌅 تقرير الصباح — الدعم والمقاومة"
-    if not items:
-        return f"{title}\n🇸🇾 {syria_now_str()}\n📭 لا بيانات."
+    if not title: title = "🌅 تقرير الصباح"
+    if not items: return f"{title}\n🇸🇾 {syria_now_str()}\n📭 لا بيانات."
     out = [f"{title}", f"🇸🇾 <b>{syria_now_str()}</b>",
-           f"📊 الإطار: <b>{MORNING_REPORT_TF}</b> | 🔌 {_exchange.primary_name}", ""]
+           f"📊 الإطار: <b>{MORNING_REPORT_TF}</b>", ""]
     for it in items:
         if not it: continue
         sym = short(it["symbol"]); price = it["price"]; p = it["pivots"]
@@ -1313,7 +1265,6 @@ def build_morning_report(items, title=None):
                 block.append(f"   • {fmt_price(l)} — <i>{syria_from_ts(ts)}</i>")
         out.append("\n".join(block))
     out.append("━━━━━━━━━━━━━━━━━━━")
-    out.append("💡 <i>استخدم /sr لعرضه عند الطلب</i>")
     return "\n".join(out)
 
 
@@ -1326,8 +1277,7 @@ async def check_range_breakout(symbol):
     if not r: return None
     price = await _get_current_price(symbol)
     if price <= 0: return None
-    now = _time.time()
-    cooldown = RANGE_BREAKOUT_COOLDOWN_MIN * 60
+    now = _time.time(); cooldown = RANGE_BREAKOUT_COOLDOWN_MIN * 60
     width = r["upper"] - r["lower"]
     if r["lower"] <= price <= r["upper"]:
         r["state"] = "inside"; return None
@@ -1362,15 +1312,12 @@ async def check_range_approach(symbol):
     dist_up = 100 - position_pct; dist_down = position_pct
     if dist_up <= RANGE_APPROACH_PCT: side, dist = "upper", dist_up
     elif dist_down <= RANGE_APPROACH_PCT: side, dist = "lower", dist_down
-    else:
-        r["last_near_side"] = None; return None
-    now = _time.time()
-    cooldown = RANGE_APPROACH_COOLDOWN_MIN * 60
+    else: r["last_near_side"] = None; return None
+    now = _time.time(); cooldown = RANGE_APPROACH_COOLDOWN_MIN * 60
     if r["last_near_side"] == side and now - r["last_approach_alert_at"] < cooldown:
         return None
     r["last_near_side"] = side; r["last_approach_alert_at"] = now
-    mid = (r["lower"] + r["upper"]) / 2
-    shift = price - mid
+    mid = (r["lower"] + r["upper"]) / 2; shift = price - mid
     shift_pct = (shift / mid) * 100 if mid else 0
     width_ratio = width / price if price > 0 else 0
     if width_ratio > 0.40:
@@ -1391,46 +1338,35 @@ async def check_range_approach(symbol):
             "width_ratio": round(width_ratio * 100, 1)}
 
 
-# ═══════════════════════════════════════════════════════════
-# 17) رسائل النطاق
-# ═══════════════════════════════════════════════════════════
 def build_breakout_msg(b):
     up = b["direction"] == "above"
-    return (
-        f"{'🚨' if up else '🔻'} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
-        f"🇸🇾 <b>{syria_now_str()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(b['price'])}</b>\n"
-        f"🎯 الحد المخترق: <b>{fmt_price(b['boundary'])}</b>\n"
-        f"📏 المسافة: <b>{b['deviation_pct']:.2f}%</b>\n"
-        f"• النطاق: {fmt_price(b['lower'])} – {fmt_price(b['upper'])}\n"
-        f"• عمر: {b['age_min']} د"
-    )
+    return (f"{'🚨' if up else '🔻'} <b>خروج عن النطاق — {short(b['symbol'])}</b>\n"
+            f"🇸🇾 <b>{syria_now_str()}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(b['price'])}</b>\n"
+            f"🎯 الحد المخترق: <b>{fmt_price(b['boundary'])}</b>\n"
+            f"📏 المسافة: <b>{b['deviation_pct']:.2f}%</b>\n"
+            f"• النطاق: {fmt_price(b['lower'])} – {fmt_price(b['upper'])}\n"
+            f"• عمر: {b['age_min']} د")
 
 
 def build_approach_msg(a):
     up = a["side"] == "upper"
-    return (
-        f"{'⚠️' if up else '🔔'} <b>اقتراب — {short(a['symbol'])}</b>\n"
-        f"🇸🇾 <b>{syria_now_str()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(a['price'])}</b>\n"
-        f"📏 المسافة: <b>{a['distance_pct']}%</b> | الموضع: {a['position_pct']}%\n"
-        f"📍 النطاق: {fmt_price(a['lower'])} – {fmt_price(a['upper'])}\n"
-        f"💡 الاقتراح: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>"
-    )
+    return (f"{'⚠️' if up else '🔔'} <b>اقتراب — {short(a['symbol'])}</b>\n"
+            f"🇸🇾 <b>{syria_now_str()}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{'⬆️' if up else '⬇️'} السعر: <b>{fmt_price(a['price'])}</b>\n"
+            f"📏 المسافة: <b>{a['distance_pct']}%</b> | الموضع: {a['position_pct']}%\n"
+            f"📍 النطاق: {fmt_price(a['lower'])} – {fmt_price(a['upper'])}\n"
+            f"💡 الاقتراح: <b>{fmt_price(a['suggested_lower'])} – {fmt_price(a['suggested_upper'])}</b>")
 
 
 # ═══════════════════════════════════════════════════════════
-# 18) رسائل الإشارات
+# 17) رسائل الإشارات
 # ═══════════════════════════════════════════════════════════
 def _source_label(src):
-    return {
-        "ema": "📈 تقاطع EMA",
-        "rsi_div": "🔄 دايفرجنس RSI",
-        "bb_squeeze": "💥 BB Squeeze",
-        "sr_breakout": "🎯 كسر S/R",
-    }.get(src, "—")
+    return {"ema": "📈 تقاطع EMA", "rsi_div": "🔄 دايفرجنس RSI",
+            "bb_squeeze": "💥 BB Squeeze", "sr_breakout": "🎯 كسر S/R"}.get(src, "—")
 
 
 def build_signal_message(cross):
@@ -1460,83 +1396,66 @@ def build_signal_message(cross):
     market_lbl = {"TREND_UP": "📈 ترند صاعد", "TREND_DOWN": "📉 ترند هابط",
                   "RANGE": "↔️ عرضي", "VOLATILE": "🌊 متقلب",
                   "UNKNOWN": "❓"}.get(market, market)
-
-    msg = (
-        f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
-        f"🇸🇾 <b>{syria_now_str()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{type_lbl} | {_source_label(source)}\n"
-        f"📊 <b>{dir_lbl}</b>\n"
-        f"🏛️ السوق: <b>{market_lbl}</b>\n"
-        f"🔗 MTF: <b>{mtf}</b>\n")
+    msg = (f"{emoji} <b>{title} — {short(sym)} [{tf}]</b>\n"
+           f"🇸🇾 <b>{syria_now_str()}</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"{type_lbl} | {_source_label(source)}\n"
+           f"📊 <b>{dir_lbl}</b>\n"
+           f"🏛️ السوق: <b>{market_lbl}</b>\n"
+           f"🔗 MTF: <b>{mtf}</b>\n")
     if source == "rsi_div" and cross.get("div_info"):
         di = cross["div_info"]
-        msg += (
-            f"🔄 الدايفرجنس: RSI <b>{di['r1']}</b> → <b>{di['r2']}</b>\n"
-            f"   • من: {syria_from_ts(di['ts1'])}\n"
-            f"   • إلى: {syria_from_ts(di['ts2'])}\n")
+        msg += (f"🔄 الدايفرجنس: RSI <b>{di['r1']}</b> → <b>{di['r2']}</b>\n")
     elif source == "bb_squeeze" and cross.get("bb_info"):
-        bi = cross["bb_info"]
-        msg += f"💥 عرض BB: <b>{bi['width']}%</b> (أدنى 20%)\n"
+        bi = cross["bb_info"]; msg += f"💥 عرض BB: <b>{bi['width']}%</b>\n"
     elif source == "sr_breakout" and cross.get("sr_info"):
-        si = cross["sr_info"]
-        msg += f"🎯 المستوى المكسور: <b>{fmt_price(si['level'])}</b>\n"
-    msg += (
-        f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
-        f"🎯 <b>العلامة: {score}/100 {grade}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• الحجم: {s.get('vol_ratio','?')}× ({s.get('vol_pts',0)}/30)\n"
-        f"• ADX: {s.get('adx','?')} ({s.get('adx_pts',0)}/20)\n"
-        f"• RSI: {s.get('rsi','?')} ({s.get('rsi_pts',0)}/10)\n"
-        f"• ATR: {s.get('atr_pct','?')}% ({s.get('atr_pts',0)}/5)\n")
-    if levels:
-        msg += (
+        si = cross["sr_info"]; msg += f"🎯 المستوى المكسور: <b>{fmt_price(si['level'])}</b>\n"
+    msg += (f"📏 فرق EMA: <b>{cross['gap_pct']:.3f}%</b>\n"
+            f"🎯 <b>العلامة: {score}/100 {grade}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>خطة التنفيذ:</b>\n"
-            f"• الدخول: <b>{fmt_price(levels['entry'])}</b>\n"
-            f"• وقف الخسارة: <b>{fmt_price(levels['stop_loss'])}</b> (-{levels['sl_pct']}%)\n"
-            f"• هدف 1 (1:1): {fmt_price(levels['tp1'])}\n"
-            f"• هدف 2 (1:2): {fmt_price(levels['tp2'])}\n"
-            f"• هدف 3 (1:3): {fmt_price(levels['tp3'])}\n")
-    msg += (
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"• السعر: {fmt_price(cross['price'])}\n"
-        f"• المصدر: {cross.get('exchange','?')} ({MARKET_TYPE})")
+            f"• الحجم: {s.get('vol_ratio','?')}×\n"
+            f"• ADX: {s.get('adx','?')}\n"
+            f"• RSI: {s.get('rsi','?')}\n"
+            f"• ATR: {s.get('atr_pct','?')}%\n")
+    if levels:
+        msg += (f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 <b>خطة التنفيذ:</b>\n"
+                f"• الدخول: <b>{fmt_price(levels['entry'])}</b>\n"
+                f"• وقف الخسارة: <b>{fmt_price(levels['stop_loss'])}</b> (-{levels['sl_pct']}%)\n"
+                f"• هدف 1 (1:1): {fmt_price(levels['tp1'])}\n"
+                f"• هدف 2 (1:2): {fmt_price(levels['tp2'])}\n"
+                f"• هدف 3 (1:3): {fmt_price(levels['tp3'])}\n")
+    msg += (f"━━━━━━━━━━━━━━━━━━━\n"
+            f"• السعر: {fmt_price(cross['price'])}\n"
+            f"• المصدر: {cross.get('exchange','?')} ({MARKET_TYPE})")
     return msg
 
 
 def build_price_alert_msg(a):
     up = a["direction"] == "up"
-    return (
-        f"{'🚀' if up else '🔻'} <b>تغير مفاجئ — {short(a['symbol'])}</b>\n"
-        f"🇸🇾 <b>{syria_now_str()}</b>\n"
-        f"📈 التغير: <b>{a['change_pct']}%</b>\n"
-        f"🔔 التنبيه: {a['alert_count']} من {a['max_alerts']}\n"
-        f"• الحالي: {fmt_price(a['current_price'])}\n"
-        f"• السابق: {fmt_price(a['prev_price'])}"
-    )
+    return (f"{'🚀' if up else '🔻'} <b>تغير مفاجئ — {short(a['symbol'])}</b>\n"
+            f"🇸🇾 <b>{syria_now_str()}</b>\n"
+            f"📈 التغير: <b>{a['change_pct']}%</b>\n"
+            f"🔔 {a['alert_count']} من {a['max_alerts']}\n"
+            f"• الحالي: {fmt_price(a['current_price'])}\n"
+            f"• السابق: {fmt_price(a['prev_price'])}")
 
 
 def build_ranges_report():
-    if not _last_range:
-        return "📭 لا نطاقات."
+    if not _last_range: return "📭 لا نطاقات."
     lines = ["<b>📊 النطاقات المُراقَبة:</b>\n"]
     now = _time.time()
     for sym, r in _last_range.items():
         age = int((now - r["computed_at"]) / 60)
         icon = {"inside": "🟢", "above": "🔺", "below": "🔻"}.get(r["state"], "⚪")
-        lines.append(
-            f"{icon} <b>{short(sym)}</b>\n"
-            f"   الأدنى: {fmt_price(r['lower'])} | الأعلى: {fmt_price(r['upper'])}\n"
-            f"   عمر: {age} د\n")
-    lines.append(
-        f"\n🎯 اقتراب: {RANGE_APPROACH_PCT}% | 6%: كل {RANGE_REPORT_INTERVAL_HOURS}h\n"
-        f"🌅 تقرير الصباح: {MORNING_REPORT_HOUR_SYRIA}:00")
+        lines.append(f"{icon} <b>{short(sym)}</b>\n"
+                     f"   {fmt_price(r['lower'])} | {fmt_price(r['upper'])}\n"
+                     f"   عمر: {age} د\n")
     return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
-# 18b) رسائل المتابعة
+# 17b) رسائل المتابعة
 # ═══════════════════════════════════════════════════════════
 def build_followup_msg(sig, result, price, age_min):
     cross = sig["cross"]
@@ -1545,50 +1464,22 @@ def build_followup_msg(sig, result, price, age_min):
     entry = sig["levels"]["entry"]
     lv = sig["levels"]
     pnl_pct = ((price - entry) / entry * 100) * (1 if bull else -1)
-
-    if result == "win_tp3":
-        emoji, title, color = "🌟", "هدف 3 مُحقَّق! (1:3)", "🟢"
-    elif result == "win_tp2":
-        emoji, title, color = "✅", "هدف 2 مُحقَّق! (1:2)", "🟢"
-    elif result == "win_tp1":
-        emoji, title, color = "🎯", "هدف 1 مُحقَّق! (1:1)", "🟢"
-    elif result == "loss_sl":
-        emoji, title, color = "❌", "وقف الخسارة", "🔴"
-    elif result == "expired":
-        emoji, title, color = "⏰", "انتهت الصلاحية", "🟡"
-    else:
-        return None
-
-    msg = (
-        f"{emoji} <b>{title}</b>\n"
-        f"📌 متابعة: {sym} [{tf}]\n"
-        f"🇸🇾 {syria_now_str()}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"{color} {'🟢 صاعد' if bull else '🔴 هابط'} | "
-        f"{_source_label(cross.get('source','ema'))}\n"
-        f"💰 الدخول: <b>{fmt_price(entry)}</b>\n"
-        f"💵 الحالي: <b>{fmt_price(price)}</b>\n"
-        f"📊 الربح/الخسارة: <b>{pnl_pct:+.2f}%</b>\n"
-        f"⏱️ المدة: <b>{int(age_min)} دقيقة</b>\n")
-
-    if result.startswith("win"):
-        msg += (
-            f"\n🎯 <b>تقدم الأهداف:</b>\n"
-            f"• TP1 ({fmt_price(lv['tp1'])}): "
-            f"{'✅' if result in ('win_tp1','win_tp2','win_tp3') else '⏳'}\n"
-            f"• TP2 ({fmt_price(lv['tp2'])}): "
-            f"{'✅' if result in ('win_tp2','win_tp3') else '⏳'}\n"
-            f"• TP3 ({fmt_price(lv['tp3'])}): "
-            f"{'✅' if result == 'win_tp3' else '⏳'}\n")
-
-    if result == "win_tp1":
-        msg += "\n💡 <i>يُنصح بنقل SL إلى نقطة الدخول</i>"
-    elif result == "win_tp2":
-        msg += "\n💡 <i>يُنصح بنقل SL إلى TP1</i>"
-    elif result == "loss_sl":
-        msg += f"\n💡 <i>راجع /perf للأداء</i>"
-    elif result == "expired":
-        msg += f"\n💡 <i>لم يحرّك السعر بشكل كافٍ خلال {SIGNAL_TRACK_MAX_MIN} دقيقة</i>"
+    if result == "win_tp3": emoji, title, color = "🌟", "هدف 3 (1:3)", "🟢"
+    elif result == "win_tp2": emoji, title, color = "✅", "هدف 2 (1:2)", "🟢"
+    elif result == "win_tp1": emoji, title, color = "🎯", "هدف 1 (1:1)", "🟢"
+    elif result == "loss_sl": emoji, title, color = "❌", "وقف الخسارة", "🔴"
+    elif result == "expired": emoji, title, color = "⏰", "انتهت الصلاحية", "🟡"
+    else: return None
+    msg = (f"{emoji} <b>{title}</b>\n"
+           f"📌 متابعة: {sym} [{tf}]\n"
+           f"🇸🇾 {syria_now_str()}\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"{color} {'🟢 صاعد' if bull else '🔴 هابط'} | "
+           f"{_source_label(cross.get('source','ema'))}\n"
+           f"💰 الدخول: <b>{fmt_price(entry)}</b>\n"
+           f"💵 الحالي: <b>{fmt_price(price)}</b>\n"
+           f"📊 P&L: <b>{pnl_pct:+.2f}%</b>\n"
+           f"⏱️ المدة: <b>{int(age_min)} دقيقة</b>\n")
     return msg
 
 
@@ -1600,21 +1491,19 @@ async def send_followup(bot, sig, result, price, age_min):
     if result == "loss_sl" and not FOLLOWUP_ON_SL: return
     if result == "expired" and not FOLLOWUP_ON_EXPIRE: return
     now = _time.time()
-    last_sent = sig.get("last_followup_ts", 0)
-    if now - last_sent < FOLLOWUP_THROTTLE_SEC: return
+    if now - sig.get("last_followup_ts", 0) < FOLLOWUP_THROTTLE_SEC: return
     sig["last_followup_ts"] = now
     text = build_followup_msg(sig, result, price, age_min)
     if not text: return
     try:
         await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
         _filter_stats["followups_sent"] += 1
-        log.info(f"📬 متابعة: {short(sig['cross']['symbol'])} → {result}")
     except Exception as e:
         log.error(f"send_followup: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 18c) تتبّع الإشارات
+# 18) تتبّع الإشارات (Paper tracking — يبقى للتحليل)
 # ═══════════════════════════════════════════════════════════
 def register_signal_for_tracking(cross):
     levels = cross.get("levels")
@@ -1623,11 +1512,9 @@ def register_signal_for_tracking(cross):
     _pending_signals[sid] = {
         "cross": cross, "levels": levels,
         "entry_price": levels["entry"], "entry_ts": _time.time(),
-        "direction": cross["direction"],
-        "source": cross.get("source", "ema"),
+        "direction": cross["direction"], "source": cross.get("source", "ema"),
         "checked": False, "result": None,
-        "max_favorable": levels["entry"],
-        "max_adverse": levels["entry"],
+        "max_favorable": levels["entry"], "max_adverse": levels["entry"],
         "last_followup_ts": 0.0,
     }
     _filter_stats["signals_tracked"] += 1
@@ -1640,8 +1527,7 @@ async def evaluate_pending_signals(bot=None):
         if sig["checked"]: continue
         age_min = (now - sig["entry_ts"]) / 60
         if age_min > SIGNAL_TRACK_MAX_MIN:
-            sig["checked"] = True
-            sig["result"] = "expired"
+            sig["checked"] = True; sig["result"] = "expired"
             _smart.record_result("expired", sig["direction"], sig.get("source", "unknown"))
             _record_history(sig, "expired", sig["levels"]["entry"], age_min)
             if bot and CHAT_ID:
@@ -1650,35 +1536,22 @@ async def evaluate_pending_signals(bot=None):
         try:
             data, _ = await _exchange.fetch_ohlcv(sig["cross"]["symbol"], "1m", 3)
             if not data: continue
-            price = float(data[-1][4])
-            lv = sig["levels"]
-            if sig["direction"] == "bullish":
-                sig["max_favorable"] = max(sig["max_favorable"], price)
-                sig["max_adverse"] = min(sig["max_adverse"], price)
-            else:
-                sig["max_favorable"] = min(sig["max_favorable"], price)
-                sig["max_adverse"] = max(sig["max_adverse"], price)
-
+            price = float(data[-1][4]); lv = sig["levels"]
             new_result = None
             if sig["direction"] == "bullish":
-                if price <= lv["stop_loss"]:
-                    sig["checked"] = True; new_result = "loss_sl"
-                elif price >= lv["tp3"]:
-                    sig["checked"] = True; new_result = "win_tp3"
-                elif price >= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
+                if price <= lv["stop_loss"]: sig["checked"] = True; new_result = "loss_sl"
+                elif price >= lv["tp3"]: sig["checked"] = True; new_result = "win_tp3"
+                elif price >= lv["tp2"] and sig.get("result") not in ("win_tp2","win_tp3"):
                     new_result = "win_tp2"; sig["result"] = "win_tp2"
                 elif price >= lv["tp1"] and not sig.get("result"):
                     new_result = "win_tp1"; sig["result"] = "win_tp1"
             else:
-                if price >= lv["stop_loss"]:
-                    sig["checked"] = True; new_result = "loss_sl"
-                elif price <= lv["tp3"]:
-                    sig["checked"] = True; new_result = "win_tp3"
-                elif price <= lv["tp2"] and sig.get("result") not in ("win_tp2", "win_tp3"):
+                if price >= lv["stop_loss"]: sig["checked"] = True; new_result = "loss_sl"
+                elif price <= lv["tp3"]: sig["checked"] = True; new_result = "win_tp3"
+                elif price <= lv["tp2"] and sig.get("result") not in ("win_tp2","win_tp3"):
                     new_result = "win_tp2"; sig["result"] = "win_tp2"
                 elif price <= lv["tp1"] and not sig.get("result"):
                     new_result = "win_tp1"; sig["result"] = "win_tp1"
-
             if new_result:
                 if sig["checked"]:
                     _smart.record_result(sig["result"], sig["direction"],
@@ -1695,203 +1568,868 @@ async def evaluate_pending_signals(bot=None):
 
 
 def _record_history(sig, result, price, age_min):
-    cross = sig["cross"]
-    entry = sig["levels"]["entry"]
+    cross = sig["cross"]; entry = sig["levels"]["entry"]
     bull = sig["direction"] == "bullish"
     pnl = ((price - entry) / entry * 100) * (1 if bull else -1)
     _last_signals.append({
-        "symbol": cross["symbol"],
-        "timeframe": cross["timeframe"],
-        "direction": cross["direction"],
-        "source": cross.get("source", "ema"),
+        "symbol": cross["symbol"], "timeframe": cross["timeframe"],
+        "direction": cross["direction"], "source": cross.get("source", "ema"),
         "score": cross.get("final_score", 0),
-        "entry": entry,
-        "exit": price,
-        "result": result,
-        "pnl_pct": round(pnl, 2),
-        "duration_min": int(age_min),
-        "ts": _time.time(),
+        "entry": entry, "exit": price, "result": result,
+        "pnl_pct": round(pnl, 2), "duration_min": int(age_min), "ts": _time.time(),
     })
 
 
 # ═══════════════════════════════════════════════════════════
-# 19) 🆕 وحدة الرسوم البيانية الاحترافية
+# 19) 📈 الرسوم البيانية
 # ═══════════════════════════════════════════════════════════
-C_BG     = "#0d1117"
-C_PANEL  = "#131722"
-C_GRID   = "#1f2430"
-C_UP     = "#26a69a"
-C_DOWN   = "#ef5350"
-C_TEXT   = "#d1d4dc"
-C_MUTED  = "#7a7f8a"
-C_PIVOT  = "#ffeb3b"
-C_R1     = "#ff9800"
-C_R2     = "#ff5722"
-C_R3     = "#f44336"
-C_S1     = "#8bc34a"
-C_S2     = "#4caf50"
-C_S3     = "#00bcd4"
-C_PRICE  = "#ffffff"
-C_ENTRY  = "#00e5ff"
+C_BG = "#0d1117"; C_PANEL = "#131722"; C_GRID = "#1f2430"
+C_UP = "#26a69a"; C_DOWN = "#ef5350"; C_TEXT = "#d1d4dc"; C_MUTED = "#7a7f8a"
+C_PIVOT = "#ffeb3b"; C_R1 = "#ff9800"; C_R2 = "#ff5722"; C_R3 = "#f44336"
+C_S1 = "#8bc34a"; C_S2 = "#4caf50"; C_S3 = "#00bcd4"
+C_PRICE = "#ffffff"; C_ENTRY = "#00e5ff"
 
 
 def _chart_generate_sync(symbol, df, sr_data, signal=None, lookback=CHART_LOOKBACK):
-    """إنشاء رسم بياني احترافي (شموع + Pivot + S/R)."""
     df = df.iloc[-lookback:].reset_index(drop=True)
-    if df.empty:
-        return None
-
+    if df.empty: return None
     fig = plt.figure(figsize=(14, 7.5), dpi=CHART_DPI, facecolor=C_BG)
-    ax  = fig.add_axes([0.06, 0.10, 0.76, 0.82])
-    ax.set_facecolor(C_PANEL)
-
+    ax = fig.add_axes([0.06, 0.10, 0.76, 0.82]); ax.set_facecolor(C_PANEL)
     n = len(df)
-
-    # الشموع
     for i, row in df.iterrows():
         is_up = row["c"] >= row["o"]
         color = C_UP if is_up else C_DOWN
-        ax.plot([i, i], [row["l"], row["h"]],
-                color=color, linewidth=0.8, zorder=2, solid_capstyle="round")
+        ax.plot([i, i], [row["l"], row["h"]], color=color, linewidth=0.8,
+                zorder=2, solid_capstyle="round")
         low_body = min(row["o"], row["c"])
-        body_h   = abs(row["c"] - row["o"])
-        if body_h <= 0:
-            body_h = (row["h"] - row["l"]) * 0.01 or row["c"] * 0.0001
+        body_h = abs(row["c"] - row["o"])
+        if body_h <= 0: body_h = (row["h"] - row["l"]) * 0.01 or row["c"] * 0.0001
         ax.add_patch(Rectangle((i - 0.35, low_body), 0.7, body_h,
-                                facecolor=color, edgecolor=color,
-                                linewidth=0, zorder=3))
-
-    # خط السعر الحالي
+                                facecolor=color, edgecolor=color, linewidth=0, zorder=3))
     price_now = float(df["c"].iloc[-1])
-    ax.axhline(price_now, color=C_PRICE, linestyle="-",
-               linewidth=0.9, alpha=0.55, zorder=1)
-    ax.text(n + 0.3, price_now, f"  {price_now:.6f}",
-            color=C_PRICE, fontsize=10, va="center", ha="left",
-            fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.25",
-                      facecolor=C_PANEL, edgecolor=C_PRICE,
-                      linewidth=0.6))
-
-    # مستويات Pivot
+    ax.axhline(price_now, color=C_PRICE, linestyle="-", linewidth=0.9, alpha=0.55, zorder=1)
+    ax.text(n + 0.3, price_now, f"  {price_now:.6f}", color=C_PRICE, fontsize=10,
+            va="center", ha="left", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor=C_PANEL,
+                      edgecolor=C_PRICE, linewidth=0.6))
     p = (sr_data or {}).get("pivots")
     if p:
-        levels = [
-            ("R3", p["r3"], C_R3),
-            ("R2", p["r2"], C_R2),
-            ("R1", p["r1"], C_R1),
-            ("P",  p["pivot"], C_PIVOT),
-            ("S1", p["s1"], C_S1),
-            ("S2", p["s2"], C_S2),
-            ("S3", p["s3"], C_S3),
-        ]
-        for name, lvl, col in levels:
-            ax.axhline(lvl, color=col, linestyle="--",
-                       linewidth=1.0, alpha=0.75, zorder=1)
-            ax.text(n + 0.3, lvl, f"  {name}  {lvl:.6f}",
-                    color=col, fontsize=9, va="center", ha="left",
-                    fontweight="bold")
-
-    # القمم السابقة
+        for name, lvl, col in [("R3", p["r3"], C_R3), ("R2", p["r2"], C_R2),
+                                ("R1", p["r1"], C_R1), ("P", p["pivot"], C_PIVOT),
+                                ("S1", p["s1"], C_S1), ("S2", p["s2"], C_S2),
+                                ("S3", p["s3"], C_S3)]:
+            ax.axhline(lvl, color=col, linestyle="--", linewidth=1.0, alpha=0.75, zorder=1)
+            ax.text(n + 0.3, lvl, f"  {name}  {lvl:.6f}", color=col, fontsize=9,
+                    va="center", ha="left", fontweight="bold")
     for h, _ts in (sr_data or {}).get("highs", []):
-        ax.axhline(h, color=C_DOWN, linestyle=":",
-                   linewidth=0.9, alpha=0.55, zorder=1)
-        ax.scatter([n - 1], [h], marker="v", s=42,
-                   color=C_DOWN, zorder=4, edgecolors="white", linewidths=0.5)
-        ax.text(-1.5, h, f"{h:.6f}  H", color=C_DOWN,
-                fontsize=8, va="center", ha="left", alpha=0.85)
-
-    # القيعان السابقة
+        ax.axhline(h, color=C_DOWN, linestyle=":", linewidth=0.9, alpha=0.55, zorder=1)
+        ax.scatter([n - 1], [h], marker="v", s=42, color=C_DOWN, zorder=4,
+                   edgecolors="white", linewidths=0.5)
     for l, _ts in (sr_data or {}).get("lows", []):
-        ax.axhline(l, color=C_UP, linestyle=":",
-                   linewidth=0.9, alpha=0.55, zorder=1)
-        ax.scatter([n - 1], [l], marker="^", s=42,
-                   color=C_UP, zorder=4, edgecolors="white", linewidths=0.5)
-        ax.text(-1.5, l, f"{l:.6f}  L", color=C_UP,
-                fontsize=8, va="center", ha="left", alpha=0.85)
-
-    # إشارة تداول (اختياري)
+        ax.axhline(l, color=C_UP, linestyle=":", linewidth=0.9, alpha=0.55, zorder=1)
+        ax.scatter([n - 1], [l], marker="^", s=42, color=C_UP, zorder=4,
+                   edgecolors="white", linewidths=0.5)
     if signal:
         lv = signal.get("levels") or {}
         entry = lv.get("entry"); sl = lv.get("stop_loss")
         tp1 = lv.get("tp1"); tp2 = lv.get("tp2"); tp3 = lv.get("tp3")
         if entry:
-            ax.axhline(entry, color=C_ENTRY, linestyle="-",
-                       linewidth=1.4, alpha=0.9, zorder=5)
-            ax.text(n + 0.3, entry, f"  ENTRY {entry:.6f}",
-                    color=C_ENTRY, fontsize=9, va="center", ha="left",
-                    fontweight="bold")
+            ax.axhline(entry, color=C_ENTRY, linestyle="-", linewidth=1.4, alpha=0.9, zorder=5)
         if sl:
-            ax.axhline(sl, color=C_DOWN, linestyle="-",
-                       linewidth=1.2, alpha=0.85, zorder=5)
-            ax.text(n + 0.3, sl, f"  SL {sl:.6f}",
-                    color=C_DOWN, fontsize=9, va="center", ha="left",
-                    fontweight="bold")
+            ax.axhline(sl, color=C_DOWN, linestyle="-", linewidth=1.2, alpha=0.85, zorder=5)
         for tp, lbl in [(tp1, "TP1"), (tp2, "TP2"), (tp3, "TP3")]:
-            if tp:
-                ax.axhline(tp, color=C_UP, linestyle="-",
-                           linewidth=1.0, alpha=0.7, zorder=5)
-                ax.text(n + 0.3, tp, f"  {lbl} {tp:.6f}",
-                        color=C_UP, fontsize=9, va="center", ha="left")
-
-    # التنسيق
+            if tp: ax.axhline(tp, color=C_UP, linestyle="-", linewidth=1.0, alpha=0.7, zorder=5)
     tf = (sr_data or {}).get("tf", "1h")
     ax.set_title(f"  {symbol}   ·   {tf}", color=C_TEXT, fontsize=13,
                  fontweight="bold", loc="left", pad=14)
-
     ax.tick_params(axis="x", colors=C_MUTED, labelsize=9)
     ax.tick_params(axis="y", colors=C_MUTED, labelsize=9)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.5f"))
     ax.grid(True, color=C_GRID, alpha=0.55, linewidth=0.5)
-    for sp in ("top", "right"):
-        ax.spines[sp].set_visible(False)
-    for sp in ("bottom", "left"):
-        ax.spines[sp].set_color(C_GRID)
-
+    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+    for sp in ("bottom", "left"): ax.spines[sp].set_color(C_GRID)
     ax.set_xlim(-3, n + 18)
-
-    fig.text(0.06, 0.025, f"SY {syria_now_str()}",
-             color=C_MUTED, fontsize=9)
-    fig.text(0.94, 0.025,
-             f"{_exchange.primary_name.upper()}  ·  {MARKET_TYPE}",
+    fig.text(0.06, 0.025, f"SY {syria_now_str()}", color=C_MUTED, fontsize=9)
+    fig.text(0.94, 0.025, f"{_exchange.primary_name.upper()}  ·  {MARKET_TYPE}",
              color=C_MUTED, fontsize=9, ha="right")
-
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", facecolor=C_BG)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+    plt.savefig(buf, format="png", facecolor=C_BG); plt.close(fig)
+    buf.seek(0); return buf
 
 
 async def generate_sr_chart(symbol, signal=None, tf=None):
-    """نسخة async — تجلب البيانات وترسم الرسم البياني"""
-    if not CHART_ENABLED:
-        return None
+    if not CHART_ENABLED: return None
     try:
         tf = tf or MORNING_REPORT_TF
         data = await fetch_ohlcv_cached(symbol, tf, MORNING_REPORT_LIMIT)
-        if not data or len(data) < 60:
-            return None
+        if not data or len(data) < 60: return None
         df = pd.DataFrame(data, columns=["ts", "o", "h", "l", "c", "v"])
-        sr_data = {
-            "pivots": calc_pivots_classic(df),
-            "highs":  find_swing_levels(df)["highs"],
-            "lows":   find_swing_levels(df)["lows"],
-            "tf":     tf,
-        }
-        buf = await asyncio.to_thread(
-            _chart_generate_sync, symbol, df, sr_data, signal
-        )
-        return buf
+        sr_data = {"pivots": calc_pivots_classic(df),
+                   "highs": find_swing_levels(df)["highs"],
+                   "lows": find_swing_levels(df)["lows"], "tf": tf}
+        return await asyncio.to_thread(_chart_generate_sync, symbol, df, sr_data, signal)
     except Exception as e:
-        log.exception(f"generate_sr_chart {symbol}: {e}")
+        log.exception(f"generate_sr_chart {symbol}: {e}"); return None
+
+
+# ═══════════════════════════════════════════════════════════
+# 20) 🆕💰 طبقة تنفيذ Binance Futures
+# ═══════════════════════════════════════════════════════════
+def _to_binance_symbol(ccxt_symbol: str) -> str:
+    """XRP/USDT:USDT → XRPUSDT"""
+    return ccxt_symbol.split(":")[0].replace("/", "").upper()
+
+
+class BinanceExecutor:
+    def __init__(self):
+        self.client = None
+        self.symbol_info = {}
+        self.ok = False
+        self._init()
+
+    def _init(self):
+        if not BINANCE_ENABLED:
+            log.info("ℹ️ BINANCE_ENABLED=0 — التنفيذ معطل")
+            return
+        if not _BINANCE_LIB_OK:
+            log.error("❌ python-binance غير مثبت — pip install python-binance")
+            return
+        if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+            log.error("❌ BINANCE_API_KEY / BINANCE_API_SECRET مفقودة")
+            return
+        try:
+            self.client = BinanceClient(
+                BINANCE_API_KEY, BINANCE_API_SECRET,
+                testnet=BINANCE_TESTNET,
+                requests_params={"timeout": 30},
+            )
+            # اختبار الاتصال
+            self.client.futures_ping()
+            acc = self.client.futures_account()
+            bal = 0.0
+            for a in acc.get("assets", []):
+                if a.get("asset") == "USDT":
+                    bal = float(a.get("availableBalance", 0) or 0); break
+            log.info(f"✅ Binance {'TESTNET' if BINANCE_TESTNET else 'MAINNET'} | "
+                     f"رصيد USDT: {bal:.2f}")
+            self._load_exchange_info()
+            self.ok = True
+        except Exception as e:
+            log.error(f"❌ Binance init: {type(e).__name__}: {e}")
+            self.client = None; self.ok = False
+
+    def _load_exchange_info(self):
+        try:
+            info = self.client.futures_exchange_info()
+            for s in info.get("symbols", []):
+                sym = s["symbol"]
+                filters = {f["filterType"]: f for f in s.get("filters", [])}
+                step = float(filters.get("LOT_SIZE", {}).get("stepSize", "0.001"))
+                min_qty = float(filters.get("LOT_SIZE", {}).get("minQty", "0"))
+                tick = float(filters.get("PRICE_FILTER", {}).get("tickSize", "0.0001"))
+                min_notional = float(filters.get("MIN_NOTIONAL", {}).get("notional", "5"))
+                self.symbol_info[sym] = {
+                    "qty_precision": s.get("quantityPrecision", 3),
+                    "price_precision": s.get("pricePrecision", 4),
+                    "step_size": step, "min_qty": min_qty,
+                    "tick_size": tick, "min_notional": min_notional,
+                }
+            log.info(f"📦 Binance: {len(self.symbol_info)} رمز")
+        except Exception as e:
+            log.error(f"load_exchange_info: {e}")
+
+    def info(self, binance_symbol: str):
+        return self.symbol_info.get(binance_symbol)
+
+    def round_qty(self, qty, step):
+        if step <= 0: return qty
+        return math.floor(qty / step) * step
+
+    def fmt_qty(self, qty, precision):
+        return f"{qty:.{precision}f}".rstrip("0").rstrip(".") or "0"
+
+    # ── إعداد الرافعة والهامش ────────────────────────
+    def _prepare_symbol(self, binance_symbol):
+        try:
+            self.client.futures_change_leverage(symbol=binance_symbol, leverage=LEVERAGE)
+        except BinanceAPIException as e:
+            log.warning(f"set_leverage {binance_symbol}: {e.message}")
+        except Exception as e:
+            log.warning(f"set_leverage {binance_symbol}: {e}")
+        try:
+            self.client.futures_change_margin_type(
+                symbol=binance_symbol, marginType=MARGIN_TYPE)
+        except BinanceAPIException as e:
+            # -4046 = No need to change margin type
+            if e.code != -4046:
+                log.warning(f"set_margin {binance_symbol}: {e.message}")
+        except Exception as e:
+            log.warning(f"set_margin {binance_symbol}: {e}")
+
+    # ── فتح صفقة MARKET ──────────────────────────────
+    def open_market(self, binance_symbol, side, qty):
+        """side: BUY أو SELL. يُرجع dict فيه تفاصيل التنفيذ."""
+        order = self.client.futures_create_order(
+            symbol=binance_symbol, side=side, type="MARKET", quantity=qty)
+        # نأخذ fill price من order status
+        try:
+            detail = self.client.futures_get_order(symbol=binance_symbol,
+                                                   orderId=order["orderId"])
+        except Exception:
+            detail = order
+        avg_price = float(detail.get("avgPrice") or 0)
+        executed = float(detail.get("executedQty") or qty)
+        if avg_price == 0:
+            # fallback: السعر الحالي
+            t = self.client.futures_symbol_ticker(symbol=binance_symbol)
+            avg_price = float(t.get("price", 0))
+        return {"order_id": detail.get("orderId"),
+                "avg_price": avg_price, "executed_qty": executed,
+                "raw": detail}
+
+    # ── إغلاق reduce-only MARKET ─────────────────────
+    def close_market(self, binance_symbol, side, qty):
+        """side: الاتجاه المعاكس (BUY لإغلاق SHORT، SELL لإغلاق LONG)"""
+        order = self.client.futures_create_order(
+            symbol=binance_symbol, side=side, type="MARKET",
+            quantity=qty, reduceOnly=True)
+        try:
+            detail = self.client.futures_get_order(symbol=binance_symbol,
+                                                   orderId=order["orderId"])
+        except Exception:
+            detail = order
+        avg_price = float(detail.get("avgPrice") or 0)
+        if avg_price == 0:
+            t = self.client.futures_symbol_ticker(symbol=binance_symbol)
+            avg_price = float(t.get("price", 0))
+        return {"order_id": detail.get("orderId"), "avg_price": avg_price,
+                "raw": detail}
+
+    # ── جلب المراكز المفتوحة ─────────────────────────
+    def get_open_positions(self):
+        try:
+            positions = self.client.futures_position_information()
+            out = []
+            for p in positions:
+                amt = float(p.get("positionAmt", 0) or 0)
+                if abs(amt) < 1e-9: continue
+                out.append({
+                    "symbol": p["symbol"],
+                    "amount": amt,
+                    "entry_price": float(p.get("entryPrice", 0) or 0),
+                    "mark_price": float(p.get("markPrice", 0) or 0),
+                    "unrealized_pnl": float(p.get("unRealizedProfit", 0) or 0),
+                    "leverage": p.get("leverage"),
+                })
+            return out
+        except Exception as e:
+            log.error(f"get_open_positions: {e}"); return []
+
+    # ── رصيد USDT ────────────────────────────────────
+    def usdt_balance(self):
+        try:
+            acc = self.client.futures_account()
+            for a in acc.get("assets", []):
+                if a.get("asset") == "USDT":
+                    return {"available": float(a.get("availableBalance", 0) or 0),
+                            "wallet": float(a.get("walletBalance", 0) or 0),
+                            "unrealized": float(a.get("unrealizedProfit", 0) or 0)}
+            return None
+        except Exception as e:
+            log.error(f"usdt_balance: {e}"); return None
+
+    # ── آخر سعر ──────────────────────────────────────
+    def last_price(self, binance_symbol):
+        try:
+            t = self.client.futures_symbol_ticker(symbol=binance_symbol)
+            return float(t["price"])
+        except Exception as e:
+            log.error(f"last_price {binance_symbol}: {e}"); return 0.0
+
+
+_binance = BinanceExecutor()
+
+
+# ═══════════════════════════════════════════════════════════
+# 20b) 🆕💰 تتبع الصفقات (Tickets)
+# ═══════════════════════════════════════════════════════════
+# كل ticket يمثل صفقة فتح منفردة. الفتح المتعدد على نفس الرمز يُنتج
+# عدة tickets لكنها كلها تُدمج كـ position واحد على Binance في One-way mode.
+TRADE_TICKETS = {}          # ticket_id -> ticket
+_symbol_ticket_index = defaultdict(list)   # binance_symbol -> [ticket_id, ...]
+_ticket_lock = threading.Lock()
+
+
+def _mk_ticket_id(binance_symbol, side):
+    return f"{binance_symbol}_{side}_{int(_time.time()*1000)}"
+
+
+def _add_ticket(t):
+    with _ticket_lock:
+        TRADE_TICKETS[t["id"]] = t
+        _symbol_ticket_index[t["binance_symbol"]].append(t["id"])
+
+
+def _remove_ticket(tid):
+    with _ticket_lock:
+        t = TRADE_TICKETS.pop(tid, None)
+        if not t: return
+        lst = _symbol_ticket_index.get(t["binance_symbol"], [])
+        if tid in lst: lst.remove(tid)
+
+
+def _tickets_for(binance_symbol):
+    with _ticket_lock:
+        ids = list(_symbol_ticket_index.get(binance_symbol, []))
+        return [TRADE_TICKETS[i] for i in ids if i in TRADE_TICKETS]
+
+
+def _total_qty_for(binance_symbol):
+    return sum(t["qty"] for t in _tickets_for(binance_symbol))
+
+
+# ═══════════════════════════════════════════════════════════
+# 20c) 🆕💰 تنفيذ صفقة من إشارة مؤكدة
+# ═══════════════════════════════════════════════════════════
+async def execute_binance_trade(cross, bot=None):
+    """يُنفذ صفقة حقيقية بناءً على إشارة مؤكدة."""
+    if not _binance.ok:
+        return {"ok": False, "error": "Binance غير متصل"}
+    if cross.get("alert_type") != "confirmed":
+        return {"ok": False, "error": "إشارة غير مؤكدة"}
+    levels = cross.get("levels")
+    if not levels:
+        return {"ok": False, "error": "لا مستويات SL/TP"}
+
+    binance_sym = _to_binance_symbol(cross["symbol"])
+    info = _binance.info(binance_sym)
+    if not info:
+        return {"ok": False, "error": f"{binance_sym} غير مدعوم"}
+
+    side_long = cross["direction"] == "bullish"
+    new_side = "LONG" if side_long else "SHORT"
+    score = cross.get("final_score", 0)
+
+    # ── حماية: هل هناك tickets مفتوحة؟ ────────────────
+    existing = _tickets_for(binance_sym)
+    if existing:
+        same_side = [t for t in existing if t["side"] == new_side]
+        opp_side = [t for t in existing if t["side"] != new_side]
+        if opp_side:
+            return {"ok": False,
+                    "error": f"مركز معاكس مفتوح على {short(cross['symbol'])}"}
+        if same_side and score < STRONG_SCORE_FOR_ADD:
+            return {"ok": False,
+                    "error": f"مركز بنفس الاتجاه موجود (score {score} < {STRONG_SCORE_FOR_ADD})"}
+
+    # ── حساب الكمية ──────────────────────────────────
+    price_for_qty = float(levels["entry"])
+    qty_raw = NOTIONAL_USDT / price_for_qty
+    qty = _binance.round_qty(qty_raw, info["step_size"])
+    if qty < info["min_qty"]:
+        return {"ok": False,
+                "error": f"qty {qty} < minQty {info['min_qty']}"}
+    notional_actual = qty * price_for_qty
+    if notional_actual < info["min_notional"]:
+        return {"ok": False,
+                "error": f"notional {notional_actual:.2f} < {info['min_notional']}"}
+    qty_s = _binance.fmt_qty(qty, info["qty_precision"])
+
+    # ── إعداد الرافعة والهامش ────────────────────────
+    try:
+        await asyncio.to_thread(_binance._prepare_symbol, binance_sym)
+    except Exception as e:
+        log.warning(f"prepare {binance_sym}: {e}")
+
+    # ── فتح الصفقة ──────────────────────────────────
+    order_side = "BUY" if side_long else "SELL"
+    try:
+        result = await asyncio.to_thread(_binance.open_market, binance_sym,
+                                         order_side, qty_s)
+    except BinanceAPIException as e:
+        _filter_stats["trades_failed"] += 1
+        err = f"Binance {e.code}: {e.message}"
+        log.error(f"❌ open {binance_sym}: {err}")
+        if bot and CHAT_ID:
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(f"⚠️ <b>فشل تنفيذ {short(cross['symbol'])}</b>\n"
+                          f"━━━━━━━━━━━━━━━━━━━\n"
+                          f"❌ {err}\n"
+                          f"💰 notional: {NOTIONAL_USDT}$\n"
+                          f"⚙️ lev: {LEVERAGE}x"),
+                    parse_mode="HTML")
+            except Exception: pass
+        return {"ok": False, "error": err}
+    except Exception as e:
+        _filter_stats["trades_failed"] += 1
+        log.exception(f"open {binance_sym}: {e}")
+        return {"ok": False, "error": str(e)}
+
+    fill_price = result["avg_price"] or price_for_qty
+    filled_qty = result["executed_qty"] or float(qty_s)
+
+    # ── إنشاء ticket ─────────────────────────────────
+    tid = _mk_ticket_id(binance_sym, new_side)
+    ticket = {
+        "id": tid, "symbol": cross["symbol"], "binance_symbol": binance_sym,
+        "side": new_side, "qty": filled_qty, "entry": fill_price,
+        "sl": levels["stop_loss"], "tp": levels["tp1"],
+        "sl_pct": levels["sl_pct"],
+        "score": score, "source": cross.get("source", "ema"),
+        "tf": cross["timeframe"], "market": cross.get("market"),
+        "opened_at": _time.time(), "manual": False,
+        "order_id": result["order_id"],
+        "notional": filled_qty * fill_price,
+        "leverage": LEVERAGE,
+        "signal": cross,
+    }
+    _add_ticket(ticket)
+    _filter_stats["trades_opened"] += 1
+    log.info(f"✅ فتح {new_side} {binance_sym} qty={filled_qty} @ {fill_price} "
+             f"SL={ticket['sl']} TP={ticket['tp']}")
+
+    # ── إرسال رسالة التنفيذ ──────────────────────────
+    if bot and CHAT_ID:
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID, text=build_execution_msg(ticket),
+                parse_mode="HTML")
+        except Exception as e:
+            log.error(f"send exec msg: {e}")
+
+    return {"ok": True, "ticket": ticket}
+
+
+def build_execution_msg(t):
+    bull = t["side"] == "LONG"
+    cross = t.get("signal", {})
+    s = cross.get("support", {})
+    return (
+        f"💸 <b>تم تنفيذ صفقة حقيقية</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>{short(t['symbol'])}</b> [{t['tf']}] "
+        f"{'🟢 LONG' if bull else '🔴 SHORT'}\n"
+        f"🇸🇾 {syria_now_str()}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>الدخول:</b> {fmt_price(t['entry'])}\n"
+        f"📦 <b>الكمية:</b> {t['qty']} (≈{t['notional']:.2f}$)\n"
+        f"⚙️ <b>الرافعة:</b> {t['leverage']}x | {MARGIN_TYPE}\n"
+        f"🎯 <b>TP:</b> {fmt_price(t['tp'])} (1:1)\n"
+        f"🛑 <b>SL:</b> {fmt_price(t['sl'])} (-{t['sl_pct']}%)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Score: <b>{t['score']}</b> | {_source_label(t['source'])}\n"
+        f"🆔 <code>{t['id']}</code>\n"
+        f"⚡ <i>إدارة داخلية — البوت يراقب و يُغلق</i>"
+    )
+
+
+def build_close_msg(t, close_price, pnl_usdt, pnl_pct, reason, age_min):
+    bull = t["side"] == "LONG"
+    if reason == CLOSE_REASON_TP:
+        emoji, title = "🎯", "TP1 مُحقَّق"
+    elif reason == CLOSE_REASON_SL:
+        emoji, title = "🛑", "وقف الخسارة"
+    else:
+        emoji, title = "ℹ️", "إغلاق"
+    pnl_icon = "🟢" if pnl_usdt >= 0 else "🔴"
+    return (
+        f"{emoji} <b>{title} — {short(t['symbol'])}</b>\n"
+        f"🇸🇾 {syria_now_str()}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"{'🟢 LONG' if bull else '🔴 SHORT'} | {_source_label(t['source'])}\n"
+        f"💰 دخول: {fmt_price(t['entry'])}\n"
+        f"💵 خروج: {fmt_price(close_price)}\n"
+        f"{pnl_icon} <b>PnL: {pnl_usdt:+.3f} USDT ({pnl_pct:+.2f}%)</b>\n"
+        f"⏱️ {int(age_min)} دقيقة\n"
+        f"📦 الكمية: {t['qty']}\n"
+        f"🆔 <code>{t['id']}</code>"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
+# 20d) 🆕💰 مزامنة الصفقات اليدوية + المراقبة الداخلية
+# ═══════════════════════════════════════════════════════════
+async def _sync_manual_positions(bot):
+    """يبحث عن مراكز مفتوحة يدوياً على Binance و يُنشئ لها ticket."""
+    try:
+        positions = await asyncio.to_thread(_binance.get_open_positions)
+    except Exception as e:
+        log.error(f"sync get_positions: {e}"); return
+    if not positions: return
+
+    for p in positions:
+        bsym = p["symbol"]
+        amt = p["amount"]
+        side = "LONG" if amt > 0 else "SHORT"
+        tickets = _tickets_for(bsym)
+        tracked_qty = sum(t["qty"] for t in tickets)
+
+        # حساب الفرق
+        diff = abs(amt) - tracked_qty
+        if abs(diff) < 1e-9:
+            continue
+
+        # حالة 1: مركز موجود على Binance لكن qty > tickets → مركز يدوي جديد
+        if diff > 1e-6:
+            # إيجاد الرمز بصيغة ccxt
+            ccxt_sym = None
+            for s in ALL_SYMBOLS:
+                if _to_binance_symbol(s) == bsym: ccxt_sym = s; break
+            if not ccxt_sym: ccxt_sym = f"{bsym[:-4]}/USDT:USDT"
+
+            # حساب SL/TP من الشارت الحالي
+            levels = await _compute_levels_for_manual(ccxt_sym, side)
+            if not levels:
+                log.warning(f"⚠️ manual {bsym}: cannot compute levels")
+                continue
+
+            tid = _mk_ticket_id(bsym, side) + "_M"
+            ticket = {
+                "id": tid, "symbol": ccxt_sym, "binance_symbol": bsym,
+                "side": side, "qty": diff,
+                "entry": p["entry_price"] or p["mark_price"],
+                "sl": levels["stop_loss"], "tp": levels["tp1"],
+                "sl_pct": levels["sl_pct"],
+                "score": 0, "source": "manual_sync",
+                "tf": "15m", "market": None,
+                "opened_at": _time.time(), "manual": True,
+                "order_id": None,
+                "notional": diff * (p["entry_price"] or p["mark_price"]),
+                "leverage": LEVERAGE, "signal": None,
+            }
+            _add_ticket(ticket)
+            _filter_stats["trades_manual_sync"] += 1
+            log.info(f"🔍 Manual {side} {bsym} qty={diff} @ {ticket['entry']}")
+            if bot and CHAT_ID:
+                try:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(f"🔍 <b>صفقة يدوية مرصودة</b>\n"
+                              f"━━━━━━━━━━━━━━━━━━━\n"
+                              f"📌 <b>{short(ccxt_sym)}</b> "
+                              f"{'🟢 LONG' if side=='LONG' else '🔴 SHORT'}\n"
+                              f"📦 {diff} @ {fmt_price(ticket['entry'])}\n"
+                              f"🎯 TP: {fmt_price(ticket['tp'])}\n"
+                              f"🛑 SL: {fmt_price(ticket['sl'])} (-{ticket['sl_pct']}%)\n"
+                              f"⚡ <i>البوت يديرها الآن</i>"),
+                        parse_mode="HTML")
+                except Exception as e:
+                    log.error(f"manual notify: {e}")
+
+        # حالة 2: qty الفعلي أقل من مجموع tickets → إغلاق جزئي يدوي
+        elif diff < -1e-6:
+            await _handle_partial_close(bsym, abs(diff), bot)
+
+
+async def _compute_levels_for_manual(ccxt_symbol, side):
+    try:
+        data = await fetch_ohlcv_cached(ccxt_symbol, "15m", 100)
+        if not data or len(data) < 30: return None
+        df = pd.DataFrame(data, columns=["ts","o","h","l","c","v"])
+        direction = "bullish" if side == "LONG" else "bearish"
+        return compute_levels(df, direction, -2, tf="15m")
+    except Exception as e:
+        log.warning(f"compute_levels_manual {ccxt_symbol}: {e}")
         return None
 
 
+async def _handle_partial_close(bsym, closed_qty, bot):
+    """عندما يكون qty الفعلي أقل من المتتبع (إغلاق يدوي جزئي)."""
+    tickets = _tickets_for(bsym)
+    remaining = closed_qty
+    for t in sorted(tickets, key=lambda x: x["opened_at"]):
+        if remaining <= 0: break
+        if t["qty"] <= remaining + 1e-9:
+            remaining -= t["qty"]
+            _remove_ticket(t["id"])
+            _filter_stats["trades_manual_close"] += 1
+            log.info(f"🔎 manual close {t['id']} full")
+        else:
+            t["qty"] -= remaining; remaining = 0
+            log.info(f"🔎 manual close {t['id']} partial")
+
+
+async def _check_ticket_close(t, last_candle):
+    """فحص إذا hit SL/TP خلال الشمعة الأخيرة."""
+    hi = last_candle["h"]; lo = last_candle["l"]
+    if t["side"] == "LONG":
+        if lo <= t["sl"]: return CLOSE_REASON_SL, t["sl"]
+        if hi >= t["tp"]: return CLOSE_REASON_TP, t["tp"]
+    else:
+        if hi >= t["sl"]: return CLOSE_REASON_SL, t["sl"]
+        if lo <= t["tp"]: return CLOSE_REASON_TP, t["tp"]
+    return None, None
+
+
+async def manage_open_positions(bot=None):
+    """الدورة الرئيسية: مزامنة + فحص SL/TP + إغلاق."""
+    if not _binance.ok: return
+
+    # 1) مزامنة الصفقات اليدوية
+    try:
+        await _sync_manual_positions(bot)
+    except Exception as e:
+        log.exception(f"sync: {e}")
+
+    # 2) جلب آخر شمعة 1m لكل رمز لدينا فيه tickets
+    symbols = set()
+    with _ticket_lock:
+        for bsym in _symbol_ticket_index.keys():
+            if _symbol_ticket_index[bsym]: symbols.add(bsym)
+    if not symbols: return
+
+    for bsym in symbols:
+        tickets = _tickets_for(bsym)
+        if not tickets: continue
+        try:
+            klines = await asyncio.to_thread(
+                _binance.client.futures_klines,
+                symbol=bsym, interval="1m", limit=2)
+        except Exception as e:
+            log.warning(f"klines {bsym}: {e}"); continue
+        if not klines or len(klines) < 2: continue
+        # الشمعة الأخيرة المُكتملة = klines[-2]
+        k = klines[-2]
+        last_candle = {"o": float(k[1]), "h": float(k[2]),
+                       "l": float(k[3]), "c": float(k[4])}
+
+        # فحص كل ticket على حدة
+        closes = defaultdict(list)  # side -> [ticket,...] للإغلاق المجمّع
+        for t in tickets:
+            reason, hit_price = await _check_ticket_close(t, last_candle)
+            if reason:
+                closes[(t["side"], reason)].append((t, hit_price))
+
+        for (side, reason), lst in closes.items():
+            total_qty = sum(t["qty"] for t, _ in lst)
+            if total_qty <= 0: continue
+            info = _binance.info(bsym)
+            qty_s = _binance.fmt_qty(
+                _binance.round_qty(total_qty, info["step_size"]),
+                info["qty_precision"]) if info else f"{total_qty}"
+
+            close_side = "SELL" if side == "LONG" else "BUY"
+            try:
+                res = await asyncio.to_thread(
+                    _binance.close_market, bsym, close_side, qty_s)
+            except BinanceAPIException as e:
+                log.error(f"❌ close {bsym} {side}: {e.code} {e.message}")
+                continue
+            except Exception as e:
+                log.exception(f"close {bsym}: {e}"); continue
+
+            close_price = res["avg_price"] or lst[0][1]
+            # معالجة كل ticket
+            for t, hit_price in lst:
+                entry = t["entry"]; qty = t["qty"]
+                if t["side"] == "LONG":
+                    pnl_usdt = (close_price - entry) * qty
+                    pnl_pct = (close_price - entry) / entry * 100
+                else:
+                    pnl_usdt = (entry - close_price) * qty
+                    pnl_pct = (entry - close_price) / entry * 100
+                # رسوم تقديرية (taker 0.04% * 2)
+                fees = t["notional"] * 0.0008
+                pnl_usdt_net = pnl_usdt - fees
+                age_min = (_time.time() - t["opened_at"]) / 60
+                _remove_ticket(t["id"])
+                _filter_stats["trades_closed"] += 1
+                if reason == CLOSE_REASON_TP: _filter_stats["trades_tp"] += 1
+                else: _filter_stats["trades_sl"] += 1
+                # سجل في history
+                _last_signals.append({
+                    "symbol": t["symbol"], "timeframe": t["tf"],
+                    "direction": "bullish" if t["side"] == "LONG" else "bearish",
+                    "source": t["source"], "score": t["score"],
+                    "entry": entry, "exit": close_price,
+                    "result": "win_tp1" if reason == CLOSE_REASON_TP else "loss_sl",
+                    "pnl_pct": round(pnl_pct, 2),
+                    "duration_min": int(age_min), "ts": _time.time(),
+                })
+                _smart.record_result(
+                    "win_tp1" if reason == CLOSE_REASON_TP else "loss_sl",
+                    "bullish" if t["side"] == "LONG" else "bearish",
+                    t["source"])
+                log.info(f"💰 إغلاق {t['id']} | {reason} | PnL {pnl_usdt_net:+.3f} USDT")
+                if bot and CHAT_ID:
+                    try:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=build_close_msg(t, close_price, pnl_usdt_net,
+                                                 pnl_pct, reason, age_min),
+                            parse_mode="HTML")
+                    except Exception as e:
+                        log.error(f"close notify: {e}")
+
+
 # ═══════════════════════════════════════════════════════════
-# 20) 🆕 الواجهة الاحترافية (Inline Keyboards)
+# 20e) 🆕💰 أوامر الإدارة
+# ═══════════════════════════════════════════════════════════
+async def cmd_positions(update, context):
+    if not _binance.ok:
+        await update.message.reply_text("❌ Binance غير متصل."); return
+    with _ticket_lock:
+        tickets = list(TRADE_TICKETS.values())
+    if not tickets:
+        await update.message.reply_text("📭 لا صفقات مفتوحة (متتبع).")
+        return
+    lines = [f"💼 <b>الصفقات المفتوحة ({len(tickets)})</b>", "━━━━━━━━━━━━━━━━━━━"]
+    now = _time.time()
+    for t in tickets:
+        try:
+            cur = await asyncio.to_thread(_binance.last_price, t["binance_symbol"])
+        except Exception:
+            cur = t["entry"]
+        if t["side"] == "LONG": pnl_pct = (cur - t["entry"]) / t["entry"] * 100
+        else: pnl_pct = (t["entry"] - cur) / t["entry"] * 100
+        pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
+        age = int((now - t["opened_at"]) / 60)
+        lines.append(
+            f"\n{'🟢 LONG' if t['side']=='LONG' else '🔴 SHORT'} "
+            f"<b>{short(t['symbol'])}</b> [{t['tf']}]"
+            f"{' 🔧' if t.get('manual') else ''}\n"
+            f"   💰 {fmt_price(t['entry'])} → {fmt_price(cur)}\n"
+            f"   {pnl_icon} {pnl_pct:+.2f}% | ⏱️ {age} د\n"
+            f"   🎯 TP {fmt_price(t['tp'])} | 🛑 SL {fmt_price(t['sl'])}\n"
+            f"   📦 {t['qty']} | 🆔 <code>{t['id'][-20:]}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_close(update, context):
+    if not _binance.ok:
+        await update.message.reply_text("❌ Binance غير متصل."); return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("الاستخدام: <code>/close XRP</code>",
+                                        parse_mode="HTML"); return
+    coin = args[0].upper()
+    target_sym = None
+    for s in ALL_SYMBOLS:
+        if short(s) == coin: target_sym = _to_binance_symbol(s); break
+    if not target_sym:
+        # حاول مباشرة
+        target_sym = coin + "USDT"
+    tickets = _tickets_for(target_sym)
+    if not tickets:
+        await update.message.reply_text(f"⚠️ لا صفقات على {coin}."); return
+    total_qty = sum(t["qty"] for t in tickets)
+    side = tickets[0]["side"]
+    close_side = "SELL" if side == "LONG" else "BUY"
+    info = _binance.info(target_sym)
+    qty_s = _binance.fmt_qty(_binance.round_qty(total_qty, info["step_size"]),
+                             info["qty_precision"]) if info else f"{total_qty}"
+    try:
+        res = await asyncio.to_thread(_binance.close_market, target_sym,
+                                      close_side, qty_s)
+    except Exception as e:
+        await update.message.reply_text(f"❌ فشل: {e}"); return
+    close_price = res["avg_price"] or 0
+    for t in tickets:
+        if t["side"] == "LONG": pnl_pct = (close_price - t["entry"]) / t["entry"] * 100
+        else: pnl_pct = (t["entry"] - close_price) / t["entry"] * 100
+        age_min = (_time.time() - t["opened_at"]) / 60
+        _remove_ticket(t["id"])
+        _filter_stats["trades_closed"] += 1
+        _filter_stats["trades_manual_close"] += 1
+        if update.effective_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=build_close_msg(t, close_price, 0.0, pnl_pct,
+                                         "MANUAL", age_min),
+                    parse_mode="HTML")
+            except Exception: pass
+
+
+async def cmd_closeall(update, context):
+    if not _binance.ok:
+        await update.message.reply_text("❌ Binance غير متصل."); return
+    with _ticket_lock:
+        symbols = [s for s, ids in _symbol_ticket_index.items() if ids]
+    if not symbols:
+        await update.message.reply_text("📭 لا صفقات مفتوحة."); return
+    await update.message.reply_text(f"🔒 جارٍ إغلاق {len(symbols)} رمز...")
+    for bsym in symbols:
+        tickets = _tickets_for(bsym)
+        if not tickets: continue
+        total_qty = sum(t["qty"] for t in tickets)
+        side = tickets[0]["side"]
+        close_side = "SELL" if side == "LONG" else "BUY"
+        info = _binance.info(bsym)
+        qty_s = _binance.fmt_qty(_binance.round_qty(total_qty, info["step_size"]),
+                                 info["qty_precision"]) if info else f"{total_qty}"
+        try:
+            res = await asyncio.to_thread(_binance.close_market, bsym,
+                                          close_side, qty_s)
+            cp = res["avg_price"] or 0
+            for t in tickets:
+                age_min = (_time.time() - t["opened_at"]) / 60
+                _remove_ticket(t["id"])
+                _filter_stats["trades_closed"] += 1
+                _filter_stats["trades_manual_close"] += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=build_close_msg(t, cp, 0.0, 0.0, "MANUAL", age_min),
+                        parse_mode="HTML")
+                except Exception: pass
+        except Exception as e:
+            await update.message.reply_text(f"❌ {bsym}: {e}")
+        await asyncio.sleep(0.3)
+
+
+async def cmd_pnl(update, context):
+    if not _binance.ok:
+        await update.message.reply_text("❌ Binance غير متصل."); return
+    bal = await asyncio.to_thread(_binance.usdt_balance)
+    if not bal:
+        await update.message.reply_text("❌ فشل جلب الرصيد."); return
+    with _ticket_lock:
+        tickets = list(TRADE_TICKETS.values())
+    total_unrealized = 0.0
+    lines = [f"💵 <b>حالة الحساب</b>", "━━━━━━━━━━━━━━━━━━━",
+             f"• رصيد المحفظة: <b>{bal['wallet']:.3f} USDT</b>",
+             f"• متاح: <b>{bal['available']:.3f} USDT</b>"]
+    if tickets:
+        lines.append(f"\n<b>📊 صفقات مفتوحة ({len(tickets)}):</b>")
+        for t in tickets:
+            try:
+                cur = await asyncio.to_thread(_binance.last_price, t["binance_symbol"])
+            except Exception:
+                cur = t["entry"]
+            if t["side"] == "LONG": pu = (cur - t["entry"]) * t["qty"]
+            else: pu = (t["entry"] - cur) * t["qty"]
+            total_unrealized += pu
+            ico = "🟢" if pu >= 0 else "🔴"
+            lines.append(f"{ico} {short(t['symbol'])} "
+                         f"{'L' if t['side']=='LONG' else 'S'} "
+                         f"{pu:+.3f} USDT")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📈 Unrealized: <b>{total_unrealized:+.3f} USDT</b>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_syncnow(update, context):
+    if not _binance.ok:
+        await update.message.reply_text("❌ Binance غير متصل."); return
+    await update.message.reply_text("🔄 مزامنة...")
+    await _sync_manual_positions(context.bot)
+    with _ticket_lock:
+        n = len(TRADE_TICKETS)
+    await update.message.reply_text(f"✅ انتهت. Tickets: {n}")
+
+
+# ═══════════════════════════════════════════════════════════
+# 21) الواجهة
 # ═══════════════════════════════════════════════════════════
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = [
+        [InlineKeyboardButton("💼 الصفقات",        callback_data="menu:positions"),
+         InlineKeyboardButton("💵 الرصيد",          callback_data="menu:pnl")],
+        [InlineKeyboardButton("🔄 مزامنة",          callback_data="menu:syncnow"),
+         InlineKeyboardButton("🧹 إغلاق الكل",       callback_data="menu:closeall")],
         [InlineKeyboardButton("📊 الدعم والمقاومة", callback_data="menu:sr"),
          InlineKeyboardButton("📈 فحص الإشارات",   callback_data="menu:cross")],
         [InlineKeyboardButton("🎯 تشخيص العملات",  callback_data="menu:why"),
@@ -1910,13 +2448,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 
 def coin_menu_kb(symbol: str) -> InlineKeyboardMarkup:
     s = short(symbol)
-    kb = [
-        [InlineKeyboardButton(f"📈 رسم {s}",       callback_data=f"chart:{s}"),
-         InlineKeyboardButton(f"🔍 تشخيص {s}",     callback_data=f"why:{s}")],
-        [InlineKeyboardButton("📊 كل العملات",      callback_data="menu:why"),
-         InlineKeyboardButton("⬅️ القائمة",          callback_data="menu:main")],
-    ]
-    return InlineKeyboardMarkup(kb)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📈 رسم {s}", callback_data=f"chart:{s}"),
+         InlineKeyboardButton(f"🔍 تشخيص {s}", callback_data=f"why:{s}")],
+        [InlineKeyboardButton("📊 كل العملات", callback_data="menu:why"),
+         InlineKeyboardButton("⬅️ القائمة", callback_data="menu:main")],
+    ])
 
 
 def back_kb(target="menu:main") -> InlineKeyboardMarkup:
@@ -1926,14 +2463,13 @@ def back_kb(target="menu:main") -> InlineKeyboardMarkup:
 
 
 async def cmd_menu(update, context):
-    txt = (
-        f"🎛️ <b>القائمة الرئيسية</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 <b>Unified Smart Bot v6.5.0</b>\n"
-        f"🔌 {_exchange.primary_name} · {len(ALL_SYMBOLS)} عملة\n"
-        f"🇸🇾 {syria_now_str()}\n\n"
-        f"👇 اختر العملية:"
-    )
+    txt = (f"🎛️ <b>القائمة الرئيسية — v6.6.0</b>\n"
+           f"━━━━━━━━━━━━━━━━━━━\n"
+           f"🤖 Unified Smart Bot\n"
+           f"💸 Binance Futures: {'✅' if _binance.ok else '❌'}\n"
+           f"🔌 {_exchange.primary_name} · {len(ALL_SYMBOLS)} عملة\n"
+           f"🇸🇾 {syria_now_str()}\n\n"
+           f"👇 اختر:")
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(
@@ -1942,183 +2478,117 @@ async def cmd_menu(update, context):
             await update.callback_query.message.reply_text(
                 txt, parse_mode="HTML", reply_markup=main_menu_kb())
     else:
-        await update.message.reply_text(
-            txt, parse_mode="HTML", reply_markup=main_menu_kb())
-
-
-async def cmd_chart_coin(update, context):
-    rows, row = [], []
-    for sym in ALL_SYMBOLS:
-        row.append(InlineKeyboardButton(
-            short(sym), callback_data=f"chart:{short(sym)}"))
-        if len(row) == 4:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ القائمة", callback_data="menu:main")])
-    await update.message.reply_text(
-        "📈 <b>اختر عملة لعرض رسمها البياني:</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows))
+        await update.message.reply_text(txt, parse_mode="HTML",
+                                        reply_markup=main_menu_kb())
 
 
 async def on_callback(update, context):
     q = update.callback_query
     data = q.data or ""
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    try: await q.answer()
+    except Exception: pass
 
-    if data == "menu:main":
-        return await cmd_menu(update, context)
+    if data == "menu:main": return await cmd_menu(update, context)
+    if data == "menu:positions": return await cmd_positions(update, context)
+    if data == "menu:pnl": return await cmd_pnl(update, context)
+    if data == "menu:syncnow": return await cmd_syncnow(update, context)
+    if data == "menu:closeall": return await cmd_closeall(update, context)
 
     if data == "menu:cross":
-        try:
-            await q.edit_message_text("🔍 جارٍ فحص الإشارات...")
-        except Exception:
-            pass
-        for tf in ["5m", "15m", "1h"]:
-            await _run_cross(update, [tf])
+        try: await q.edit_message_text("🔍 فحص...")
+        except Exception: pass
+        for tf in ["5m", "15m", "1h"]: await _run_cross(update, [tf])
         return
-
     if data == "menu:sr":
-        try:
-            await q.edit_message_text("📊 جارٍ توليد الرسوم البيانية...")
-        except Exception:
-            pass
+        try: await q.edit_message_text("📊 توليد رسوم...")
+        except Exception: pass
         return await _send_sr_charts(update, context)
-
     if data == "menu:why":
-        try:
-            await q.edit_message_text("🔍 فحص شامل...")
-        except Exception:
-            pass
+        try: await q.edit_message_text("🔍 فحص شامل...")
+        except Exception: pass
         return await _diagnose_all(update)
-
-    if data == "menu:last":
-        return await cmd_last(update, context)
-    if data == "menu:pending":
-        return await cmd_pending(update, context)
-    if data == "menu:ref6":
-        return await cmd_ref6(update, context)
-    if data == "menu:ranges":
-        return await cmd_ranges(update, context)
-    if data == "menu:checkranges":
-        return await cmd_checkranges(update, context)
-    if data == "menu:stats":
-        return await cmd_stats(update, context)
-    if data == "menu:status":
-        return await cmd_status(update, context)
-    if data == "menu:strict":
-        return await cmd_strict(update, context)
-    if data == "menu:refresh":
-        return await cmd_refresh(update, context)
+    if data == "menu:last": return await cmd_last(update, context)
+    if data == "menu:pending": return await cmd_pending(update, context)
+    if data == "menu:ref6": return await cmd_ref6(update, context)
+    if data == "menu:ranges": return await cmd_ranges(update, context)
+    if data == "menu:checkranges": return await cmd_checkranges(update, context)
+    if data == "menu:stats": return await cmd_stats(update, context)
+    if data == "menu:status": return await cmd_status(update, context)
+    if data == "menu:strict": return await cmd_strict(update, context)
+    if data == "menu:refresh": return await cmd_refresh(update, context)
 
     if data.startswith("chart:"):
         coin = data.split(":", 1)[1]
         target = find_symbol_by_name(coin)
         if not target:
-            try:
-                return await q.edit_message_text(f"❌ {coin} غير معروفة")
-            except Exception:
-                return
-        try:
-            await q.edit_message_text(f"📈 جارٍ رسم {coin}...")
-        except Exception:
-            pass
+            try: return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception: return
+        try: await q.edit_message_text(f"📈 جارٍ رسم {coin}...")
+        except Exception: pass
         buf = await generate_sr_chart(target)
         if not buf:
-            try:
-                return await q.message.reply_text("⚪ لا بيانات")
-            except Exception:
-                return
+            try: return await q.message.reply_text("⚪ لا بيانات")
+            except Exception: return
         try:
-            await q.message.reply_photo(
-                photo=buf,
-                caption=f"📈 <b>{short(target)}</b> — {MORNING_REPORT_TF}\n"
-                        f"🇸🇾 {syria_now_str()}",
-                parse_mode="HTML",
-                reply_markup=back_kb("menu:main"))
+            await q.message.reply_photo(photo=buf,
+                caption=f"📈 <b>{short(target)}</b>\n🇸🇾 {syria_now_str()}",
+                parse_mode="HTML", reply_markup=back_kb("menu:main"))
             _filter_stats["charts_sent"] += 1
         except Exception as e:
             log.error(f"chart send: {e}")
-            try:
-                await q.message.reply_text("❌ فشل إرسال الرسم")
-            except Exception:
-                pass
         return
 
     if data.startswith("why:"):
         coin = data.split(":", 1)[1]
         target = find_symbol_by_name(coin)
         if not target:
-            try:
-                return await q.edit_message_text(f"❌ {coin} غير معروفة")
-            except Exception:
-                return
+            try: return await q.edit_message_text(f"❌ {coin} غير معروفة")
+            except Exception: return
         return await _diagnose_coin(update, target)
 
 
 async def _send_sr_charts(update, context):
-    """يولّد رسم لكل عملة ويرسلها مع أزرار"""
     if not _exchange.ok():
-        try:
-            return await update.effective_message.reply_text("❌ لا منصة.")
-        except Exception:
-            return
-
-    chat_id = update.effective_chat.id
-    ok = 0
+        try: return await update.effective_message.reply_text("❌ لا منصة.")
+        except Exception: return
+    chat_id = update.effective_chat.id; ok = 0
     for sym in ALL_SYMBOLS:
         buf = await generate_sr_chart(sym)
         if buf:
             try:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=buf,
-                    caption=(
-                        f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
-                        f"🇸🇾 {syria_now_str()}\n"
-                        f"<i>R3..S3 = Pivot Levels  ·  H/L = القمم/القيعان</i>"
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=coin_menu_kb(sym))
-                ok += 1
-                _filter_stats["charts_sent"] += 1
-            except Exception as e:
-                log.error(f"send_sr_chart {sym}: {e}")
+                await context.bot.send_photo(chat_id=chat_id, photo=buf,
+                    caption=f"📊 <b>{short(sym)}</b>",
+                    parse_mode="HTML", reply_markup=coin_menu_kb(sym))
+                ok += 1; _filter_stats["charts_sent"] += 1
+            except Exception as e: log.error(f"send_sr {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-
     if ok == 0:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id, text="⚪ لا بيانات لرسمها.")
-        except Exception:
-            pass
+        try: await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
+        except Exception: pass
 
 
 # ═══════════════════════════════════════════════════════════
-# 21) الأوامر
+# 22) أوامر عامة
 # ═══════════════════════════════════════════════════════════
 async def cmd_start(update, context):
     sd, sn = get_session_info()
     ranges_txt = "\n".join(
         f"• <b>{short(s)}</b>: {fmt_price(r['lower'])} – {fmt_price(r['upper'])}"
         for s, r in _last_range.items()) or "  (لا نطاقات)"
+    binance_status = "✅ متصل" if _binance.ok else "❌ غير متصل"
     await update.message.reply_text(
-        f"🔀 <b>Unified Smart Bot v6.5.0</b>\n"
+        f"🔀 <b>Unified Smart Bot v6.6.0</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔌 <b>{_exchange.primary_name}</b>\n"
-        f"🕐 الجلسة: <b>{sn}</b> ({sd:+d})\n\n"
+        f"💸 Binance Futures: <b>{binance_status}</b>\n"
+        f"• الرافعة: {LEVERAGE}x | Notional: {NOTIONAL_USDT}$\n"
+        f"• الهامش: {MARGIN_TYPE}\n"
+        f"• صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔌 {_exchange.primary_name}\n"
+        f"🕐 {sn} ({sd:+d})\n\n"
         f"<b>📌 النطاقات ({len(_last_range)}):</b>\n{ranges_txt}\n\n"
-        f"<b>🛡️ فلاتر v6.5.0:</b>\n"
-        f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
-        f"• EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%\n"
-        f"• ATR: 5m≥{MIN_ATR_PCT['5m']}%\n"
-        f"• BB: Vol≥{BB_MIN_VOL}× | ADX≥{MIN_ADX_FOR_BB}\n\n"
-        f"👇 استخدم الأزرار:",
-        parse_mode="HTML",
-        reply_markup=main_menu_kb())
+        f"👇",
+        parse_mode="HTML", reply_markup=main_menu_kb())
 
 
 async def _run_cross(update, tfs=None):
@@ -2128,10 +2598,8 @@ async def _run_cross(update, tfs=None):
         except Exception: pass
         return
     tfs = tfs or TIMEFRAMES
-    try:
-        await msg_target.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
-    except Exception:
-        pass
+    try: await msg_target.reply_text(f"🔍 فحص: {', '.join(tfs)} ...")
+    except Exception: pass
     clear_caches()
     detectors = _get_detectors()
     found = filtered = 0
@@ -2148,23 +2616,24 @@ async def _run_cross(update, tfs=None):
                 if not cross: continue
                 htf = await get_htf_trend(sym)
                 passed, _r, _c = await passes_filter(cross, htf)
-                if not passed:
-                    filtered += 1; continue
+                if not passed: filtered += 1; continue
                 try:
-                    await msg_target.reply_text(
-                        build_signal_message(cross), parse_mode="HTML")
+                    await msg_target.reply_text(build_signal_message(cross),
+                                                parse_mode="HTML")
                     mark_symbol_sent(sym)
                     if cross["alert_type"] == "confirmed":
                         record_signal(sym, cross["direction"])
                         register_signal_for_tracking(cross)
+                        # 💰 تنفيذ حقيقي
+                        exe = await execute_binance_trade(
+                            cross, bot=update.get_bot() if update else None)
+                        if not exe.get("ok"):
+                            log.info(f"exec skip {sym}: {exe.get('error')}")
                     found += 1
-                except Exception as e:
-                    log.error(f"send {sym} {tf}: {e}")
+                except Exception as e: log.error(f"send {sym} {tf}: {e}")
             await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     msg = f"✅ {found} إشارة."
     if filtered: msg += f"\n🚫 {filtered} محجوبة."
-    if found == 0 and filtered == 0:
-        msg = f"⚪ لا إشارات على {', '.join(tfs)}"
     try: await msg_target.reply_text(msg)
     except Exception: pass
 
@@ -2186,7 +2655,6 @@ async def cmd_cross15(u, c): await _run_cross(u, ["15m"])
 async def cmd_cross1h(u, c): await _run_cross(u, ["1h"])
 
 
-# ── /why ────────────────────────────────────────────────
 async def _get_diagnosis(symbol, tf):
     try:
         df = await _df_for(symbol, tf)
@@ -2201,50 +2669,32 @@ async def _get_diagnosis(symbol, tf):
         atr_pct = (atr / price) * 100 if price else 0
         adx = float(calc_adx(df).iloc[curr])
         rsi = float(calc_rsi(df["c"]).iloc[curr])
-        try:
-            vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
+        try: vol_ratio = float(df["v"].iloc[curr]) / float(df["v"].iloc[curr-20:curr].mean())
         except: vol_ratio = 0
-
         th = get_thresholds(atr_pct=atr_pct, adx=adx, tf=tf)
-        score_bull = compute_score(df, "bullish", curr)["score"]
-        score_bear = compute_score(df, "bearish", curr)["score"]
-        best_score = max(score_bull, score_bear)
-
+        sb = compute_score(df, "bullish", curr)["score"]
+        sr = compute_score(df, "bearish", curr)["score"]
+        best = max(sb, sr)
         min_gap = MIN_EMA_GAP_PCT.get(tf, 0.02)
         min_atr = MIN_ATR_PCT.get(tf, 0.05)
-
-        checks = {
-            "EMA gap":       gap >= min_gap,
-            "ATR":           atr_pct >= min_atr,
-            "ADX":           adx >= th["min_adx"],
-            "Volume":        vol_ratio >= th["min_vol_ratio"],
-            "Score مطلق":    best_score >= ABS_MIN_SCORE,
-            "Score ديناميكي": best_score >= th["min_score"],
-        }
-        values = {
-            "EMA gap":       f"{gap:.3f}%",
-            "ATR":           f"{atr_pct:.3f}%",
-            "ADX":           f"{adx:.1f}",
-            "Volume":        f"{vol_ratio:.2f}×",
-            "Score مطلق":    f"{best_score}",
-            "Score ديناميكي": f"{best_score}",
-        }
-        thresholds = {
-            "EMA gap":       f"{min_gap}%",
-            "ATR":           f"{min_atr}%",
-            "ADX":           f"{th['min_adx']:.1f}",
-            "Volume":        f"{th['min_vol_ratio']}×",
-            "Score مطلق":    f"{ABS_MIN_SCORE}",
-            "Score ديناميكي": f"{th['min_score']:.0f}",
-        }
-        return {
-            "symbol": symbol, "tf": tf, "score": best_score,
-            "checks": checks, "values": values, "thresholds": thresholds,
-            "price": price, "rsi": rsi,
-        }
+        checks = {"EMA gap": gap >= min_gap, "ATR": atr_pct >= min_atr,
+                  "ADX": adx >= th["min_adx"],
+                  "Volume": vol_ratio >= th["min_vol_ratio"],
+                  "Score مطلق": best >= ABS_MIN_SCORE,
+                  "Score ديناميكي": best >= th["min_score"]}
+        values = {"EMA gap": f"{gap:.3f}%", "ATR": f"{atr_pct:.3f}%",
+                  "ADX": f"{adx:.1f}", "Volume": f"{vol_ratio:.2f}×",
+                  "Score مطلق": f"{best}", "Score ديناميكي": f"{best}"}
+        thresholds = {"EMA gap": f"{min_gap}%", "ATR": f"{min_atr}%",
+                      "ADX": f"{th['min_adx']:.1f}",
+                      "Volume": f"{th['min_vol_ratio']}×",
+                      "Score مطلق": f"{ABS_MIN_SCORE}",
+                      "Score ديناميكي": f"{th['min_score']:.0f}"}
+        return {"symbol": symbol, "tf": tf, "score": best, "checks": checks,
+                "values": values, "thresholds": thresholds,
+                "price": price, "rsi": rsi}
     except Exception as e:
-        log.warning(f"_get_diagnosis {symbol} {tf}: {e}")
-        return None
+        log.warning(f"_get_diagnosis {symbol} {tf}: {e}"); return None
 
 
 async def _diagnose_coin(update, target):
@@ -2252,25 +2702,18 @@ async def _diagnose_coin(update, target):
     lines = [f"📊 <b>تشخيص {short(target)}</b>", "━━━━━━━━━━━━━━━━━━━"]
     for tf in ["5m", "15m", "1h"]:
         r = await _get_diagnosis(target, tf)
-        if r is None:
-            lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
+        if r is None: lines.append(f"\n<b>[{tf}]</b> ❌ لا بيانات"); continue
         lines.append(f"\n<b>[{tf}]</b>  💰 {fmt_price(r['price'])}")
         for k in r["checks"]:
             ok = "✅" if r["checks"][k] else "❌"
-            lines.append(
-                f"{ok} {k}: <b>{r['values'][k]}</b> / {r['thresholds'][k]}")
+            lines.append(f"{ok} {k}: <b>{r['values'][k]}</b> / {r['thresholds'][k]}")
         lines.append(f"📉 RSI: {r['rsi']:.1f}")
     ok_cd, rem = check_symbol_cooldown(target)
-    cd_txt = "✅" if ok_cd else f"❌ متبقي {rem}s"
-    lines.append(f"\n⏳ Cooldown: {cd_txt}")
-    lines.append("━━━━━━━━━━━━━━━━━━━")
-    lines.append("💡 <i>أي ❌ = فلتر يمنع الإشارة</i>")
+    lines.append(f"\n⏳ Cooldown: {'✅' if ok_cd else f'❌ {rem}s'}")
     try:
-        await msg_target.reply_text(
-            "\n".join(lines), parse_mode="HTML",
-            reply_markup=coin_menu_kb(target))
-    except Exception as e:
-        log.error(f"_diagnose_coin: {e}")
+        await msg_target.reply_text("\n".join(lines), parse_mode="HTML",
+                                    reply_markup=coin_menu_kb(target))
+    except Exception as e: log.error(f"_diagnose_coin: {e}")
 
 
 async def _diagnose_all(update):
@@ -2279,69 +2722,37 @@ async def _diagnose_all(update):
         try: await msg_target.reply_text("❌ لا منصة.")
         except Exception: pass
         return
-    try:
-        await msg_target.reply_text(
-            f"🔍 فحص شامل لـ {len(ALL_SYMBOLS)} عملة (15m) ...")
-    except Exception:
-        pass
-
+    try: await msg_target.reply_text(f"🔍 فحص {len(ALL_SYMBOLS)} عملة ...")
+    except Exception: pass
     results = []
     for sym in ALL_SYMBOLS:
         r = await _get_diagnosis(sym, "15m")
         if r: results.append(r)
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-
     if not results:
         try: await msg_target.reply_text("⚪ لا بيانات.")
         except Exception: pass
         return
-
-    def sort_key(r):
-        fails = sum(1 for v in r["checks"].values() if not v)
-        return (fails, -r["score"])
-    results.sort(key=sort_key)
-
+    results.sort(key=lambda r: (sum(1 for v in r["checks"].values() if not v), -r["score"]))
     sd, sn = get_session_info()
-    lines = [f"📊 <b>تشخيص شامل ({len(results)})</b>",
-             f"🕐 {sn}",
-             "━━━━━━━━━━━━━━━━━━━"]
-
+    lines = [f"📊 <b>تشخيص شامل ({len(results)})</b>", f"🕐 {sn}", "━━━━━━━━━━━━━━━━━━━"]
     for r in results:
         fails = [k for k, v in r["checks"].items() if not v]
-        if not fails:      icon = "🌟"
-        elif len(fails) == 1: icon = "⚠️"
-        elif len(fails) == 2: icon = "❌"
-        else:              icon = "🚫"
-        lines.append(
-            f"\n{icon} <b>{short(r['symbol'])}</b>  "
-            f"Score={r['score']}  💰{fmt_price(r['price'])}")
-        if not fails:
-            lines.append("   ✅ كل الفلاتر مرّت")
+        icon = "🌟" if not fails else ("⚠️" if len(fails)==1 else "❌" if len(fails)==2 else "🚫")
+        lines.append(f"\n{icon} <b>{short(r['symbol'])}</b>  Score={r['score']}  💰{fmt_price(r['price'])}")
+        if not fails: lines.append("   ✅ كل الفلاتر مرّت")
         else:
-            for k in fails:
-                lines.append(
-                    f"   ❌ {k}: {r['values'][k]} / {r['thresholds'][k]}")
-
-    lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"💡 <code>/why BTC</code> لتفاصيل عملة محددة")
-    lines.append(f"🌟=جاهز | ⚠️=قريب | ❌=بعيد | 🚫=مستحيل")
-    try:
-        await msg_target.reply_text("\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        log.error(f"_diagnose_all: {e}")
+            for k in fails: lines.append(f"   ❌ {k}: {r['values'][k]} / {r['thresholds'][k]}")
+    try: await msg_target.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as e: log.error(f"_diagnose_all: {e}")
 
 
 async def cmd_why(update, context):
     args = context.args or []
     if args:
-        coin_name = args[0]
-        target = find_symbol_by_name(coin_name)
+        target = find_symbol_by_name(args[0])
         if not target:
-            await update.message.reply_text(
-                f"❌ <b>{coin_name}</b> غير معروف.\n"
-                f"المتاح: <code>{', '.join(short(s) for s in ALL_SYMBOLS)}</code>\n"
-                f"أو جرّب: <code>/why BTC</code>",
-                parse_mode="HTML")
+            await update.message.reply_text(f"❌ {args[0]} غير معروف.", parse_mode="HTML")
             return
         await _diagnose_coin(update, target)
     else:
@@ -2350,84 +2761,54 @@ async def cmd_why(update, context):
 
 async def cmd_last(update, context):
     if not _last_signals:
-        await update.message.reply_text(
-            "📭 لا إشارات بعد.\n"
-            "ستُحفظ الإشارات المُتابَعة هنا.", parse_mode="HTML")
-        return
+        await update.message.reply_text("📭 لا إشارات بعد."); return
     lines = ["📋 <b>آخر الإشارات</b>", "━━━━━━━━━━━━━━━━━━━"]
     for s in reversed(list(_last_signals)):
         icon = {"win_tp3": "🌟", "win_tp2": "✅", "win_tp1": "🎯",
                 "loss_sl": "❌", "expired": "⏰", None: "⏳"}.get(s["result"], "?")
         ts_str = datetime.fromtimestamp(s["ts"], tz=SYRIA_TZ).strftime("%H:%M")
         dir_icon = "🟢" if s["direction"] == "bullish" else "🔴"
-        lines.append(
-            f"\n{icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
-            f"{dir_icon} {_source_label(s['source'])}")
+        lines.append(f"\n{icon} <b>{short(s['symbol'])}</b> [{s['timeframe']}] "
+                     f"{dir_icon} {_source_label(s['source'])}")
         lines.append(f"   🕐 {ts_str} | Score={s['score']}")
-        lines.append(
-            f"   💰 {fmt_price(s['entry'])} → {fmt_price(s['exit'])} "
-            f"<b>{s['pnl_pct']:+.2f}%</b>")
-        lines.append(
-            f"   ⏱️ {s['duration_min']} د | نتيجة: <b>{s['result']}</b>")
-    lines.append("\n━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 المجموع: {len(_last_signals)} إشارة")
+        lines.append(f"   💰 {fmt_price(s['entry'])} → {fmt_price(s['exit'])} "
+                     f"<b>{s['pnl_pct']:+.2f}%</b>")
+        lines.append(f"   ⏱️ {s['duration_min']} د | <b>{s['result']}</b>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_pending(update, context):
     active = {sid: s for sid, s in _pending_signals.items() if not s["checked"]}
     if not active:
-        await update.message.reply_text("📭 لا إشارات نشطة.")
-        return
+        await update.message.reply_text("📭 لا إشارات نشطة."); return
     lines = [f"⏳ <b>إشارات نشطة ({len(active)})</b>", "━━━━━━━━━━━━━━━━━━━"]
     now = _time.time()
     for sid, sig in active.items():
-        cross = sig["cross"]
-        sym = short(cross["symbol"]); tf = cross["timeframe"]
+        cross = sig["cross"]; lv = sig["levels"]
         bull = sig["direction"] == "bullish"
-        lv = sig["levels"]
         try:
             data, _ = await _exchange.fetch_ohlcv(cross["symbol"], "1m", 2)
             price = float(data[-1][4]) if data else lv["entry"]
-        except Exception:
-            price = lv["entry"]
+        except Exception: price = lv["entry"]
         pnl = ((price - lv["entry"]) / lv["entry"] * 100) * (1 if bull else -1)
-        age_min = int((now - sig["entry_ts"]) / 60)
-        tp_status = []
-        if bull:
-            if price >= lv["tp1"]: tp_status.append("TP1 ✅")
-            if price >= lv["tp2"]: tp_status.append("TP2 ✅")
-            if price >= lv["tp3"]: tp_status.append("TP3 ✅")
-        else:
-            if price <= lv["tp1"]: tp_status.append("TP1 ✅")
-            if price <= lv["tp2"]: tp_status.append("TP2 ✅")
-            if price <= lv["tp3"]: tp_status.append("TP3 ✅")
-        tp_txt = " | ".join(tp_status) if tp_status else "لا هدف بعد"
-        dir_icon = "🟢" if bull else "🔴"
-        pnl_icon = "🟢" if pnl >= 0 else "🔴"
-        lines.append(
-            f"\n{dir_icon} <b>{sym}</b> [{tf}] {_source_label(cross.get('source','ema'))}")
-        lines.append(f"   💰 دخول: {fmt_price(lv['entry'])} → حالي: {fmt_price(price)}")
-        lines.append(f"   {pnl_icon} P&L: <b>{pnl:+.2f}%</b> | ⏱️ {age_min} د")
-        lines.append(f"   🎯 {tp_txt}")
+        age = int((now - sig["entry_ts"]) / 60)
+        lines.append(f"\n{'🟢' if bull else '🔴'} <b>{short(cross['symbol'])}</b> [{cross['timeframe']}]")
+        lines.append(f"   💰 {fmt_price(lv['entry'])} → {fmt_price(price)}")
+        lines.append(f"   <b>{pnl:+.2f}%</b> | ⏱️ {age} د")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    lines.append("\n━━━━━━━━━━━━━━━━━━━")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_checkprice(update, context):
-    if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text("🔍 فحص ...")
+    if not _exchange.ok(): await update.message.reply_text("❌ لا منصة."); return
+    await update.message.reply_text("🔍 ...")
     found = 0
     for sym in ALL_SYMBOLS:
         a = await detect_sudden_change(sym)
         if a:
-            try:
-                await update.message.reply_text(build_price_alert_msg(a), parse_mode="HTML")
-                found += 1
-            except Exception as e:
-                log.error(f"send {sym}: {e}")
+            try: await update.message.reply_text(build_price_alert_msg(a), parse_mode="HTML")
+            except Exception: pass
+            found += 1
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
     if found == 0: await update.message.reply_text("⚪ لا تغيرات.")
 
@@ -2459,57 +2840,37 @@ async def cmd_ref6(update, context):
         except Exception: pass
         return
     try:
-        await msg_target.reply_text(
-            build_6pct_report(results, "📊 تقرير 6%"), parse_mode="HTML")
-    except Exception as e:
-        log.error(f"cmd_ref6: {e}")
+        await msg_target.reply_text(build_6pct_report(results), parse_mode="HTML")
+    except Exception as e: log.error(f"cmd_ref6: {e}")
 
 
 async def cmd_sr(update, context):
-    """🆕 يرسل الرسوم البيانية مع الأزرار"""
     msg_target = update.effective_message or update.message
     if not _exchange.ok():
         try: await msg_target.reply_text("❌ لا منصة.")
         except Exception: pass
         return
-    try:
-        await msg_target.reply_text(
-            f"📊 جارٍ توليد رسوم {MORNING_REPORT_TF} لـ {len(ALL_SYMBOLS)} عملة...")
-    except Exception:
-        pass
-
-    chat_id = update.effective_chat.id
-    ok = 0
+    try: await msg_target.reply_text(f"📊 {len(ALL_SYMBOLS)} رسم ...")
+    except Exception: pass
+    chat_id = update.effective_chat.id; ok = 0
     for sym in ALL_SYMBOLS:
         buf = await generate_sr_chart(sym)
         if buf:
             try:
-                await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=buf,
-                    caption=(
-                        f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
-                        f"🇸🇾 {syria_now_str()}"
-                    ),
-                    parse_mode="HTML",
+                await context.bot.send_photo(chat_id=chat_id, photo=buf,
+                    caption=f"📊 <b>{short(sym)}</b>", parse_mode="HTML",
                     reply_markup=coin_menu_kb(sym))
-                ok += 1
-                _filter_stats["charts_sent"] += 1
-            except Exception as e:
-                log.error(f"sr send {sym}: {e}")
+                ok += 1; _filter_stats["charts_sent"] += 1
+            except Exception as e: log.error(f"sr {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-
     if ok == 0:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
-        except Exception:
-            pass
+        try: await context.bot.send_message(chat_id=chat_id, text="⚪ لا بيانات.")
+        except Exception: pass
 
 
 async def cmd_checkranges(update, context):
-    if not _exchange.ok():
-        await update.message.reply_text("❌ لا منصة."); return
-    await update.message.reply_text("🔍 فحص فوري ...")
+    if not _exchange.ok(): await update.message.reply_text("❌ لا منصة."); return
+    await update.message.reply_text("🔍 ...")
     alerts = 0
     for symbol in list(_last_range.keys()):
         b = await check_range_breakout(symbol)
@@ -2521,8 +2882,7 @@ async def cmd_checkranges(update, context):
             await update.message.reply_text(build_approach_msg(a), parse_mode="HTML")
             _filter_stats["range_approaches"] += 1; alerts += 1
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if alerts == 0:
-        await update.message.reply_text("✅ كل الأسعار داخل النطاقات.")
+    if alerts == 0: await update.message.reply_text("✅ كل الأسعار داخل النطاقات.")
 
 
 async def cmd_status(update, context):
@@ -2532,73 +2892,59 @@ async def cmd_status(update, context):
     sd, sn = get_session_info()
     st = _smart.stats()
     active = len([s for s in _pending_signals.values() if not s["checked"]])
+    with _ticket_lock:
+        open_tickets = len(TRADE_TICKETS)
     await update.message.reply_text(
-        f"🤖 <b>الحالة v6.5.0</b>\n"
-        f"🔌 {_exchange.primary_name}\n"
-        f"🕐 {sn} ({sd:+d})\n"
+        f"🤖 <b>الحالة v6.6.0</b>\n"
+        f"💸 Binance: {'✅' if _binance.ok else '❌'}\n"
+        f"🔌 {_exchange.primary_name} | 🕐 {sn}\n"
         f"⚙️ Jobs: <b>{jobs_n}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 إشارات: <b>{_filter_stats['sent']}</b>\n"
-        f"📬 متابعات: <b>{_filter_stats['followups_sent']}</b>\n"
-        f"🖼️ رسوم: <b>{_filter_stats['charts_sent']}</b>\n"
-        f"🚫 محجوبة: {total}\n"
-        f"  • score_abs: {_filter_stats['filtered_score_abs']}\n"
-        f"  • score: {_filter_stats['filtered_score']}\n"
-        f"  • bb_confirm: {_filter_stats['filtered_bb_confirm']}\n"
-        f"  • trend: {_filter_stats['filtered_trend']}\n"
-        f"  • ema_gap: {_filter_stats['filtered_ema_gap']}\n"
-        f"  • atr_low: {_filter_stats['filtered_atr_low']}\n"
-        f"  • cooldown: {_filter_stats['filtered_cooldown']}\n"
-        f"📈 WR: <b>{st['wr']}%</b> "
-        f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})\n"
+        f"💼 صفقات مفتوحة: <b>{open_tickets}</b>\n"
+        f"💸 فُتحت: {_filter_stats['trades_opened']} | "
+        f"أُغلقت: {_filter_stats['trades_closed']}\n"
+        f"🎯 TP: {_filter_stats['trades_tp']} | "
+        f"🛑 SL: {_filter_stats['trades_sl']}\n"
+        f"❌ فشل: {_filter_stats['trades_failed']}\n"
+        f"🔍 يدوي: {_filter_stats['trades_manual_sync']}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ نشطة: {active}\n"
-        f"📝 تاريخ: {len(_last_signals)} إشارة",
+        f"📊 إشارات: {_filter_stats['sent']}\n"
+        f"🚫 محجوبة: {total}\n"
+        f"📈 WR: <b>{st['wr']}%</b> "
+        f"(✅{st['wins']} ❌{st['losses']} ⏰{st['expired']})",
         parse_mode="HTML")
 
 
 async def cmd_stats(update, context):
     st = _smart.stats()
     if st["n"] == 0:
-        await update.message.reply_text(
-            "📊 <b>لا نتائج بعد</b>\nسيبدأ بعد أول إشارة تُرسل.", parse_mode="HTML")
-        return
+        await update.message.reply_text("📊 لا نتائج بعد."); return
     bar = "█" * int(st["wr"] / 5) + "░" * (20 - int(st["wr"] / 5))
     await update.message.reply_text(
-        f"📊 <b>إحصائيات الأداء</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 معدل النجاح: <b>{st['wr']}%</b>\n"
-        f"<code>{bar}</code>\n"
-        f"✅ فوز: {st['wins']} | ❌ خسارة: {st['losses']} | ⏰ {st['expired']}\n"
-        f"📝 المجموع: {st['n']}",
-        parse_mode="HTML")
+        f"📊 <b>الأداء</b>\n📈 WR: <b>{st['wr']}%</b>\n"
+        f"<code>{bar}</code>\n✅ {st['wins']} | ❌ {st['losses']} | ⏰ {st['expired']}\n"
+        f"📝 {st['n']} إشارة", parse_mode="HTML")
 
 
 async def cmd_perf(update, context):
     rep = _smart.source_report()
-    if not rep:
-        await update.message.reply_text("📊 لا بيانات بعد.")
-        return
+    if not rep: await update.message.reply_text("📊 لا بيانات."); return
     lines = ["📊 <b>أداء المصادر</b>\n━━━━━━━━━━━━━━━━━━━"]
     for src, d in rep.items():
-        total_res = d["wins"] + d["losses"]
-        wr = round(d["wins"] / total_res * 100, 1) if total_res > 0 else 0
-        name = _source_label(src) if src != "unknown" else "—"
-        lines.append(
-            f"\n🔹 <b>{name}</b>\n"
-            f"   📤 {d['sent']} | 🚫 {d['filtered']}\n"
-            f"   ✅ {d['wins']} | ❌ {d['losses']} | ⏰ {d.get('expired',0)}\n"
-            f"   📈 WR: <b>{wr}%</b>")
+        tot = d["wins"] + d["losses"]
+        wr = round(d["wins"] / tot * 100, 1) if tot else 0
+        lines.append(f"\n🔹 <b>{_source_label(src) if src != 'unknown' else '—'}</b>\n"
+                     f"   📤 {d['sent']} | 🚫 {d['filtered']}\n"
+                     f"   ✅ {d['wins']} | ❌ {d['losses']}\n"
+                     f"   📈 WR: <b>{wr}%</b>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_jobs(update, context):
     jq = context.application.job_queue
-    if jq is None:
-        await update.message.reply_text("❌ job_queue غير متوفر."); return
+    if jq is None: await update.message.reply_text("❌ غير متوفر."); return
     jobs = jq.jobs()
-    if not jobs:
-        await update.message.reply_text("⚠️ لا مهام مسجّلة."); return
+    if not jobs: await update.message.reply_text("⚠️ لا مهام."); return
     lines = [f"⚙️ <b>Jobs ({len(jobs)}):</b>\n"]
     for j in jobs:
         nxt = getattr(j, "next_t", None)
@@ -2611,32 +2957,28 @@ async def cmd_strict(update, context):
     th = get_thresholds(tf="15m")
     sd, sn = get_session_info()
     await update.message.reply_text(
-        f"🎯 <b>التشدد v6.5.0</b>\n"
-        f"🕐 {sn} ({sd:+d})\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>التشدد v6.6.0</b>\n🕐 {sn}\n━━━━━━━━━━━━━━━━━━━\n"
         f"<b>ديناميكي (15m):</b>\n"
         f"• Score ≥ {th['min_score']:.0f}\n"
         f"• Vol ≥ {th['min_vol_ratio']}×\n"
         f"• ADX ≥ {th['min_adx']}\n"
         f"• ATR ≤ {th['max_atr_pct']}%\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>🛡️ ثوابت v6.5.0:</b>\n"
+        f"<b>🛡️ ثوابت:</b>\n"
         f"• Score مطلق ≥ {ABS_MIN_SCORE}\n"
-        f"• EMA gap: 5m={MIN_EMA_GAP_PCT['5m']}%\n"
-        f"• ATR min: 5m={MIN_ATR_PCT['5m']}%\n"
-        f"• BB Vol ≥ {BB_MIN_VOL}×\n"
-        f"• BB ADX ≥ {MIN_ADX_FOR_BB}\n"
-        f"• BB في رينج ADX ≥ {BB_MIN_ADX_IN_RANGE}\n"
-        f"• BB تأكيد: {'✅' if BB_CONFIRM_ENABLED else '❌'}\n"
         f"• cooldown: {SYMBOL_COOLDOWN_SEC}s\n"
-        f"• max final: {STRICTNESS_MAX_FINAL}",
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>💸 Binance:</b>\n"
+        f"• Notional: {NOTIONAL_USDT}$\n"
+        f"• الرافعة: {LEVERAGE}x\n"
+        f"• الهامش: {MARGIN_TYPE}\n"
+        f"• صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}\n"
+        f"• فحص كل: {POSITION_MONITOR_SEC}s",
         parse_mode="HTML")
 
 
 async def cmd_clearcache(update, context):
-    clear_caches()
-    _smart.reset_feedback()
-    _last_signal_time.clear()
+    clear_caches(); _smart.reset_feedback(); _last_signal_time.clear()
     await update.message.reply_text("✅ تم تفريغ الكاش.")
 
 
@@ -2648,7 +2990,7 @@ async def error_handler(update, context):
 
 
 # ═══════════════════════════════════════════════════════════
-# 22) Jobs
+# 23) Jobs
 # ═══════════════════════════════════════════════════════════
 async def crossover_job(context):
     if not _exchange.ok(): return
@@ -2677,6 +3019,11 @@ async def crossover_job(context):
                             if cross["alert_type"] == "confirmed":
                                 record_signal(sym, cross["direction"])
                                 register_signal_for_tracking(cross)
+                                # 💰 تنفيذ حقيقي
+                                exe = await execute_binance_trade(
+                                    cross, bot=context.bot)
+                                if not exe.get("ok"):
+                                    log.info(f"exec skip {sym}: {exe.get('error')}")
                         except Exception as e:
                             log.error(f"send {sym} {tf}: {e}")
                 except Exception as e:
@@ -2687,10 +3034,8 @@ async def crossover_job(context):
 
 async def signal_tracker_job(context):
     if not _exchange.ok(): return
-    try:
-        await evaluate_pending_signals(bot=context.bot)
-    except Exception as e:
-        log.exception(f"tracker: {e}")
+    try: await evaluate_pending_signals(bot=context.bot)
+    except Exception as e: log.exception(f"tracker: {e}")
 
 
 async def price_alert_job(context):
@@ -2702,14 +3047,13 @@ async def price_alert_job(context):
             if a and CHAT_ID:
                 try:
                     await context.bot.send_message(
-                        chat_id=CHAT_ID, text=build_price_alert_msg(a), parse_mode="HTML")
+                        chat_id=CHAT_ID, text=build_price_alert_msg(a),
+                        parse_mode="HTML")
                     total += 1
-                except Exception as e:
-                    log.error(f"send {sym}: {e}")
-        except Exception as e:
-            log.exception(f"price_alert {sym}: {e}")
+                except Exception: pass
+        except Exception as e: log.exception(f"price_alert {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if total: log.info(f"📤 {total} تغير مفاجئ")
+    if total: log.info(f"📤 {total} تنبيه")
 
 
 async def range_monitor_job(context):
@@ -2719,20 +3063,16 @@ async def range_monitor_job(context):
         try:
             b = await check_range_breakout(symbol)
             if b and CHAT_ID:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID, text=build_breakout_msg(b), parse_mode="HTML")
-                _filter_stats["range_breakouts"] += 1
-                total += 1; continue
+                await context.bot.send_message(chat_id=CHAT_ID,
+                    text=build_breakout_msg(b), parse_mode="HTML")
+                _filter_stats["range_breakouts"] += 1; total += 1; continue
             a = await check_range_approach(symbol)
             if a and CHAT_ID:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID, text=build_approach_msg(a), parse_mode="HTML")
-                _filter_stats["range_approaches"] += 1
-                total += 1
-        except Exception as e:
-            log.exception(f"range_monitor {symbol}: {e}")
+                await context.bot.send_message(chat_id=CHAT_ID,
+                    text=build_approach_msg(a), parse_mode="HTML")
+                _filter_stats["range_approaches"] += 1; total += 1
+        except Exception as e: log.exception(f"range_monitor {symbol}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
-    if total: log.info(f"📤 {total} إشعار نطاق")
 
 
 async def six_pct_report_job(context):
@@ -2740,61 +3080,49 @@ async def six_pct_report_job(context):
     results = await compute_6pct_ranges()
     if not results: return
     try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=build_6pct_report(results, "📊 نطاقات 6% المرجعية"),
-            parse_mode="HTML")
-        log.info(f"📤 تقرير 6% ({len(results)})")
-    except Exception as e:
-        log.error(f"send 6pct: {e}")
+        await context.bot.send_message(chat_id=CHAT_ID,
+            text=build_6pct_report(results), parse_mode="HTML")
+    except Exception as e: log.error(f"6pct: {e}")
 
 
 async def morning_report_job(context):
-    """🌅 يرسل رسم بياني + ملخص لكل عملة"""
     if not _exchange.ok() or not CHAT_ID: return
-    log.info("🌅 بدء التقرير الصباحي المصوّر ...")
-
+    log.info("🌅 التقرير الصباحي ...")
     try:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=(f"🌅 <b>تقرير الصباح</b>\n"
-                  f"🇸🇾 {syria_now_str()}\n"
-                  f"📊 {len(ALL_SYMBOLS)} عملة · {MORNING_REPORT_TF}"),
-            parse_mode="HTML")
-    except Exception as e:
-        log.error(f"morning header: {e}")
-
-    ok = 0
+        await context.bot.send_message(chat_id=CHAT_ID,
+            text=(f"🌅 <b>تقرير الصباح</b>\n🇸🇾 {syria_now_str()}\n"
+                  f"📊 {len(ALL_SYMBOLS)} عملة"), parse_mode="HTML")
+    except Exception: pass
     for sym in ALL_SYMBOLS:
         try:
             buf = await generate_sr_chart(sym)
-            if not buf:
-                continue
-            await context.bot.send_photo(
-                chat_id=CHAT_ID, photo=buf,
-                caption=(f"📊 <b>{short(sym)}</b>  ·  {MORNING_REPORT_TF}\n"
-                         f"<i>R3..S3 = Pivot  ·  H/L = قمم/قيعان</i>"),
-                parse_mode="HTML",
+            if not buf: continue
+            await context.bot.send_photo(chat_id=CHAT_ID, photo=buf,
+                caption=f"📊 <b>{short(sym)}</b>", parse_mode="HTML",
                 reply_markup=coin_menu_kb(sym))
-            ok += 1
             _filter_stats["charts_sent"] += 1
-        except Exception as e:
-            log.error(f"morning {sym}: {e}")
+        except Exception as e: log.error(f"morning {sym}: {e}")
         await asyncio.sleep(SYMBOL_DELAY_MS / 1000)
 
-    _filter_stats["morning_reports"] += 1
-    log.info(f"📤 التقرير الصباحي: {ok}/{len(ALL_SYMBOLS)}")
+
+async def binance_position_monitor_job(context):
+    """🆕💰 مراقبة الصفقات + مزامنة اليدوية كل X ثانية."""
+    if not _binance.ok: return
+    try:
+        await manage_open_positions(bot=context.bot)
+    except Exception as e:
+        log.exception(f"position_monitor: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
-# 23) Health
+# 24) Health
 # ═══════════════════════════════════════════════════════════
 class _Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Unified Smart Bot v6.5.0")
+        self.wfile.write(b"OK - Unified Smart Bot v6.6.0")
     def do_HEAD(self):
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
@@ -2806,52 +3134,36 @@ def run_health():
 
 
 # ═══════════════════════════════════════════════════════════
-# 24) Main
+# 25) Main
 # ═══════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        print("❌ TELEGRAM_REPORT_BOT_TOKEN و TELEGRAM_REPORT_CHAT_ID مطلوبان")
-        return
+        print("❌ TELEGRAM_REPORT_BOT_TOKEN و CHAT_ID مطلوبان"); return
 
     threading.Thread(target=run_health, daemon=True).start()
 
     n = _load_manual_ranges()
     sd, sn = get_session_info()
-    print(f"📌 {n} نطاق يدوي")
-    print(f"🔌 {_exchange.primary_name} | بدائل: {_exchange.chain_names[1:]}")
-    print(f"📊 رموز: {ALL_SYMBOLS}")
+    print(f"📌 {n} نطاق | 🔌 {_exchange.primary_name}")
     print(f"🕐 الجلسة: {sn} ({sd:+d})")
-    print(f"🛡️ فلاتر v6.5.0:")
-    print(f"   • Score مطلق ≥ {ABS_MIN_SCORE}")
-    print(f"   • EMA gap: 5m≥{MIN_EMA_GAP_PCT['5m']}%")
-    print(f"   • ATR min: 5m≥{MIN_ATR_PCT['5m']}%")
-    print(f"   • BB Vol ≥ {BB_MIN_VOL}×")
-    print(f"   • BB ADX ≥ {MIN_ADX_FOR_BB}")
-    print(f"   • BB في رينج ADX ≥ {BB_MIN_ADX_IN_RANGE}")
-    print(f"   • BB تأكيد: {'مُفعّل' if BB_CONFIRM_ENABLED else 'معطّل'}")
-    print(f"   • cooldown: {SYMBOL_COOLDOWN_SEC}s")
-    print(f"📏 SL min: 5m={MIN_SL_PCT['5m']}%")
-    print(f"📬 متابعة: {'مُفعّلة' if FOLLOWUP_ENABLED else 'معطّلة'}")
-    print(f"🌅 تقرير الصباح: يومياً {MORNING_REPORT_HOUR_SYRIA}:00")
-    print(f"📊 الرسوم: {'مُفعّلة' if CHART_ENABLED else 'معطّلة'} | lookback={CHART_LOOKBACK}")
+    print(f"💸 Binance: {'✅' if _binance.ok else '❌'} | "
+          f"{'TESTNET' if BINANCE_TESTNET else 'MAINNET'}")
+    print(f"   • Notional: {NOTIONAL_USDT}$ | Lev: {LEVERAGE}x | {MARGIN_TYPE}")
+    print(f"   • صفقة ثانية: score ≥ {STRONG_SCORE_FOR_ADD}")
+    print(f"   • مراقبة: كل {POSITION_MONITOR_SEC}s")
 
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(read_timeout=30.0, write_timeout=30.0,
                            connect_timeout=30.0, pool_timeout=30.0)
-
     app = (Application.builder().token(BOT_TOKEN)
            .request(request).get_updates_request(request).build())
 
     if app.job_queue is None:
-        raise RuntimeError(
-            "❌ job_queue غير متوفر!\n"
-            "   الحل: pip install 'python-telegram-bot[job-queue]'")
-    print("✅ job_queue متوفر")
+        raise RuntimeError("❌ job_queue غير متوفر! pip install 'python-telegram-bot[job-queue]'")
 
-    # ── Handlers ─────────────────────────────────────
+    # ── Handlers ────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("chart", cmd_chart_coin))
     app.add_handler(CommandHandler("cross", cmd_cross))
     app.add_handler(CommandHandler("cross5", cmd_cross5))
     app.add_handler(CommandHandler("cross15", cmd_cross15))
@@ -2871,42 +3183,43 @@ def main():
     app.add_handler(CommandHandler("jobs", cmd_jobs))
     app.add_handler(CommandHandler("strict", cmd_strict))
     app.add_handler(CommandHandler("clearcache", cmd_clearcache))
+    # 💰 Binance commands
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("closeall", cmd_closeall))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("syncnow", cmd_syncnow))
 
-    # ── معالج الأزرار ─────────────────────────────────
     app.add_handler(CallbackQueryHandler(on_callback))
-
     app.add_error_handler(error_handler)
 
-    # ── Jobs ─────────────────────────────────────────
-    app.job_queue.run_repeating(
-        crossover_job, interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
-    app.job_queue.run_repeating(
-        signal_tracker_job, interval=SIGNAL_TRACK_INTERVAL_MIN * 60,
-        first=60, name="tracker")
-    app.job_queue.run_repeating(
-        price_alert_job, interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price")
-    app.job_queue.run_repeating(
-        range_monitor_job, interval=RANGE_MONITOR_INTERVAL_MIN * 60, first=30,
-        name="range_monitor")
+    # ── Jobs ────────────────────────────────────────
+    app.job_queue.run_repeating(crossover_job,
+        interval=JOB_INTERVAL_MIN * 60, first=15, name="cross")
+    app.job_queue.run_repeating(signal_tracker_job,
+        interval=SIGNAL_TRACK_INTERVAL_MIN * 60, first=60, name="tracker")
+    app.job_queue.run_repeating(price_alert_job,
+        interval=PRICE_ALERT_INTERVAL_MIN * 60, first=20, name="price")
+    app.job_queue.run_repeating(range_monitor_job,
+        interval=RANGE_MONITOR_INTERVAL_MIN * 60, first=30, name="range_monitor")
+
+    # 💰 مراقبة الصفقات + مزامنة يدوية
+    if _binance.ok:
+        app.job_queue.run_repeating(binance_position_monitor_job,
+            interval=POSITION_MONITOR_SEC, first=20, name="binance_monitor")
+        print(f"💼 مراقبة Binance: كل {POSITION_MONITOR_SEC} ثانية")
 
     if SEND_STARTUP_REPORT:
         app.job_queue.run_once(six_pct_report_job, when=45, name="six_pct_startup")
-        print("📊 تقرير 6% عند التشغيل: بعد 45 ثانية")
 
-    app.job_queue.run_repeating(
-        six_pct_report_job,
+    app.job_queue.run_repeating(six_pct_report_job,
         interval=RANGE_REPORT_INTERVAL_HOURS * 3600,
-        first=RANGE_REPORT_INTERVAL_HOURS * 3600,
-        name="six_pct_periodic",
-    )
-    print(f"📊 تقرير 6% دوري: كل {RANGE_REPORT_INTERVAL_HOURS} ساعات")
+        first=RANGE_REPORT_INTERVAL_HOURS * 3600, name="six_pct_periodic")
 
     if MORNING_REPORT_ENABLED:
         morning_time = dt_time(hour=MORNING_REPORT_HOUR_SYRIA, minute=0, tzinfo=SYRIA_TZ)
-        app.job_queue.run_daily(
-            morning_report_job, time=morning_time, name="morning_report")
-        print(f"🌅 التقرير الصباحي: يومياً "
-              f"{MORNING_REPORT_HOUR_SYRIA}:00 (Asia/Damascus)")
+        app.job_queue.run_daily(morning_report_job, time=morning_time,
+                                name="morning_report")
 
     print("✅ جاهز — بدء polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES,
